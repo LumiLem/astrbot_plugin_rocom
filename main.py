@@ -70,6 +70,9 @@ class RocomPlugin(Star):
         self.merchant_subscription_items = self.config.get(
             "merchant_subscription_items", ["国王球", "棱镜球", "炫彩精灵蛋"]
         )
+        self.merchant_subscription_all_products = self.config.get(
+            "merchant_subscription_all_products", False
+        )
         self.merchant_private_subscription_enabled = self.config.get(
             "merchant_private_subscription_enabled", True
         )
@@ -1721,13 +1724,18 @@ class RocomPlugin(Star):
         logger.info(f"[Rocom] 远行商人订阅检查：当前商品={product_names}")
         pending_pushes = []
         for key, sub in all_subs.items():
-            items = sub.get("items") or self.merchant_subscription_items
-            matched = [name for name in items if name in product_names]
-            logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key}（关注={items}）→ 命中={matched}")
-            if not matched or sub.get("last_push_round") == round_info["round_id"]:
-                if sub.get("last_push_round") == round_info["round_id"]:
-                    logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key} 本轮已推送过（last_push_round={round_info['round_id']}），跳过")
+            if sub.get("last_push_round") == round_info["round_id"]:
+                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key} 本轮已推送过（last_push_round={round_info['round_id']}），跳过")
                 continue
+            if sub.get("all_products"):
+                matched = ["全部商品"]
+                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key}（全部订阅）→ 跳过商品匹配，直接推送")
+            else:
+                items = sub.get("items") or self.merchant_subscription_items
+                matched = [name for name in items if name in product_names]
+                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key}（关注={items}）→ 命中={matched}")
+                if not matched:
+                    continue
             pending_pushes.append((key, sub, matched))
         if not pending_pushes:
             logger.info("[Rocom] 远行商人订阅检查：无订阅命中本轮商品，结束")
@@ -1744,9 +1752,14 @@ class RocomPlugin(Star):
             text_chain = MessageChain()
             if sub.get("mention_all"):
                 text_chain.at_all()
-            text_chain.message(
-                f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
-            )
+            if sub.get("all_products"):
+                text_chain.message(
+                    f"远行商人本轮商品已更新\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}\n商品：{'、'.join(product_names)}"
+                )
+            else:
+                text_chain.message(
+                    f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
+                )
             try:
                 await self.context.send_message(sub["umo"], text_chain)
                 logger.info(f"[Rocom] 远行商人订阅检查：文本推送成功 → {key}")
@@ -1788,23 +1801,28 @@ class RocomPlugin(Star):
             seen.add(name)
         return items
 
-    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None]:
+    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool]:
         """解析远行商人订阅参数
-        返回：(是否@全体，自定义商品列表)
-        商品列表为 None 表示使用默认配置
+        返回：(是否@全体，自定义商品列表，是否订阅全部)
+        自定义商品列表为 None 表示使用默认配置
+        订阅全部为 True 时商品列表用于展示，匹配时跳过商品检查
         """
         text = str(raw_text or "").strip()
         if not text:
-            return False, None
+            return False, None, False
         tokens = text.split(maxsplit=1)
         mention = False
         items_text = text
         if tokens and tokens[0] in {"0", "1"}:
             mention = tokens[0] == "1"
             items_text = tokens[1] if len(tokens) > 1 else ""
-        items = self._split_merchant_subscription_items(items_text) if items_text.strip() else None
-        # 只有当 items 非空时才返回，否则返回 None 表示使用默认配置
-        return mention, items if items else None
+        items_text = str(items_text or "").strip()
+        if not items_text:
+            return mention, None, False
+        if items_text in ("全部", "所有", "all"):
+            return mention, ["全部商品"], True
+        items = self._split_merchant_subscription_items(items_text)
+        return mention, items if items else None, False
 
     def _wiki_asset_id(self, number: Any) -> int | None:
         try:
@@ -2864,7 +2882,7 @@ class RocomPlugin(Star):
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
                         {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
-                        {"cmd": "订阅远行商人 1/0 [商品 商品]", "desc": "群主/群管/bot管理可配置本群订阅商品，不填商品则用默认配置"},
+                        {"cmd": "订阅远行商人 1/0 [商品 商品/全部]", "desc": "群主/群管可配置订阅商品，不加商品用默认，\"全部\"每轮必推"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
@@ -4108,11 +4126,15 @@ class RocomPlugin(Star):
         else:
             args_text = args.strip()
         
-        mention, custom_items = self._parse_merchant_subscription_args(args_text)
-        # custom_items 为 None 时使用默认配置，否则使用自定义商品
-        selected_items = list(custom_items) if custom_items is not None else list(self.merchant_subscription_items)
+        mention, custom_items, all_products = self._parse_merchant_subscription_args(args_text)
+        if custom_items is not None:
+            selected_items = list(custom_items)
+        else:
+            selected_items = list(self.merchant_subscription_items)
+            if self.merchant_subscription_all_products:
+                all_products = True
+                selected_items = ["全部商品"]
         
-        # 生成唯一订阅键：私聊用 user_id，群聊用 group_id
         if event.is_private_chat():
             subscription_key = f"private_{event.get_sender_id()}"
             subscription_type = "个人订阅"
@@ -4128,18 +4150,25 @@ class RocomPlugin(Star):
                 "umo": event.unified_msg_origin,
                 "mention_all": mention,
                 "items": selected_items,
+                "all_products": all_products,
                 "last_push_round": "",
                 "last_matched_items": [],
                 "updated_by": str(event.get_sender_id()),
             },
         )
-        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} mention_all={mention}")
-        source_hint = "自定义商品" if custom_items is not None else "WebUI 默认商品"
+        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention}")
+        if all_products:
+            source_hint = "全部商品（每轮必推）"
+        elif custom_items is not None:
+            source_hint = "自定义商品"
+        else:
+            source_hint = "WebUI 默认商品"
         mention_hint = f"命中后{'会' if mention else '不会'}@全体" if not event.is_private_chat() else ""
         yield event.plain_result(
             f"已订阅远行商人，监听商品：{'、'.join(selected_items)}（{source_hint}）；{mention_hint}\n"
             f"订阅方式：/订阅远行商人 1 为 @全体（仅群聊），/订阅远行商人 0 为不@全体，"
             f"/订阅远行商人 1 国王球 棱镜球 为自定义商品，"
+            f"/订阅远行商人 1 全部 为全部商品（每轮必推），"
             f"/取消订阅远行商人 可关闭订阅。"
         )
 

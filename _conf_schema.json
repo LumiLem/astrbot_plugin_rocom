@@ -53,11 +53,17 @@
   "merchant_subscription_items": {
     "type": "list",
     "description": "远行商人默认订阅商品",
-    "hint": "群管理员订阅时默认监听这些商品名称，按名称精确匹配",
+    "hint": "群管理员订阅时默认监听这些商品名称，按名称精确匹配。下面「订阅全部商品」开启后此项仅作展示",
     "default": ["国王球", "棱镜球", "炫彩精灵蛋"],
     "items": {
       "type": "string"
     }
+  },
+  "merchant_subscription_all_products": {
+    "type": "bool",
+    "description": "默认订阅全部商品",
+    "hint": "开启后，群管理员不加商品名订阅时，默认订阅全部商品（每轮必推，跳过商品匹配）",
+    "default": false
   },
   "merchant_private_subscription_enabled": {
     "type": "bool",
