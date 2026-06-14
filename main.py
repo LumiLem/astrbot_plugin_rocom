@@ -784,8 +784,6 @@ class RocomPlugin(Star):
     async def _home_subscription_loop(self):
         logger.info(f"[Rocom] 家园订阅循环任务已启动（instance={self._instance_id}）")
         interval = max(1, int(self.home_subscription_interval_minutes or 5)) * 60
-        poll_seconds = 60
-        heartbeat_interval = 600
         iteration = 0
         while True:
             iteration += 1
@@ -796,10 +794,16 @@ class RocomPlugin(Star):
                     now = datetime.now(self._cn_tz())
                     if now >= target:
                         break
-                    step = min(poll_seconds, max(1, (target - now).total_seconds()))
+                    remaining = max(1, (target - now).total_seconds())
+                    if remaining > 300:
+                        step = 60
+                    elif remaining > 60:
+                        step = 30
+                    else:
+                        step = 10
                     await asyncio.sleep(step)
                     now = datetime.now(self._cn_tz())
-                    if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                    if (now - last_heartbeat).total_seconds() >= 600:
                         last_heartbeat = now
                         logger.info(f"[Rocom] 家园订阅心跳：迭代 #{iteration} | 目标 {target.strftime('%H:%M:%S CST')} | instance={self._instance_id}")
                 await self._check_home_subscriptions()
@@ -1287,8 +1291,6 @@ class RocomPlugin(Star):
     async def _announcement_subscription_loop(self):
         logger.info(f"[Rocom] 公告订阅循环任务已启动（instance={self._instance_id}）")
         interval = max(1, int(self.announcement_poll_interval_minutes or 10)) * 60
-        poll_seconds = 60
-        heartbeat_interval = 600
         iteration = 0
         while True:
             iteration += 1
@@ -1299,10 +1301,16 @@ class RocomPlugin(Star):
                     now = datetime.now(self._cn_tz())
                     if now >= target:
                         break
-                    step = min(poll_seconds, max(1, (target - now).total_seconds()))
+                    remaining = max(1, (target - now).total_seconds())
+                    if remaining > 300:
+                        step = 60
+                    elif remaining > 60:
+                        step = 30
+                    else:
+                        step = 10
                     await asyncio.sleep(step)
                     now = datetime.now(self._cn_tz())
-                    if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                    if (now - last_heartbeat).total_seconds() >= 600:
                         last_heartbeat = now
                         logger.info(f"[Rocom] 公告订阅心跳：迭代 #{iteration} | 目标 {target.strftime('%H:%M:%S CST')} | instance={self._instance_id}")
                 await self._check_announcement_subscriptions()
@@ -1388,11 +1396,10 @@ class RocomPlugin(Star):
         return self._merchant_check_times(next_day)[0]
 
     def _merchant_subscription_thread(self):
-        """独立线程调度器：使用 OS 级 sleep，不受 asyncio 事件循环阻塞影响"""
+        """独立线程调度器：使用 OS 级 sleep + wall clock 绝对时间比较，不受 timer 漂移影响"""
         loop = self._main_loop
         stop = self._merchant_stop
         iteration = 0
-        heartbeat_interval = 600
         logger.info(f"[Rocom] 远行商人订阅调度线程已启动（instance={self._instance_id}）")
         while not stop.is_set():
             iteration += 1
@@ -1406,19 +1413,26 @@ class RocomPlugin(Star):
                     f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 目标 {target_check.strftime('%Y-%m-%d %H:%M:%S CST')} | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
                 )
                 wait_start = now
+                last_heartbeat = now
                 while True:
                     current = datetime.now(self._cn_tz())
                     if current >= target_check or stop.is_set():
                         break
                     remaining = max(1, (target_check - current).total_seconds())
-                    step = min(heartbeat_interval, remaining)
+                    if remaining > 600:
+                        step = 600
+                    elif remaining > 120:
+                        step = 60
+                    else:
+                        step = 10
                     if stop.wait(step):
                         logger.info(f"[Rocom] 远行商人订阅线程：收到停止信号，退出 | instance={self._instance_id}")
                         return
                     current = datetime.now(self._cn_tz())
                     elapsed = (current - wait_start).total_seconds()
-                    remaining_after = (target_check - current).total_seconds()
-                    if remaining_after > 0:
+                    if (current - last_heartbeat).total_seconds() >= 600:
+                        last_heartbeat = current
+                        remaining_after = max(0, (target_check - current).total_seconds())
                         logger.info(
                             f"[Rocom] 远行商人订阅线程：心跳 | 已过 {elapsed:.0f}s | 剩余 {remaining_after:.0f}s | 目标 {target_check.strftime('%H:%M:%S CST')} | instance={self._instance_id}"
                         )
