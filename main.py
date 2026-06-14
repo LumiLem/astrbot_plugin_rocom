@@ -784,17 +784,24 @@ class RocomPlugin(Star):
     async def _home_subscription_loop(self):
         logger.info(f"[Rocom] 家园订阅循环任务已启动（instance={self._instance_id}）")
         interval = max(1, int(self.home_subscription_interval_minutes or 5)) * 60
+        poll_seconds = 60
+        heartbeat_interval = 600
         iteration = 0
-        heartbeat_count = 0
-        heartbeat_interval = 10  # 每 10 轮检查打一次心跳
         while True:
             iteration += 1
-            heartbeat_count += 1
             try:
-                await asyncio.sleep(interval)
-                if heartbeat_count >= heartbeat_interval:
-                    heartbeat_count = 0
-                    logger.info(f"[Rocom] 家园订阅心跳：迭代 #{iteration}，间隔 {interval}s | instance={self._instance_id}")
+                target = datetime.now(self._cn_tz()) + timedelta(seconds=interval)
+                last_heartbeat = datetime.now(self._cn_tz())
+                while True:
+                    now = datetime.now(self._cn_tz())
+                    if now >= target:
+                        break
+                    step = min(poll_seconds, max(1, (target - now).total_seconds()))
+                    await asyncio.sleep(step)
+                    now = datetime.now(self._cn_tz())
+                    if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                        last_heartbeat = now
+                        logger.info(f"[Rocom] 家园订阅心跳：迭代 #{iteration} | 目标 {target.strftime('%H:%M:%S CST')} | instance={self._instance_id}")
                 await self._check_home_subscriptions()
             except asyncio.CancelledError:
                 logger.info(f"[Rocom] 家园订阅循环任务收到取消信号，正在退出（iteration={iteration}, instance={self._instance_id}）")
@@ -1280,17 +1287,24 @@ class RocomPlugin(Star):
     async def _announcement_subscription_loop(self):
         logger.info(f"[Rocom] 公告订阅循环任务已启动（instance={self._instance_id}）")
         interval = max(1, int(self.announcement_poll_interval_minutes or 10)) * 60
+        poll_seconds = 60
+        heartbeat_interval = 600
         iteration = 0
-        heartbeat_count = 0
-        heartbeat_interval = 10
         while True:
             iteration += 1
-            heartbeat_count += 1
             try:
-                await asyncio.sleep(interval)
-                if heartbeat_count >= heartbeat_interval:
-                    heartbeat_count = 0
-                    logger.info(f"[Rocom] 公告订阅心跳：迭代 #{iteration}，间隔 {interval}s | instance={self._instance_id}")
+                target = datetime.now(self._cn_tz()) + timedelta(seconds=interval)
+                last_heartbeat = datetime.now(self._cn_tz())
+                while True:
+                    now = datetime.now(self._cn_tz())
+                    if now >= target:
+                        break
+                    step = min(poll_seconds, max(1, (target - now).total_seconds()))
+                    await asyncio.sleep(step)
+                    now = datetime.now(self._cn_tz())
+                    if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                        last_heartbeat = now
+                        logger.info(f"[Rocom] 公告订阅心跳：迭代 #{iteration} | 目标 {target.strftime('%H:%M:%S CST')} | instance={self._instance_id}")
                 await self._check_announcement_subscriptions()
             except asyncio.CancelledError:
                 logger.info(f"[Rocom] 公告订阅循环任务收到取消信号，正在退出（iteration={iteration}, instance={self._instance_id}）")
@@ -1391,20 +1405,27 @@ class RocomPlugin(Star):
                 logger.info(
                     f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 目标 {target_check.strftime('%Y-%m-%d %H:%M:%S CST')} | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
                 )
-                waited = 0.0
-                while waited < wait_seconds and not stop.is_set():
-                    step = min(heartbeat_interval, wait_seconds - waited)
+                wait_start = now
+                while True:
+                    current = datetime.now(self._cn_tz())
+                    if current >= target_check or stop.is_set():
+                        break
+                    remaining = max(1, (target_check - current).total_seconds())
+                    step = min(heartbeat_interval, remaining)
                     if stop.wait(step):
-                        logger.info(f"[Rocom] 远行商人订阅线程：收到停止信号（已等待 {waited:.0f}s），退出 | instance={self._instance_id}")
+                        logger.info(f"[Rocom] 远行商人订阅线程：收到停止信号，退出 | instance={self._instance_id}")
                         return
-                    waited += step
-                    if waited < wait_seconds:
+                    current = datetime.now(self._cn_tz())
+                    elapsed = (current - wait_start).total_seconds()
+                    remaining_after = (target_check - current).total_seconds()
+                    if remaining_after > 0:
                         logger.info(
-                            f"[Rocom] 远行商人订阅线程：心跳 | 已等待 {waited:.0f}/{wait_seconds:.0f}s | instance={self._instance_id}"
+                            f"[Rocom] 远行商人订阅线程：心跳 | 已过 {elapsed:.0f}s | 剩余 {remaining_after:.0f}s | 目标 {target_check.strftime('%H:%M:%S CST')} | instance={self._instance_id}"
                         )
                 if stop.is_set():
                     return
-                logger.info(f"[Rocom] 远行商人订阅线程：等待结束（{waited:.0f}s），注入事件循环 | instance={self._instance_id}")
+                elapsed = (datetime.now(self._cn_tz()) - wait_start).total_seconds()
+                logger.info(f"[Rocom] 远行商人订阅线程：等待结束（实际 {elapsed:.0f}s），注入事件循环 | instance={self._instance_id}")
                 asyncio.run_coroutine_threadsafe(self._merchant_check_with_guard(), loop)
             except Exception as e:
                 logger.error(f"[Rocom] 远行商人订阅线程异常（iteration={iteration}）: {e}")
