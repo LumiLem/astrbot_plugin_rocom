@@ -123,12 +123,11 @@ class RocomPlugin(Star):
             logger.info("[Rocom] 自动刷新功能未启用")
         
         if self.merchant_subscription_enabled:
-            logger.info("[Rocom] 远行商人订阅功能已启用，启动独立调度线程（128KB 栈）")
+            logger.info("[Rocom] 远行商人订阅功能已启用，启动独立调度线程")
             self._merchant_thread = threading.Thread(
                 target=self._merchant_subscription_thread,
                 name=f"rocom:merchant:{self._instance_id}",
                 daemon=True,
-                stack_size=131072,
             )
             self._merchant_thread.start()
         else:
