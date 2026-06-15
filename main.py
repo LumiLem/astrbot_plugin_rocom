@@ -573,6 +573,8 @@ class RocomPlugin(Star):
         variant_text = ""
         if "异色" in mutation_name and "炫彩" in mutation_name:
             variant_text = "异色炫彩"
+        elif "噩梦污染" in mutation_name:
+            variant_text = "噩梦污染"
         elif "异色" in mutation_name:
             variant_text = "异色"
         elif "炫彩" in mutation_name:
