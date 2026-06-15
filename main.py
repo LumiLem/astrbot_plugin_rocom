@@ -519,17 +519,31 @@ class RocomPlugin(Star):
     def _home_cell_info(self, home_info: Dict[str, Any]) -> Dict[str, Any]:
         return home_info.get("friend_cell_home_brief_info") or home_info.get("cell_home_brief_info") or {}
 
-    def _home_pet_icon(self, pet_id: Any, icon_url: str = "") -> str:
-        if icon_url:
-            return icon_url
+    def _home_pet_asset_id(self, pet_id: Any) -> int:
         try:
             asset_id = int(str(pet_id))
         except (TypeError, ValueError):
-            return ""
+            return 0
         if asset_id <= 0:
-            return ""
+            return 0
         if asset_id < 3000:
             asset_id += 3000
+        return asset_id
+
+    def _home_pet_icon(self, pet_id: Any, icon_url: str = "", variant_text: str = "") -> str:
+        if icon_url:
+            return icon_url
+        asset_id = self._home_pet_asset_id(pet_id)
+        if not asset_id:
+            return ""
+        if "异色" in variant_text:
+            return f"https://img.roco.lumlime.cn/{asset_id}_1.png"
+        return f"https://img.roco.lumlime.cn/{asset_id}.png"
+
+    def _home_pet_icon_fallback(self, pet_id: Any) -> str:
+        asset_id = self._home_pet_asset_id(pet_id)
+        if not asset_id:
+            return ""
         return f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{asset_id}/icon.png"
 
     def _extract_home_pet(self, raw: Dict[str, Any], index: int, guard: bool = False) -> Dict[str, Any] | None:
@@ -595,7 +609,8 @@ class RocomPlugin(Star):
             "pos": raw.get("pos") or raw.get("position") or index + 1,
             "name": str(name),
             "level": display.get("level") or raw.get("level") or home_pet.get("level") or "--",
-            "iconUrl": self._home_pet_icon(pet_id, raw.get("icon_url") or raw.get("pet_img_url") or raw.get("petIcon") or ""),
+            "iconUrl": self._home_pet_icon(pet_id, raw.get("icon_url") or raw.get("pet_img_url") or raw.get("petIcon") or "", variant_text=variant_text),
+            "iconFallback": self._home_pet_icon_fallback(pet_id) if not raw.get("icon_url") and not raw.get("pet_img_url") and not raw.get("petIcon") else "",
             "badge": "守" if is_guard else "",
             "isShiny": is_shiny,
             "variantText": variant_text,

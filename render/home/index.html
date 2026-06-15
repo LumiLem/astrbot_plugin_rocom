@@ -114,7 +114,7 @@
           <article class="pet-card indoor-card status-{{item.statusClass}}">
             <div class="pet-avatar-wrap">
               {{if item.iconUrl}}
-              <img class="pet-avatar" src="{{item.iconUrl}}" alt="">
+              <img class="pet-avatar" src="{{item.iconUrl}}" alt="" {{if item.iconFallback}}onerror="this.onerror=null;this.src='{{item.iconFallback}}'"{{/if}}>
               {{else}}
               <div class="pet-avatar empty-icon">无图</div>
               {{/if}}
