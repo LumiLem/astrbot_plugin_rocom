@@ -1363,10 +1363,10 @@ class RocomPlugin(Star):
                     if curr_ts >= target_ts or stop.is_set():
                         break
                     remaining = max(1, target_ts - curr_ts)
-                    if remaining > 600:
-                        step = 600
-                    elif remaining > 120:
+                    if remaining > 120:
                         step = 60
+                    elif remaining > 30:
+                        step = 30
                     else:
                         step = 10
                     if stop.wait(step):
