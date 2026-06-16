@@ -621,7 +621,7 @@ class RocomPlugin(Star):
             "hasEgg": bool(raw.get("have_egg") or home_pet.get("have_egg")),
             "eggReady": egg_ready,
             "eggTime": egg_time,
-            "eggText": ("可能已生蛋" if egg_ready else f"预计生蛋 {self._format_home_remaining(egg_time, now_ts)}") if egg_time else "",
+            "eggText": ("可能已生蛋" if egg_ready else f"预计生蛋 {self._format_home_remaining(egg_time, now_ts)}（{datetime.fromtimestamp(egg_time).strftime('%m-%d %H:%M')}）") if egg_time else "",
             "inspireReady": inspire_ready,
             "readyAt": rip_time,
             "eventId": f"pet:{raw.get('pos') or index + 1}:{pet_id}:{rip_time}",
