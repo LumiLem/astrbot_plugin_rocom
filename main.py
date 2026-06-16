@@ -908,7 +908,7 @@ class RocomPlugin(Star):
         all_subs = await self.home_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
-        logger.info(f"[Rocom] 家园订阅检查：共 {len(all_subs)} 个订阅")
+        logger.debug(f"[Rocom] 家园检查：{len(all_subs)} 个订阅")
         data_cache: Dict[str, Dict[str, Any] | None] = {}
         for key, sub in all_subs.items():
             uid = str(sub.get("uid", "") or "")
@@ -948,6 +948,7 @@ class RocomPlugin(Star):
 
             if not push_levels:
                 if changed:
+                    logger.debug(f"[Rocom] 家园检查：{key} uid={uid} kind={kind} 状态恢复（已收获），重置 notify_state")
                     sub["notify_state"] = notify_state
                     await self.home_sub_mgr.upsert_subscription(key, sub)
                 continue
@@ -957,7 +958,6 @@ class RocomPlugin(Star):
                 self._home_subscription_level_message(display_name, kind, level, total_count, ready_items, names)
                 for level in push_levels
             ]
-            logger.info(f"[Rocom] 家园订阅检查：key={key} uid={uid} kind={kind} ready={ready_count}/{total_count} levels={push_levels}，开始推送")
             try:
                 chain = MessageChain()
                 for mention in mentions:
@@ -966,7 +966,8 @@ class RocomPlugin(Star):
                     chain.message("\n")
                 chain.message("\n\n".join(messages))
                 await self.context.send_message(sub["umo"], chain)
-                logger.info(f"[Rocom] 家园订阅推送成功 → {key}")
+                logger.info(f"[Rocom] 家园推送 → {key} uid={uid} kind={kind} ready={ready_count}/{total_count}")
+                logger.debug(f"[Rocom] 家园检查：已更新订阅 {key} levels={push_levels}")
             except Exception as e:
                 logger.warning(f"[Rocom] 家园订阅推送失败: {e}")
                 continue
@@ -975,7 +976,6 @@ class RocomPlugin(Star):
             sub["notify_state"] = notify_state
             sub["last_push_time"] = int(time.time())
             await self.home_sub_mgr.upsert_subscription(key, sub)
-            logger.info(f"[Rocom] 家园订阅检查：已更新订阅 {key}")
             await asyncio.sleep(2)
 
     def _announcement_id(self, item: Dict[str, Any] | None) -> str:
@@ -1302,18 +1302,18 @@ class RocomPlugin(Star):
         all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
-        logger.info(f"[Rocom] 公告订阅检查：共 {len(all_subs)} 个订阅，开始查询最新公告")
+        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，查询最新公告")
         latest = await self.client.get_announcement_latest()
         if not latest:
-            logger.info("[Rocom] 公告订阅检查：无最新公告")
             return
         latest_id = self._announcement_id(latest)
         latest_ts = self._announcement_ts(latest)
         if not latest_id:
             return
-        logger.info(f"[Rocom] 公告订阅检查：最新公告 id={latest_id} title={latest.get('title', '?')}")
+        logger.debug(f"[Rocom] 公告检查：最新 id={latest_id} title={latest.get('title', '?')}")
         detail = None
         img_url = None
+        pushed = 0
         for key, sub in all_subs.items():
             last_id = str(sub.get("last_id") or "")
             last_ts = int(sub.get("since_ts") or 0)
@@ -1321,8 +1321,8 @@ class RocomPlugin(Star):
                 continue
             if latest_ts and last_ts and latest_ts <= last_ts:
                 continue
-            if detail is None:
-                logger.info(f"[Rocom] 公告订阅检查：首次命中，获取公告详情并渲染图片")
+            if img_url is None:
+                logger.info(f"[Rocom] 公告订阅：新公告 id={latest_id} title={latest.get('title', '?')}，渲染中")
                 detail = await self.client.get_announcement_detail(latest_id) or latest
                 img_url = await self.renderer.render_html(
                     "render/announcement/detail.html",
@@ -1336,10 +1336,11 @@ class RocomPlugin(Star):
                 chain.file_image(img_url)
             elif latest.get("summary"):
                 chain.message(str(latest.get("summary")))
-            logger.info(f"[Rocom] 公告订阅检查：推送订阅 {key}")
             try:
                 await self.context.send_message(sub["umo"], chain)
                 logger.info(f"[Rocom] 公告订阅推送成功 → {key}")
+                logger.debug(f"[Rocom] 公告检查：已更新订阅 {key} last_id={latest_id}")
+                pushed += 1
             except Exception as e:
                 logger.warning(f"[Rocom] 公告订阅推送失败: {e}")
                 continue
@@ -1347,9 +1348,9 @@ class RocomPlugin(Star):
             sub["since_ts"] = latest_ts or int(time.time())
             sub["updated_at"] = int(time.time())
             await self.announcement_sub_mgr.upsert_subscription(key, sub)
-            logger.info(f"[Rocom] 公告订阅检查：已更新订阅 {key}")
             await asyncio.sleep(2)
-        logger.info("[Rocom] 公告订阅检查：本轮完成")
+        if pushed:
+            logger.info(f"[Rocom] 公告订阅：本轮推送 {pushed} 个订阅")
 
     def _merchant_check_times(self, base: datetime | None = None) -> List[datetime]:
         now = base or datetime.now(self._cn_tz())
@@ -1677,10 +1678,8 @@ class RocomPlugin(Star):
         return img_url
 
     async def _run_merchant_subscription_window(self):
-        logger.info("[Rocom] 远行商人订阅窗口：开始执行检查")
         window_start = datetime.now(self._cn_tz())
         for retry_index in range(self._merchant_retry_times + 1):
-            logger.info(f"[Rocom] 远行商人订阅窗口：第 {retry_index + 1}/{self._merchant_retry_times + 1} 次检查")
             if retry_index > 0:
                 delay = max(
                     1,
@@ -1693,8 +1692,6 @@ class RocomPlugin(Star):
                 await asyncio.sleep(delay)
             status = await self._check_merchant_subscriptions()
             if status != "empty":
-                elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
-                logger.info(f"[Rocom] 远行商人订阅窗口：检查完成，状态={status}，耗时={elapsed:.1f}s")
                 return
             if retry_index >= self._merchant_retry_times:
                 elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
@@ -1702,56 +1699,55 @@ class RocomPlugin(Star):
                 return
 
     async def _check_merchant_subscriptions(self) -> str:
-        logger.info("[Rocom] 远行商人订阅检查：开始获取所有订阅")
         all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
         if not all_subs:
-            logger.info("[Rocom] 远行商人订阅检查：无订阅，跳过")
             return "no_subscriptions"
-        logger.info(f"[Rocom] 远行商人订阅检查：已获取 {len(all_subs)} 个订阅，开始查询 API")
+        logger.debug(f"[Rocom] 远行商人检查：{len(all_subs)} 个订阅，查询 API")
         try:
             res = await self.client.get_merchant_info(refresh=True)
-            logger.info(f"[Rocom] 远行商人订阅检查：API 查询成功，开始解析响应")
             activity, products, history_groups = self._merchant_products_from_response(res)
+            logger.debug(f"[Rocom] 远行商人检查：API 成功，解析到 {len(products)} 个商品")
         except Exception as e:
             logger.warning(f"[Rocom] 远行商人订阅查询失败，视为空结果等待重试: {e}")
             return "empty"
         round_info = self._current_merchant_round()
-        logger.info(f"[Rocom] 远行商人订阅检查：当前轮次={round_info['current']}，轮次ID={round_info['round_id']}，is_open={round_info['is_open']}，剩余={round_info['countdown']}，商品数={len(products)}")
         if not round_info["is_open"]:
-            logger.info("[Rocom] 远行商人订阅检查：当前不在营业时间，跳过")
             return "closed"
         if not products:
-            logger.warning("[Rocom] 远行商人订阅检查：API 返回商品列表为空")
             return "empty"
         product_names = {p.get("name", "") for p in products}
-        logger.info(f"[Rocom] 远行商人订阅检查：当前商品={product_names}")
         pending_pushes = []
+        skipped = 0
         for key, sub in all_subs.items():
             if sub.get("last_push_round") == round_info["round_id"]:
-                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key} 本轮已推送过（last_push_round={round_info['round_id']}），跳过")
+                logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 本轮已推送，跳过")
+                skipped += 1
                 continue
             if sub.get("all_products"):
                 matched = ["全部商品"]
-                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key}（全部订阅）→ 跳过商品匹配，直接推送")
+                logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 全部订阅模式")
             else:
                 items = sub.get("items") or self.merchant_subscription_items
                 matched = [name for name in items if name in product_names]
-                logger.info(f"[Rocom] 远行商人订阅检查：订阅 {key}（关注={items}）→ 命中={matched}")
+                logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 关注={items} → 命中={matched}")
                 if not matched:
                     continue
             pending_pushes.append((key, sub, matched))
+        logger.debug(f"[Rocom] 远行商人检查：{len(pending_pushes)} 待推送，{skipped} 已推送跳过")
         if not pending_pushes:
-            logger.info("[Rocom] 远行商人订阅检查：无订阅命中本轮商品，结束")
             return "done"
-        logger.info(f"[Rocom] 远行商人订阅检查：共 {len(pending_pushes)} 个订阅待推送，开始预渲染图片")
+        logger.info(
+            f"[Rocom] 远行商人 第{round_info['current']}轮 | 商品:{'、'.join(sorted(product_names))} | {len(pending_pushes)}订阅待推送 | 剩余{round_info['countdown']}"
+        )
         img_url = None
         try:
             img_url = await self._render_merchant_image_from_data(activity, products, round_info, history_groups)
-            logger.info(f"[Rocom] 远行商人订阅检查：图片预渲染成功，路径={img_url}")
+            logger.debug(f"[Rocom] 远行商人检查：图片渲染成功 {img_url}")
         except Exception as e:
-            logger.warning(f"[Rocom] 远行商人订阅图片预渲染失败，将仅发送文本: {e}")
+            logger.warning(f"[Rocom] 远行商人图片预渲染失败，将仅发送文本: {e}")
+        window_start = datetime.now(self._cn_tz())
+        pushed = 0
         for key, sub, matched in pending_pushes:
-            logger.info(f"[Rocom] 远行商人订阅检查：推送订阅 {key}，命中商品={matched}")
             text_chain = MessageChain()
             if sub.get("mention_all"):
                 text_chain.at_all()
@@ -1763,33 +1759,37 @@ class RocomPlugin(Star):
                 text_chain.message(
                     f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
                 )
+            push_ok = False
             try:
                 await self.context.send_message(sub["umo"], text_chain)
-                logger.info(f"[Rocom] 远行商人订阅检查：文本推送成功 → {key}")
+                push_ok = True
             except Exception as e:
-                logger.warning(f"[Rocom] 远行商人订阅文本推送失败: {e}")
+                logger.warning(f"[Rocom] 远行商人文本推送失败: {e}")
                 fallback = MessageChain().message(
                     f"远行商人本轮命中订阅商品：{'、'.join(matched)}"
                 )
                 try:
                     await self.context.send_message(sub["umo"], fallback)
-                    logger.info(f"[Rocom] 远行商人订阅检查：降级文本推送成功 → {key}")
+                    push_ok = True
                 except Exception as fallback_e:
-                    logger.warning(f"[Rocom] 远行商人订阅降级文本推送失败: {fallback_e}")
+                    logger.warning(f"[Rocom] 远行商人降级文本推送失败: {fallback_e}")
                     continue
             if img_url:
                 try:
                     image_chain = MessageChain().file_image(img_url)
                     await self.context.send_message(sub["umo"], image_chain)
-                    logger.info(f"[Rocom] 远行商人订阅检查：图片推送成功 → {key}")
                 except Exception as image_e:
-                    logger.warning(f"[Rocom] 远行商人订阅图片推送失败: {image_e}")
+                    logger.warning(f"[Rocom] 远行商人图片推送失败: {image_e}")
+            if push_ok:
+                pushed += 1
+                logger.info(f"[Rocom] 远行商人推送 → {key} {'全部' if sub.get('all_products') else '、'.join(matched)}")
+                logger.debug(f"[Rocom] 远行商人检查：已更新订阅 {key} last_push_round={round_info['round_id']}")
             sub["last_push_round"] = round_info["round_id"]
             sub["last_matched_items"] = matched
             await self.merchant_sub_mgr.upsert_subscription(key, sub)
-            logger.info(f"[Rocom] 远行商人订阅检查：已更新订阅 {key} 的 last_push_round={round_info['round_id']}")
             await asyncio.sleep(5)
-        logger.info(f"[Rocom] 远行商人订阅检查：所有推送完成，共处理 {len(pending_pushes)} 个订阅")
+        elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
+        logger.info(f"[Rocom] 远行商人 本轮推送 {pushed}/{len(pending_pushes)} 个订阅，耗时 {elapsed:.0f}s")
         return "done"
 
     def _split_merchant_subscription_items(self, raw_text: str) -> List[str]:
