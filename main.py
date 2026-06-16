@@ -68,10 +68,13 @@ class RocomPlugin(Star):
             "merchant_subscription_enabled", True
         )
         self.merchant_subscription_items = self.config.get(
-            "merchant_subscription_items", ["国王球", "棱镜球", "炫彩精灵蛋"]
+            "merchant_subscription_items", ["国王球", "棱镜球", "炫彩精灵蛋", "祝福项坠", "首领血脉药剂", "奇异血脉药剂", "神奇的蛋", "黑晶琉璃", "黄石榴石", "蓝晶碧玺", "紫莲刚玉"]
         )
         self.merchant_subscription_all_products = self.config.get(
-            "merchant_subscription_all_products", False
+            "merchant_subscription_all_products", True
+        )
+        self.merchant_subscription_mention_items = self.config.get(
+            "merchant_subscription_mention_items", ["国王球", "棱镜球", "炫彩精灵蛋", "祝福项坠"]
         )
         self.merchant_private_subscription_enabled = self.config.get(
             "merchant_private_subscription_enabled", True
@@ -1749,8 +1752,14 @@ class RocomPlugin(Star):
         pushed = 0
         for key, sub, matched in pending_pushes:
             text_chain = MessageChain()
-            if sub.get("mention_all"):
-                text_chain.at_all()
+            if sub.get("mention_all") and not key.startswith("private_"):
+                mention_items = sub.get("mention_items")
+                if mention_items:
+                    check_set = product_names if sub.get("all_products") else set(matched)
+                    if check_set & set(mention_items):
+                        text_chain.at_all()
+                else:
+                    text_chain.at_all()
             if sub.get("all_products"):
                 text_chain.message(
                     f"远行商人本轮商品已更新\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}\n商品：{'、'.join(product_names)}"
@@ -1804,15 +1813,15 @@ class RocomPlugin(Star):
             seen.add(name)
         return items
 
-    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool]:
+    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None]:
         """解析远行商人订阅参数
-        返回：(是否@全体，自定义商品列表，是否订阅全部)
+        返回：(是否@全体，自定义商品列表，是否订阅全部，@触发商品列表)
         自定义商品列表为 None 表示使用默认配置
-        订阅全部为 True 时商品列表用于展示，匹配时跳过商品检查
+        @触发商品列表为 None 时命中任一商品都 @全体，非空时仅命中其中商品才 @全体
         """
         text = str(raw_text or "").strip()
         if not text:
-            return False, None, False
+            return False, None, False, None
         tokens = text.split(maxsplit=1)
         mention = False
         items_text = text
@@ -1821,11 +1830,38 @@ class RocomPlugin(Star):
             items_text = tokens[1] if len(tokens) > 1 else ""
         items_text = str(items_text or "").strip()
         if not items_text:
-            return mention, None, False
-        if items_text in ("全部", "所有", "all"):
-            return mention, ["全部商品"], True
-        items = self._split_merchant_subscription_items(items_text)
-        return mention, items if items else None, False
+            return mention, None, False, None
+        for prefix in ("全部", "所有", "all"):
+            if items_text == prefix or items_text.startswith(prefix + " "):
+                suffix = items_text[len(prefix):].strip()
+                if suffix:
+                    raw_mention = self._split_merchant_subscription_items(suffix)
+                    mention_items = [item[1:] for item in raw_mention if item.startswith("@") and len(item) > 1]
+                    mention_items = mention_items if mention_items else None
+                else:
+                    mention_items = None
+                return mention, ["全部商品"], True, mention_items
+        raw_items = self._split_merchant_subscription_items(items_text)
+        mention_items = [item[1:] for item in raw_items if item.startswith("@") and len(item) > 1]
+        items = [item[1:] if item.startswith("@") and len(item) > 1 else item for item in raw_items]
+        mention_items = mention_items if mention_items else None
+        return mention, items if items else None, False, mention_items
+
+    def _default_items_hint(self) -> str:
+        if self.merchant_subscription_all_products:
+            return "全部商品"
+        return f"{'、'.join(self.merchant_subscription_items[:3])}等{len(self.merchant_subscription_items)}种"
+
+    def _default_config_hint(self) -> str:
+        if self.merchant_subscription_all_products:
+            items = "全部商品"
+        else:
+            items = f"{'、'.join(self.merchant_subscription_items)}"
+        if self.merchant_subscription_mention_items:
+            at = f" | 可@商品：{'、'.join(self.merchant_subscription_mention_items)}"
+        else:
+            at = ""
+        return f"{items}{at}"
 
     def _wiki_asset_id(self, number: Any) -> int | None:
         try:
@@ -2871,7 +2907,7 @@ class RocomPlugin(Star):
                         {"cmd": "洛克背包 <筛选> <页码>", "desc": "查看精灵收集 (筛选:全部/异色/了不起/炫彩，参数可交换)"},
                         {"cmd": "洛克阵容 <分类> <页码>", "desc": "查看阵容助手推荐阵容 (参数可交换)"},
                         {"cmd": "洛克交换大厅 <页码>", "desc": "查看交换大厅海报 (支持别名：洛克大厅/交换大厅)"},
-                        {"cmd": "远行商人", "desc": "查看当前轮次远行商人商品"},
+                        {"cmd": "远行商人", "desc": "查看当前轮次远行商人商品及剩余时间"},
                         {"cmd": "洛克公告 [页码]", "desc": "查询洛克王国公告列表"},
                         {"cmd": "洛克公告详情 <公告ID>", "desc": "查看指定公告详情"},
                         {"cmd": "洛克公告最新", "desc": "查看最新一条公告"},
@@ -2885,8 +2921,8 @@ class RocomPlugin(Star):
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
                         {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
-                        {"cmd": "订阅远行商人 1/0 [商品 商品/全部]", "desc": "群主/群管可配置订阅商品，不加商品用默认，\"全部\"每轮必推"},
-                        {"cmd": "取消订阅远行商人", "desc": "关闭当前群远行商人订阅"},
+                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部]", "desc": "订阅远行商人，1=@全体，@前缀=仅命中时@全体，全部=每轮必推"},
+                        {"cmd": "取消订阅远行商人", "desc": "关闭当前群/私聊远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
                         {"cmd": "洛克wiki <精灵名>", "desc": "暂不可用：接口暂时关闭，当前仅返回提示"},
@@ -4131,7 +4167,7 @@ class RocomPlugin(Star):
         else:
             args_text = args.strip()
         
-        mention, custom_items, all_products = self._parse_merchant_subscription_args(args_text)
+        mention, custom_items, all_products, mention_items = self._parse_merchant_subscription_args(args_text)
         if custom_items is not None:
             selected_items = list(custom_items)
         else:
@@ -4139,6 +4175,8 @@ class RocomPlugin(Star):
             if self.merchant_subscription_all_products:
                 all_products = True
                 selected_items = ["全部商品"]
+            if mention_items is None and self.merchant_subscription_mention_items:
+                mention_items = list(self.merchant_subscription_mention_items)
         
         if event.is_private_chat():
             subscription_key = f"private_{event.get_sender_id()}"
@@ -4154,6 +4192,7 @@ class RocomPlugin(Star):
                 "type": subscription_type,
                 "umo": event.unified_msg_origin,
                 "mention_all": mention,
+                "mention_items": mention_items,
                 "items": selected_items,
                 "all_products": all_products,
                 "last_push_round": "",
@@ -4161,21 +4200,38 @@ class RocomPlugin(Star):
                 "updated_by": str(event.get_sender_id()),
             },
         )
-        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention}")
+        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items}")
         if all_products:
-            source_hint = "全部商品（每轮必推）"
+            summary = "全部商品（每轮必推）"
         elif custom_items is not None:
-            source_hint = "自定义商品"
+            summary = f"{'、'.join(selected_items)}（自定义）"
         else:
-            source_hint = "WebUI 默认商品"
-        mention_hint = f"命中后{'会' if mention else '不会'}@全体" if not event.is_private_chat() else ""
-        yield event.plain_result(
-            f"已订阅远行商人，监听商品：{'、'.join(selected_items)}（{source_hint}）；{mention_hint}\n"
-            f"订阅方式：/订阅远行商人 1 为 @全体（仅群聊），/订阅远行商人 0 为不@全体，"
-            f"/订阅远行商人 1 国王球 棱镜球 为自定义商品，"
-            f"/订阅远行商人 1 全部 为全部商品（每轮必推），"
-            f"/取消订阅远行商人 可关闭订阅。"
-        )
+            summary = f"{'、'.join(selected_items)}（默认）"
+        if event.is_private_chat():
+            at_desc = ""
+        elif mention and mention_items:
+            at_desc = f" | 命中{'、'.join(mention_items)}时@全体"
+        elif mention:
+            at_desc = " | 命中后@全体"
+        else:
+            at_desc = " | 不@全体"
+        if event.is_private_chat():
+            yield event.plain_result(
+                f"已订阅远行商人：{summary}\n"
+                f"示例：/订阅远行商人 → {self._default_items_hint()}\n"
+                f"/订阅远行商人 国王球 棱镜球 → 自定义商品\n"
+                f"/订阅远行商人 全部 → 每轮必推\n"
+                f"/取消订阅远行商人 → 关闭订阅"
+            )
+        else:
+            yield event.plain_result(
+                f"已订阅远行商人：{summary}{at_desc}\n"
+                f"默认配置：{self._default_config_hint()}\n"
+                f"示例：/订阅远行商人 1 国王球 棱镜球 → 仅订阅指定商品\n"
+                f"/订阅远行商人 1 @棱镜球 国王球 → 仅棱镜球命中时@全体\n"
+                f"/订阅远行商人 1 全部 @棱镜球 → 每轮必推，棱镜球@全体\n"
+                f"/取消订阅远行商人 → 关闭订阅"
+            )
 
     @filter.command("取消订阅远行商人")
     async def unsubscribe_merchant(self, event: AstrMessageEvent):

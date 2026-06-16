@@ -54,7 +54,7 @@
     "type": "list",
     "description": "远行商人默认订阅商品",
     "hint": "群管理员订阅时默认监听这些商品名称，按名称精确匹配。下面「订阅全部商品」开启后此项仅作展示",
-    "default": ["国王球", "棱镜球", "炫彩精灵蛋"],
+    "default": ["国王球", "棱镜球", "炫彩精灵蛋", "祝福项坠", "首领血脉药剂", "奇异血脉药剂", "神奇的蛋", "黑晶琉璃", "黄石榴石", "蓝晶碧玺", "紫莲刚玉"],
     "items": {
       "type": "string"
     }
@@ -63,7 +63,16 @@
     "type": "bool",
     "description": "默认订阅全部商品",
     "hint": "开启后，群管理员不加商品名订阅时，默认订阅全部商品（每轮必推，跳过商品匹配）",
-    "default": false
+    "default": true
+  },
+  "merchant_subscription_mention_items": {
+    "type": "list",
+    "description": "默认@全体触发商品",
+    "hint": "群管理员不加@商品名时，命中这些商品才@全体。留空表示命中任一商品都@全体，仅群聊有效",
+    "default": ["国王球", "棱镜球", "炫彩精灵蛋", "祝福项坠"],
+    "items": {
+      "type": "string"
+    }
   },
   "merchant_private_subscription_enabled": {
     "type": "bool",
