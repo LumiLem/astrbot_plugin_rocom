@@ -570,34 +570,35 @@ class RocomPlugin(Star):
             or home_pet.get("egg_time")
         )
         egg_ready = bool(egg_time and now_ts >= egg_time)
-        speciality_values = []
-        for value in (
-            home_pet.get("real_speciality_ids"),
-            raw.get("real_speciality_ids"),
-            home_pet.get("speciality_id"),
-            raw.get("speciality_id"),
-        ):
-            if isinstance(value, list):
-                speciality_values.extend(value)
-            elif value not in (None, ""):
-                speciality_values.append(value)
-        speciality_ids = {str(value).strip() for value in speciality_values if str(value).strip()}
+        mutation_type = display.get("mutation_type") if display.get("mutation_type") is not None else raw.get("mutation_type")
         mutation_name = str(display.get("mutation_name") or raw.get("mutation_name") or home_pet.get("mutation_name") or "")
         variant_text = ""
-        if "异色" in mutation_name and "炫彩" in mutation_name:
-            variant_text = "异色炫彩"
-        elif "噩梦污染" in mutation_name:
-            variant_text = "噩梦污染"
-        elif "异色" in mutation_name:
-            variant_text = "异色"
-        elif "炫彩" in mutation_name:
-            variant_text = "炫彩"
-        elif "103" in speciality_ids and "502" in speciality_ids:
-            variant_text = "异色炫彩"
-        elif "103" in speciality_ids:
-            variant_text = "异色"
-        elif "502" in speciality_ids:
-            variant_text = "炫彩"
+        fallback_to_name = True
+        if isinstance(mutation_type, (int, float)) and not isinstance(mutation_type, bool):
+            mt = int(mutation_type)
+            if mt == 0:
+                fallback_to_name = False
+            elif mt == 1:
+                variant_text = "异色"
+                fallback_to_name = False
+            elif mt == 8:
+                variant_text = "炫彩"
+                fallback_to_name = False
+            elif mt == 9:
+                variant_text = "异色炫彩"
+                fallback_to_name = False
+            elif mt == 32:
+                variant_text = "噩梦污染"
+                fallback_to_name = False
+        if fallback_to_name:
+            if "异色" in mutation_name and "炫彩" in mutation_name:
+                variant_text = "异色炫彩"
+            elif "噩梦污染" in mutation_name:
+                variant_text = "噩梦污染"
+            elif "异色" in mutation_name:
+                variant_text = "异色"
+            elif "炫彩" in mutation_name:
+                variant_text = "炫彩"
         is_shiny = variant_text in {"异色", "异色炫彩"}
         status = raw.get("status")
         is_guard = guard or bool(raw.get("is_guard") or raw.get("guard")) or str(status).lower() in {"2", "guard", "守卫"}
