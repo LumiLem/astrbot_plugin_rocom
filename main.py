@@ -3995,6 +3995,7 @@ class RocomPlugin(Star):
         if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
             return
+        yield event.plain_result(f"正在查询 UID:{uid} 的家园信息，请稍候...")
         res = await self.client.ingame_home_info(
             uid,
             fw_token=fw_token,
