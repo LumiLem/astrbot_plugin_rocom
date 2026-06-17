@@ -733,19 +733,32 @@ class RocomClient:
             request_timeout=10.0,
         )
 
+    @staticmethod
+    def _is_completed_gateway_payload(data: Optional[Dict]) -> bool:
+        if not isinstance(data, dict):
+            return False
+        return any(key in data for key in ("rows", "home_info", "source", "title"))
+
     def _task_result_payload(self, task_data: Optional[Dict]) -> Optional[Dict]:
         if not isinstance(task_data, dict):
             return task_data
         status = str(task_data.get("status") or "").lower()
         if status in {"queued", "pending", "running", "processing"}:
             return None
+
         for key in ("result", "data"):
             value = task_data.get(key)
             if isinstance(value, dict):
-                return value
-        if any(key in task_data for key in ("rows", "home_info", "source", "title")):
+                if self._is_completed_gateway_payload(value):
+                    return value
+                for nested_key in ("result", "data"):
+                    nested = value.get(nested_key)
+                    if isinstance(nested, dict) and self._is_completed_gateway_payload(nested):
+                        return nested
+
+        if self._is_completed_gateway_payload(task_data):
             return task_data
-        return task_data
+        return None
 
     async def _poll_ingame_task(
         self,
@@ -769,10 +782,13 @@ class RocomClient:
             if result:
                 return result
             status = str((task_data or {}).get("status") or "").lower()
-            if status in {"failed", "error", "cancelled", "canceled"}:
+            if status in {"failed", "error", "cancelled", "canceled", "timeout"}:
                 self._set_last_error(
                     str((task_data or {}).get("message") or f"{label}任务执行失败")
                 )
+                return None
+            if status in {"done", "success", "succeeded", "completed", "finished"}:
+                self._set_last_error(f"{label}任务已完成但未返回可解析结果（task_id: {task_id}）")
                 return None
 
         self._set_last_error(f"{label}任务仍在队列中，请稍后重试（task_id: {task_id}）")
@@ -810,6 +826,9 @@ class RocomClient:
             request_timeout=10.0,
         )
         if status_code == 200:
+            direct = self._task_result_payload(data)
+            if direct:
+                return direct
             task_id = (data or {}).get("task_id")
             if task_id:
                 return await self._poll_ingame_task(
@@ -819,7 +838,7 @@ class RocomClient:
                     user_identifier=user_identifier,
                     max_wait_seconds=max_wait_seconds,
                 )
-            return self._task_result_payload(data) or data
+            return data
 
         if status_code is None:
             status_code, data = await self._request_with_status(
@@ -831,6 +850,9 @@ class RocomClient:
                 request_timeout=10.0,
             )
             if status_code == 200:
+                direct = self._task_result_payload(data)
+                if direct:
+                    return direct
                 task_id = (data or {}).get("task_id")
                 if task_id:
                     return await self._poll_ingame_task(
@@ -840,7 +862,7 @@ class RocomClient:
                         user_identifier=user_identifier,
                         max_wait_seconds=max_wait_seconds,
                     )
-                return self._task_result_payload(data) or data
+                return data
 
         task_id = (data or {}).get("task_id")
         if not task_id:

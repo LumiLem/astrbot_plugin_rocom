@@ -2563,10 +2563,14 @@ class RocomPlugin(Star):
 
     def _clean_player_field_value(self, field: str, value: str) -> str:
         text = str(value or "").strip().strip("'")
-        if text in {"<0B>", "<0b>", "<0B >", "<0b >", ""}:
+        if not text or re.match(r'^<\s*\d+\s*[Bb]', text):
             return "未设置"
         if field in {"is_online", "online", "chat_top_unlock", "is_friend", "is_black", "is_black_role", "is_chat_node_unlock"}:
-            return "是" if text in {"1", "true", "True"} else "否"
+            if text in {"1", "true", "True", "是", "在线"}:
+                return "是"
+            if text in {"0", "false", "False", "否", "离线"}:
+                return "否"
+            return text
         if field in {"sex", "gender"}:
             return {"0": "未知", "1": "男", "2": "女"}.get(text, text)
         if field in {"friend_type"}:
@@ -2582,8 +2586,17 @@ class RocomPlugin(Star):
         label_map: Dict[str, str] = {}
         for row in rows:
             field = str(row.get("field", ""))
-            row_map[field] = str(row.get("value", ""))
-            label_map[field] = str(row.get("label") or row.get("field") or "")
+            value = str(row.get("value", ""))
+            label = str(row.get("label") or row.get("field") or "")
+            row_map[field] = value
+            label_map[field] = label
+            short = field.rsplit(".", 1)[-1] if "." in field else field
+            if short and short not in row_map:
+                row_map[short] = value
+            if short and short not in label_map:
+                label_map[short] = label
+            if label and label not in row_map:
+                row_map[label] = value
 
         title = payload.get("title") or "玩家搜索"
         nickname = self._clean_player_field_value("name", row_map.get("name", "-"))
@@ -2683,7 +2696,10 @@ class RocomPlugin(Star):
         }
         for row in rows:
             field = str(row.get("field", ""))
-            if field in used_fields or field in skip_fields:
+            short = field.rsplit(".", 1)[-1] if "." in field else field
+            if field in used_fields or short in used_fields:
+                continue
+            if field in skip_fields or short in skip_fields:
                 continue
             raw_value = str(row.get("value", ""))
             if raw_value.startswith("(") and raw_value.endswith(")"):
@@ -2691,7 +2707,7 @@ class RocomPlugin(Star):
             extra_items.append(
                 {
                     "label": row.get("label") or field,
-                    "value": self._clean_player_field_value(field, raw_value),
+                    "value": self._clean_player_field_value(short, raw_value),
                 }
             )
         if extra_items:
@@ -2739,6 +2755,7 @@ class RocomPlugin(Star):
                 "核心档案",
                 [
                     ("等级", parsed.get("level", "-")),
+                    ("注册时间", self._player_field(parsed, "regist_date")),
                     ("在线状态", self._player_field(parsed, "online")),
                     ("性别", self._player_field(parsed, "gender", self._player_field(parsed, "sex"))),
                     ("世界等级", self._player_field(parsed, "world_level")),
