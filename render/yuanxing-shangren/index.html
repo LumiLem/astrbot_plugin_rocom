@@ -31,6 +31,12 @@
     --card-bg: rgba(255, 252, 247, 0.82);
     --tag-bg: rgba(255, 214, 153, 0.4);
     --tag-text: #9a5f19;
+    --weekend-color: #c04030;
+    --normal-color: #2a8040;
+    --round-color: #2a60b0;
+    --weekend-bg: rgba(220, 80, 60, 0.15);
+    --normal-bg: rgba(60, 160, 80, 0.15);
+    --round-bg: rgba(60, 120, 220, 0.15);
 }
 
 html,
@@ -279,6 +285,48 @@ body {
     background: rgba(255,255,255,0.52);
 }
 
+.category-section {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.category-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 4px;
+}
+
+.category-title {
+    font-family: var(--font-family-accent);
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--text-1);
+}
+
+.category-tag {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.category-tag.weekend {
+    background: var(--weekend-bg);
+    color: var(--weekend-color);
+}
+
+.category-tag.normal {
+    background: var(--normal-bg);
+    color: var(--normal-color);
+}
+
+.category-tag.round {
+    background: var(--round-bg);
+    color: var(--round-color);
+}
+
 .history-section {
     margin-top: 18px;
     padding: 18px;
@@ -473,31 +521,42 @@ body {
             </div>
 
             <div class="products-grid">
-                {% if products and products|length > 0 %}
-                {% for product in products %}
-                <div class="product-card">
-                    <div class="product-image-container">
-                        <img class="product-image" src="{{product.image}}" alt="{{product.name}}">
+                {% if categories and categories|length > 0 %}
+                {% set show_category_header = categories|length > 1 %}
+                {% for cat in categories %}
+                <div class="category-section">
+                    {% if show_category_header %}
+                    <div class="category-header">
+                        <span class="category-title">{{cat.label}}</span>
+                        <span class="category-tag {{cat.key}}">{{cat.products|length}} 件</span>
                     </div>
-                    <div class="product-main">
-                        <div class="product-name">{{product.name}}</div>
-                        <div class="product-sub">远行商人当前轮次商品</div>
-                        <div class="product-time">北京时间 {{product.time_label}}</div>
-                    </div>
-                    <div class="product-side">
-                        {% if product.price is not none %}
-                        <div class="price-pill">
-                            <img class="coin-icon" src="{{_res_path}}img/coin.png" alt="金币">
-                            <span>{{product.price}}</span>
+                    {% endif %}
+                    {% for product in cat.products %}
+                    <div class="product-card">
+                        <div class="product-image-container">
+                            <img class="product-image" src="{{product.image}}" alt="{{product.name}}">
                         </div>
-                        {% endif %}
-                        {% if product.buy_limit_num is not none %}
-                        <div class="limit-pill">限购 {{product.buy_limit_num}}</div>
-                        {% endif %}
-                        {% if product.price is none and product.buy_limit_num is none %}
-                        <div class="product-side-empty"></div>
-                        {% endif %}
+                        <div class="product-main">
+                            <div class="product-name">{{product.name}}</div>
+                            <div class="product-sub">远行商人当前轮次商品</div>
+                            <div class="product-time">北京时间 {{product.time_label}}</div>
+                        </div>
+                        <div class="product-side">
+                            {% if product.price is not none %}
+                            <div class="price-pill">
+                                <img class="coin-icon" src="{{_res_path}}img/coin.png" alt="金币">
+                                <span>{{product.price}}</span>
+                            </div>
+                            {% endif %}
+                            {% if product.buy_limit_num is not none %}
+                            <div class="limit-pill">限购 {{product.buy_limit_num}}</div>
+                            {% endif %}
+                            {% if product.price is none and product.buy_limit_num is none %}
+                            <div class="product-side-empty"></div>
+                            {% endif %}
+                        </div>
                     </div>
+                    {% endfor %}
                 </div>
                 {% endfor %}
                 {% else %}

@@ -1435,6 +1435,20 @@ class RocomPlugin(Star):
     def _cn_tz(self):
         return timezone(timedelta(hours=8))
 
+    def _classify_merchant_item(self, start_ms, end_ms):
+        if start_ms is None or end_ms is None or start_ms == 0 or end_ms == 0:
+            return "normal"
+        duration_hours = (end_ms - start_ms) / (1000 * 60 * 60)
+        if duration_hours / 24 >= 2:
+            return "weekend"
+        start_dt = datetime.fromtimestamp(start_ms / 1000, tz=self._cn_tz())
+        end_dt = datetime.fromtimestamp(end_ms / 1000, tz=self._cn_tz())
+        start_hour = start_dt.hour + start_dt.minute / 60
+        end_hour = end_dt.hour + end_dt.minute / 60
+        if start_hour <= 8 and end_hour >= 23.5:
+            return "normal"
+        return "round"
+
     def _current_merchant_round(self, now: datetime | None = None):
         now = now or datetime.now(self._cn_tz())
         if now.tzinfo is None:
@@ -1567,6 +1581,7 @@ class RocomPlugin(Star):
             "is_active": is_active,
             "status_label": status_label,
             "category": category,
+            "product_category": self._classify_merchant_item(start_ms, end_ms),
             "price": item.get("price") if item.get("price") not in (None, "") else goods_meta.get("price"),
             "buy_limit_num": (
                 item.get("buy_limit_num")
@@ -1658,16 +1673,32 @@ class RocomPlugin(Star):
         activity: Dict[str, Any] | None,
         products: List[Dict[str, Any]] | None,
         round_info: Dict[str, Any] | None,
-        history_groups: List[Dict[str, Any]] | None = None,
+        history_groups: List[Dict[str, Any] | None] = None,
     ):
+        products = products or []
+        category_defs = [
+            {"key": "normal", "label": "热销商品", "products": []},
+            {"key": "round", "label": "常规商品", "products": []},
+            {"key": "weekend", "label": "周末限定", "products": []},
+        ]
+        for product in products:
+            pc = product.get("product_category", "round")
+            for cat_def in category_defs:
+                if cat_def["key"] == pc:
+                    cat_def["products"].append(product)
+                    break
+
+        categories = [cat_def for cat_def in category_defs if cat_def["products"]]
+
         data = {
             "background": "{{_res_path}}img/bg.C8CUoi7I.jpg",
             "titleIcon": True,
             "title": (activity or {}).get("name", "远行商人"),
             "subtitle": (activity or {}).get("start_date", "每日 08:00 / 12:00 / 16:00 / 20:00 刷新"),
-            "product_count": len(products or []),
+            "product_count": len(products),
             "round_info": round_info or self._current_merchant_round(),
-            "products": products or [],
+            "products": products,
+            "categories": categories,
             "history_groups": history_groups or [],
         }
         img_url = await self.renderer.render_html(
@@ -1762,9 +1793,26 @@ class RocomPlugin(Star):
                 else:
                     text_chain.at_all()
             if sub.get("all_products"):
-                text_chain.message(
-                    f"远行商人本轮商品已更新\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}\n商品：{'、'.join(product_names)}"
-                )
+                category_labels = {"normal": "热销商品", "round": "常规商品", "weekend": "周末限定"}
+                cat_order = ["normal", "round", "weekend"]
+                cat_map = {}
+                for p in products:
+                    pc = p.get("product_category", "round")
+                    cat_map.setdefault(pc, []).append(p)
+                active_cats = [k for k in cat_order if k in cat_map]
+                lines = [
+                    f"远行商人本轮商品已更新",
+                    f"轮次：第{round_info['current']}轮",
+                    f"剩余：{round_info['countdown']}",
+                ]
+                if len(active_cats) > 1:
+                    for key in cat_order:
+                        prods = cat_map.get(key, [])
+                        names = "、".join(p["name"] for p in prods)
+                        lines.append(f"{category_labels[key]}：{names}")
+                else:
+                    lines.append(f"商品：{'、'.join(product_names)}")
+                text_chain.message("\n".join(lines).strip())
             else:
                 text_chain.message(
                     f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
@@ -3894,10 +3942,29 @@ class RocomPlugin(Star):
         if not products:
             yield event.plain_result("当前远行商人暂无商品。")
             return
-        names = "、".join([p["name"] for p in products])
-        yield event.plain_result(
-            f"远行商人当前商品：{names}\n当前轮次：{round_info['current'] or '未开放'}\n剩余：{round_info['countdown']}"
-        )
+        lines = [
+            f"远行商人 第{round_info['current'] or '未开放'}/{round_info['total']}轮",
+            f"剩余：{round_info['countdown']}",
+            "",
+        ]
+        category_labels = {"normal": "热销商品", "round": "常规商品", "weekend": "周末限定"}
+        category_order = ["normal", "round", "weekend"]
+        cat_map = {}
+        for p in products:
+            pc = p.get("product_category", "round")
+            cat_map.setdefault(pc, []).append(p)
+        active_cats = [k for k in category_order if k in cat_map]
+        show_header = len(active_cats) > 1
+        for key in active_cats:
+            prods = cat_map.get(key)
+            if not prods:
+                continue
+            if show_header:
+                lines.append(f"【{category_labels[key]}】")
+            for i, p in enumerate(prods, 1):
+                lines.append(f"  {i}. {p['name']}  ({p['time_label']})")
+            lines.append("")
+        yield event.plain_result("\n".join(lines).strip())
 
     @filter.command("洛克玩家")
     async def rocom_player_search(self, event: AstrMessageEvent, uid: str = ""):
