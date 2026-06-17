@@ -616,6 +616,7 @@ class RocomPlugin(Star):
             "iconFallback": self._home_pet_icon_fallback(pet_id) if not raw.get("icon_url") and not raw.get("pet_img_url") and not raw.get("petIcon") else "",
             "badge": "守" if is_guard else "",
             "isShiny": is_shiny,
+            "gender": display.get("gender") if display.get("gender") is not None else raw.get("gender") if raw.get("gender") is not None else home_pet.get("gender"),
             "variantText": variant_text,
             "isGuard": is_guard,
             "statusText": status_text,

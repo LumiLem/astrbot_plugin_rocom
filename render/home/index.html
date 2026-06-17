@@ -135,7 +135,7 @@
               {{/if}}
             </div>
             <div class="pet-info">
-              <div class="pet-name">{{item.name}}</div>
+              <div class="pet-name"><span>{{item.name}}</span>{{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}</div>
               <div class="pet-meta">
                 <span>Lv.{{item.level}}</span>
                 <span class="status-pill status-{{item.statusClass}}">{{item.statusText}}</span>

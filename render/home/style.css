@@ -339,8 +339,7 @@ h2 {
     min-width: 0;
 }
 
-.plant-name,
-.pet-name {
+.plant-name {
     overflow: hidden;
     color: #33271a;
     text-overflow: ellipsis;
@@ -498,7 +497,24 @@ h2 {
 }
 
 .pet-name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: #33271a;
     font-size: 24px;
+}
+
+.pet-name span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pet-gender-icon {
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+    flex-shrink: 0;
 }
 
 .pet-meta {
