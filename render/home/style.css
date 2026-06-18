@@ -367,7 +367,8 @@ h2 {
 .time-text {
     margin-top: 3px;
     color: #806f58;
-    font-size: 15px;
+    font-size: 14px;
+    white-space: nowrap;
 }
 
 .plot-tags {
@@ -522,6 +523,19 @@ h2 {
     flex-wrap: wrap;
     gap: 7px;
     margin-top: 8px;
+}
+
+.pet-meta > span {
+    font-size: 15px;
+    color: rgba(51, 39, 26, 0.75);
+}
+
+.feed-round {
+    color: #8b7355 !important;
+}
+
+.nature-tag {
+    color: #8b7355 !important;
 }
 
 .status-pill {

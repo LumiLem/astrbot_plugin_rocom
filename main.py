@@ -54,6 +54,7 @@ class RocomPlugin(Star):
         res_path = os.path.abspath(os.path.dirname(__file__))
         self.renderer = Renderer(res_path=res_path, render_timeout=render_timeout)
         self.home_plant_map = self._load_home_plant_map(res_path)
+        self.nature_map = self._load_nature_map(res_path)
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -605,8 +606,15 @@ class RocomPlugin(Star):
         is_shiny = variant_text in {"异色", "异色炫彩"}
         status = raw.get("status")
         is_guard = guard or bool(raw.get("is_guard") or raw.get("guard")) or str(status).lower() in {"2", "guard", "守卫"}
-        status_text = "守卫中" if is_guard and not has_inspiration else ("灵感已完成" if inspire_ready else ("灵感收集中" if has_inspiration else "未喂食"))
-        status_class = "guard" if is_guard and not has_inspiration else ("ready" if inspire_ready else ("progress" if has_inspiration else "idle"))
+        if is_guard:
+            status_text = "守卫中"
+            status_class = "guard"
+        elif has_inspiration:
+            status_text = "灵感已完成" if inspire_ready else "灵感收集中"
+            status_class = "ready" if inspire_ready else "progress"
+        else:
+            status_text = ""
+            status_class = ""
         return {
             "id": str(pet_id),
             "pos": raw.get("pos") or raw.get("position") or index + 1,
@@ -617,11 +625,14 @@ class RocomPlugin(Star):
             "badge": "守" if is_guard else "",
             "isShiny": is_shiny,
             "gender": display.get("gender") if display.get("gender") is not None else raw.get("gender") if raw.get("gender") is not None else home_pet.get("gender"),
+            "feedRound": home_pet.get("feed_round") if home_pet.get("feed_round") is not None else raw.get("feed_round"),
+            "natureId": display.get("nature") if display.get("nature") is not None else raw.get("nature"),
+            "natureName": self.nature_map.get(str(display.get("nature") or raw.get("nature") or ""), ""),
             "variantText": variant_text,
             "isGuard": is_guard,
             "statusText": status_text,
             "statusClass": status_class,
-            "note": self._format_home_remaining(rip_time, now_ts) if has_inspiration else ("家园守卫位" if is_guard else "暂无灵感倒计时"),
+            "note": self._format_home_remaining(rip_time, now_ts) if has_inspiration else ("家园守卫位" if is_guard else ""),
             "hasEgg": bool(raw.get("have_egg") or home_pet.get("have_egg")),
             "eggReady": egg_ready,
             "eggTime": egg_time,
@@ -675,6 +686,18 @@ class RocomPlugin(Star):
             return data if isinstance(data, dict) else {}
         except Exception as e:
             logger.warning(f"[Rocom] 加载家园作物映射失败: {e}")
+            return {}
+
+    def _load_nature_map(self, res_path: str) -> Dict[str, str]:
+        path = os.path.join(res_path, "render", "home", "data", "nature_map.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            return {str(k): str(v.get("name", v) if isinstance(v, dict) else v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"[Rocom] 加载性格映射失败: {e}")
             return {}
 
     def _home_plant_icon(self, icon_id: Any) -> str:
@@ -741,12 +764,12 @@ class RocomPlugin(Star):
                 "iconUrl": self._home_plant_icon(icon_id),
                 "stateType": "ready" if ready else "warning",
                 "statusText": "已成熟" if ready else "成长中",
-                "leftTimeText": "可收获" if ready else self._format_home_remaining(rip_time, now_ts),
+                "leftTimeText": "可收获" if ready else f"{self._format_home_remaining(rip_time, now_ts)}（{datetime.fromtimestamp(rip_time).strftime('%m-%d %H:%M')}）",
                 "progress": progress,
                 "ready": ready,
                 "readyAt": rip_time,
-                "harvestText": f"产量 {harvest_num}" if harvest_num not in (None, "") else "",
-                "stealText": f"可偷 {steal_account}/{can_steal_account}" if steal_account not in (None, "") and can_steal_account not in (None, "") else "",
+                "harvestText": f"产量 {harvest_num}" if harvest_num not in (None, "", 0) else "",
+                "stealText": f"可偷 {steal_account}/{can_steal_account}" if steal_account not in (None, "", 0) and can_steal_account not in (None, "", 0) else "",
                 "eventId": f"plant:{raw.get('slot_index') or raw.get('land_index') or index}:{plant_id}:{rip_time}",
             })
         return result
