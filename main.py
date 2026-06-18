@@ -3471,7 +3471,6 @@ class RocomPlugin(Star):
         profile_card_image = ""
         if player_search_data:
             tag_pairs = [
-                ("在线", self._player_field(player_search_data, "online")),
                 ("性别", self._player_field(player_search_data, "gender", self._player_field(player_search_data, "sex"))),
                 ("世界等级", self._player_field(player_search_data, "world_level")),
                 ("家园等级", self._player_field(player_search_data, "home_level")),
@@ -3546,8 +3545,8 @@ class RocomPlugin(Star):
             "profileHomeItems": profile_home_items,
             "profileCardItems": profile_card_items,
             "profileCardImage": profile_card_image,
-            "profileStatusText": self._player_field(player_search_data, "online", "未知"),
-            "profileStatusClass": "online" if self._player_field(player_search_data, "online", "未知") == "是" else "offline",
+            "profileStatusText": "在线" if self._player_field(player_search_data, "online", "") in {"是", "1", "true", "True", "在线"} else "离线",
+            "profileStatusClass": "online" if self._player_field(player_search_data, "online", "") in {"是", "1", "true", "True", "在线"} else "offline",
             
             "hasBattleData": bo.get("total_match", 0) > 0,
             "tierBadgeUrl": bo.get("tier_icon_url", ""),
@@ -3562,6 +3561,16 @@ class RocomPlugin(Star):
             "commandHint": "💡 /洛克背包 <筛选> <页码> | /洛克战绩 <页码> | /洛克 查看菜单",
             "copyright": "AstrBot & WeGame Locke Kingdom Plugin"
         }
+
+        if not data.get("userAvatarDisplay"):
+            gender = self._player_field(player_search_data, "gender", self._player_field(player_search_data, "sex", "0")) if player_search_data else "0"
+            avatar_file = "img/img_nv.png" if gender == "2" else "img/img_nan.png"
+            avatar_path = os.path.join(self.renderer.res_path, avatar_file)
+            try:
+                with open(avatar_path, "rb") as f:
+                    data["userAvatarDisplay"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+            except Exception:
+                data["userAvatarDisplay"] = ""
         
         # Radar area scaling (mock base max values)
         max_str, max_coll, max_capt, max_prog = 100, 100, 100, 100
