@@ -733,36 +733,57 @@ class RocomPlugin(Star):
         result = []
         for index, raw in enumerate(plant_sources):
             plant_data = raw.get("plant_info") if isinstance(raw.get("plant_info"), dict) else raw
-            plant_id = raw.get("plant_seed_id") or raw.get("plant_cfg_id") or raw.get("plant_id") or plant_data.get("id")
-            if str(plant_id or "0") in {"", "0"}:
+            seed_id = raw.get("plant_seed_id") if raw.get("plant_seed_id") is not None else raw.get("plant_cfg_id")
+            plant_id = seed_id or raw.get("plant_id") or plant_data.get("id")
+            empty_slot = str(seed_id or "0") in {"", "0"} and not raw.get("plant_harvest_num") and not raw.get("plant_can_steal_account")
+            if not empty_slot and str(plant_id or "0") in {"", "0"}:
                 continue
-            mapped_plant = getattr(self, "home_plant_map", {}).get(str(plant_id), {})
-            icon_id = (
-                plant_data.get("icon_url")
-                or plant_data.get("iconUrl")
-                or raw.get("icon_url")
-                or raw.get("iconUrl")
-                or plant_data.get("iconid")
-                or raw.get("iconid")
-                or raw.get("icon_id")
-                or (mapped_plant.get("iconid") if isinstance(mapped_plant, dict) else "")
-            )
-            rip_time = self._normalize_epoch_seconds(raw.get("plant_rip_time") or raw.get("rip_time") or raw.get("end_time"))
+            mapped_plant = getattr(self, "home_plant_map", {}).get(str(plant_id), {}) if not empty_slot else {}
+            icon_id = ""
+            if not empty_slot:
+                icon_id = (
+                    plant_data.get("icon_url")
+                    or plant_data.get("iconUrl")
+                    or raw.get("icon_url")
+                    or raw.get("iconUrl")
+                    or plant_data.get("iconid")
+                    or raw.get("iconid")
+                    or raw.get("icon_id")
+                    or (mapped_plant.get("iconid") if isinstance(mapped_plant, dict) else "")
+                )
+            rip_time = self._normalize_epoch_seconds(raw.get("plant_rip_time") or raw.get("rip_time") or raw.get("end_time")) if not empty_slot else 0
             left_time = int(raw.get("left_time") or 0)
             if not rip_time and left_time > 0:
                 rip_time = now_ts + left_time
-            ready = bool(rip_time and now_ts >= rip_time) or (raw.get("status") in {2, "ready", "mature"})
+            ready = (bool(rip_time and now_ts >= rip_time) or raw.get("plant_state") in {2, "ready", "mature"} or raw.get("status") in {2, "ready", "mature"}) if not empty_slot else False
             total = int(raw.get("time_cost") or raw.get("total_time") or 0)
-            if not total and raw.get("plant_tab_id"):
+            if not total and raw.get("plant_tab_id") and not empty_slot:
                 try:
                     total = int(raw.get("plant_tab_id")) * 21600
                 except (TypeError, ValueError):
                     total = 0
-            progress = int(max(0, min(100, ((total - max(0, rip_time - now_ts)) / total) * 100))) if total and rip_time else (100 if ready else 35)
+            progress = int(max(0, min(100, ((total - max(0, rip_time - now_ts)) / total) * 100))) if total and rip_time else (100 if ready else (0 if empty_slot else 35))
             land_index = raw.get("slot_index") or raw.get("land_index") or index + 1
             harvest_num = raw.get("plant_harvest_num")
             steal_account = raw.get("plant_steal_account")
             can_steal_account = raw.get("plant_can_steal_account")
+            if empty_slot:
+                result.append({
+                    "id": "",
+                    "landIndex": land_index,
+                    "plantName": "空土地",
+                    "iconUrl": "",
+                    "stateType": "empty",
+                    "statusText": "未种植",
+                    "leftTimeText": "",
+                    "progress": 0,
+                    "ready": False,
+                    "readyAt": 0,
+                    "harvestText": "",
+                    "stealText": "",
+                    "eventId": "",
+                })
+                continue
             result.append({
                 "id": str(plant_id),
                 "landIndex": land_index,
@@ -770,12 +791,12 @@ class RocomPlugin(Star):
                 "iconUrl": self._home_plant_icon(icon_id),
                 "stateType": "ready" if ready else "warning",
                 "statusText": "已成熟" if ready else "成长中",
-                "leftTimeText": "可收获" if ready else f"{self._format_home_remaining(rip_time, now_ts)}（{datetime.fromtimestamp(rip_time).strftime('%m-%d %H:%M')}）",
+                "leftTimeText": "" if ready else f"{self._format_home_remaining(rip_time, now_ts)}（{datetime.fromtimestamp(rip_time).strftime('%m-%d %H:%M')}）",
                 "progress": progress,
                 "ready": ready,
                 "readyAt": rip_time,
                 "harvestText": f"产量 {harvest_num}" if harvest_num not in (None, "", 0) else "",
-                "stealText": f"可偷 {steal_account}/{can_steal_account}" if steal_account not in (None, "", 0) and can_steal_account not in (None, "", 0) else "",
+                "stealText": f"可偷 {steal_account}/{can_steal_account}" if can_steal_account not in (None, "", 0) else "",
                 "eventId": f"plant:{raw.get('slot_index') or raw.get('land_index') or index}:{plant_id}:{rip_time}",
             })
         return result

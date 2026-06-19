@@ -298,12 +298,15 @@ h2 {
 }
 
 .plot-card {
+    display: flex;
+    flex-direction: column;
     min-height: 138px;
     padding: 13px 14px;
 }
 
 .plot-index {
     display: inline-flex;
+    align-self: flex-start;
     padding: 4px 10px;
     border-radius: 999px;
     background: rgba(255, 198, 95, 0.28);
@@ -315,7 +318,7 @@ h2 {
     display: flex;
     align-items: center;
     gap: 12px;
-    margin-top: 10px;
+    flex: 1;
 }
 
 .plant-icon,
@@ -360,6 +363,10 @@ h2 {
     color: #c47a24;
 }
 
+.state-empty {
+    color: #999;
+}
+
 .state-ready {
     color: #3e9c60;
 }
@@ -397,7 +404,6 @@ h2 {
 
 .progress-fill {
     height: 100%;
-    min-width: 4%;
     max-width: 100%;
     border-radius: inherit;
     background: linear-gradient(90deg, #83c665, #ffc65f);
