@@ -604,14 +604,20 @@ class RocomPlugin(Star):
             elif "炫彩" in mutation_name:
                 variant_text = "炫彩"
         is_shiny = variant_text in {"异色", "异色炫彩"}
-        status = raw.get("status")
-        is_guard = guard or bool(raw.get("is_guard") or raw.get("guard")) or str(status).lower() in {"2", "guard", "守卫"}
+        status = home_pet.get("status") if home_pet.get("status") is not None else raw.get("status")
+        is_guard = guard or bool(raw.get("is_guard") or raw.get("guard")) or str(status).lower() in {"2", "guard", "守卫"} or (isinstance(status, (int, float)) and int(status) == 1704)
         if is_guard:
             status_text = "守卫中"
             status_class = "guard"
-        elif has_inspiration:
-            status_text = "灵感已完成" if inspire_ready else "灵感收集中"
-            status_class = "ready" if inspire_ready else "progress"
+        elif isinstance(status, (int, float)) and int(status) == 1700:
+            status_text = "未喂食"
+            status_class = "idle"
+        elif isinstance(status, (int, float)) and int(status) == 1702:
+            status_text = "可收取"
+            status_class = "ready"
+        elif isinstance(status, (int, float)) and int(status) == 1701:
+            status_text = "已喂食"
+            status_class = "progress"
         else:
             status_text = ""
             status_class = ""
