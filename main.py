@@ -1782,7 +1782,13 @@ class RocomPlugin(Star):
         product_names = {p.get("name", "") for p in products}
         pending_pushes = []
         skipped = 0
+        seen_keys = set()
         for key, sub in all_subs.items():
+            sub_key = str(sub.get("key") or key)
+            if sub_key in seen_keys:
+                logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 与 {sub_key} 重复，跳过")
+                continue
+            seen_keys.add(sub_key)
             if sub.get("last_push_round") == round_info["round_id"]:
                 logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 本轮已推送，跳过")
                 skipped += 1
@@ -1835,10 +1841,10 @@ class RocomPlugin(Star):
                     f"剩余：{round_info['countdown']}",
                 ]
                 if len(active_cats) > 1:
-                    for key in cat_order:
-                        prods = cat_map.get(key, [])
+                    for cat in cat_order:
+                        prods = cat_map.get(cat, [])
                         names = "、".join(p["name"] for p in prods)
-                        lines.append(f"{category_labels[key]}：{names}")
+                        lines.append(f"{category_labels[cat]}：{names}")
                 else:
                     lines.append(f"商品：{'、'.join(product_names)}")
                 text_chain.message("\n".join(lines).strip())
@@ -4324,6 +4330,11 @@ class RocomPlugin(Star):
                 "updated_by": str(event.get_sender_id()),
             },
         )
+        all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+        for existing_key, existing_sub in list(all_subs.items()):
+            if str(existing_key) != str(subscription_key) and str(existing_sub.get("key", "")) == str(subscription_key):
+                await self.merchant_sub_mgr.delete_subscription(existing_key)
+                logger.warning(f"[Rocom] 远行商人订阅：清理重复条目 {existing_key}（与 {subscription_key} 指向同一目标）")
         logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items}")
         if all_products:
             summary = "全部商品（每轮必推）"
