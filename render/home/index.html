@@ -39,6 +39,65 @@
     </section>
 
     <main class="content-grid">
+      <section class="panel indoor-panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-label">Indoor Pets</div>
+            <h2>室内精灵</h2>
+          </div>
+          <span class="panel-count">{{indoorCount}}</span>
+        </div>
+
+        {{if indoorPets.length}}
+        <div class="pet-grid">
+          {{each indoorPets item}}
+          <article class="pet-card indoor-card status-{{item.statusClass}}">
+            <div class="pet-avatar-wrap">
+              {{if item.iconUrl}}
+              <img class="pet-avatar" src="{{item.iconUrl}}" alt="" {{if item.iconFallback}}onerror="this.onerror=null;this.src='{{item.iconFallback}}'"{{/if}}>
+              {{else}}
+              <div class="pet-avatar empty-icon">无图</div>
+              {{/if}}
+              {{if item.badge}}
+              <span class="pet-badge">{{item.badge}}</span>
+              {{/if}}
+              {{if item.variantText == "异色"}}
+              <img class="pet-variant-icon" src="{{_res_path}}img/异色.png" alt="异色">
+              {{/if}}
+              {{if item.variantText == "异色炫彩"}}
+              <img class="pet-variant-icon" src="{{_res_path}}img/异色炫彩.png" alt="异色炫彩">
+              {{/if}}
+              {{if item.variantText == "炫彩"}}
+              <img class="pet-variant-icon" src="{{_res_path}}img/炫彩.png" alt="炫彩">
+              {{/if}}
+              {{if item.variantText == "噩梦污染"}}
+              <img class="pet-variant-icon" src="{{_res_path}}img/噩梦污染.png" alt="噩梦污染">
+              {{/if}}
+            </div>
+            <div class="pet-info">
+              <div class="pet-name"><span>{{item.name}}</span>{{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}</div>
+              <div class="pet-meta">
+                <span>Lv.{{item.level}}</span>
+                {{if item.natureName}}<span class="nature-tag">{{item.natureName}}</span>{{/if}}
+                {{if item.statusText}}<span class="status-pill status-{{item.statusClass}}">{{item.statusText}}</span>{{/if}}
+                {{if item.feedRound}}<span class="feed-round">喂养 {{item.feedRound}} 轮</span>{{/if}}
+              </div>
+              {{if item.eggText}}
+              <div class="egg-note {{if item.eggReady}}egg-ready{{/if}}">
+                <span class="egg-dot"></span>
+                <span>{{item.eggText}}</span>
+              </div>
+              {{/if}}
+              {{if item.note}}<div class="pet-note">{{item.note}}</div>{{/if}}
+            </div>
+          </article>
+          {{/each}}
+        </div>
+        {{else}}
+        <div class="empty-state">当前没有室内精灵信息</div>
+        {{/if}}
+      </section>
+
       <div class="left-column">
         <section class="panel garden-panel">
           <div class="panel-head">
@@ -98,65 +157,6 @@
           {{/if}}
         </section>
       </div>
-
-      <section class="panel indoor-panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-label">Indoor Pets</div>
-            <h2>室内精灵</h2>
-          </div>
-          <span class="panel-count">{{indoorCount}}</span>
-        </div>
-
-        {{if indoorPets.length}}
-        <div class="pet-grid">
-          {{each indoorPets item}}
-          <article class="pet-card indoor-card status-{{item.statusClass}}">
-            <div class="pet-avatar-wrap">
-              {{if item.iconUrl}}
-              <img class="pet-avatar" src="{{item.iconUrl}}" alt="" {{if item.iconFallback}}onerror="this.onerror=null;this.src='{{item.iconFallback}}'"{{/if}}>
-              {{else}}
-              <div class="pet-avatar empty-icon">无图</div>
-              {{/if}}
-              {{if item.badge}}
-              <span class="pet-badge">{{item.badge}}</span>
-              {{/if}}
-              {{if item.variantText == "异色"}}
-              <img class="pet-variant-icon" src="{{_res_path}}img/异色.png" alt="异色">
-              {{/if}}
-              {{if item.variantText == "异色炫彩"}}
-              <img class="pet-variant-icon" src="{{_res_path}}img/异色炫彩.png" alt="异色炫彩">
-              {{/if}}
-              {{if item.variantText == "炫彩"}}
-              <img class="pet-variant-icon" src="{{_res_path}}img/炫彩.png" alt="炫彩">
-              {{/if}}
-              {{if item.variantText == "噩梦污染"}}
-              <img class="pet-variant-icon" src="{{_res_path}}img/噩梦污染.png" alt="噩梦污染">
-              {{/if}}
-            </div>
-            <div class="pet-info">
-              <div class="pet-name"><span>{{item.name}}</span>{{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}</div>
-              <div class="pet-meta">
-                <span>Lv.{{item.level}}</span>
-                {{if item.natureName}}<span class="nature-tag">{{item.natureName}}</span>{{/if}}
-                {{if item.statusText}}<span class="status-pill status-{{item.statusClass}}">{{item.statusText}}</span>{{/if}}
-                {{if item.feedRound}}<span class="feed-round">喂养 {{item.feedRound}} 轮</span>{{/if}}
-              </div>
-              {{if item.eggText}}
-              <div class="egg-note {{if item.eggReady}}egg-ready{{/if}}">
-                <span class="egg-dot"></span>
-                <span>{{item.eggText}}</span>
-              </div>
-              {{/if}}
-              {{if item.note}}<div class="pet-note">{{item.note}}</div>{{/if}}
-            </div>
-          </article>
-          {{/each}}
-        </div>
-        {{else}}
-        <div class="empty-state">当前没有室内精灵信息</div>
-        {{/if}}
-      </section>
     </main>
   </div>
 </body>

@@ -20,7 +20,7 @@ body {
 
 .home-page {
     position: relative;
-    width: 1280px;
+    width: 1080px;
     min-height: 860px;
     overflow: hidden;
     border-radius: 28px;
@@ -184,7 +184,7 @@ body {
 
 .content-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1.12fr) minmax(400px, 0.88fr);
+    grid-template-columns: 1fr;
     gap: 22px;
     align-items: start;
     margin: 22px 44px 0;
@@ -286,7 +286,7 @@ h2 {
 
 .garden-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
 }
 
@@ -300,6 +300,7 @@ h2 {
 .plot-card {
     display: flex;
     flex-direction: column;
+    min-height: 130px;
     padding: 13px 14px;
 }
 
@@ -415,16 +416,16 @@ h2 {
 }
 
 .indoor-panel {
-    min-height: 100%;
 }
 
 .pet-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .pet-card {
     display: flex;
     align-items: center;
+    min-height: 130px;
     gap: 14px;
     padding: 13px 14px;
 }
