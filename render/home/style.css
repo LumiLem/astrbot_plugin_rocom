@@ -300,9 +300,9 @@ h2 {
 .plot-card {
     display: flex;
     flex-direction: column;
-    min-height: 138px;
     padding: 13px 14px;
 }
+
 
 .plot-index {
     display: inline-flex;
@@ -425,7 +425,6 @@ h2 {
 .pet-card {
     display: flex;
     align-items: center;
-    min-height: 122px;
     gap: 14px;
     padding: 13px 14px;
 }
@@ -553,19 +552,19 @@ h2 {
     box-shadow: 0 3px 8px rgba(111, 80, 42, 0.14);
 }
 
-.status-ready {
+.status-pill.status-ready {
     background: linear-gradient(135deg, #39a75b, #82cf55);
 }
 
-.status-progress {
+.status-pill.status-progress {
     background: linear-gradient(135deg, #55a876, #e0b857);
 }
 
-.status-idle {
+.status-pill.status-idle {
     background: linear-gradient(135deg, #d7772d, #f4b24e);
 }
 
-.status-guard {
+.status-pill.status-guard {
     background: linear-gradient(135deg, #387fae, #72b5d5);
 }
 
