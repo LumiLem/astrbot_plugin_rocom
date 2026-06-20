@@ -84,12 +84,13 @@ class RocomPlugin(Star):
         self._merchant_thread = None
         self._merchant_stop = threading.Event()
         self._merchant_check_running = False
+        self._prev_merchant_products: set[str] = set()
         try:
             self._main_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._main_loop = asyncio.get_event_loop()
             logger.info("[Rocom] 远行商人：插件初始化时未检测到运行中的事件循环，将在线程启动时获取")
-        self._merchant_retry_delay_seconds = 240
+        self._merchant_retry_delay_seconds = 120
         self._merchant_retry_times = 3
         self._merchant_jitter_seconds = 30
         self.home_subscription_enabled = self.config.get(
@@ -1801,6 +1802,15 @@ class RocomPlugin(Star):
         if not products:
             return "empty"
         product_names = {p.get("name", "") for p in products}
+        if product_names:
+            elapsed = (datetime.now(self._cn_tz()) - round_info["start_time"]).total_seconds()
+            has_round = any(p.get("product_category") == "round" for p in products)
+            same_as_prev = product_names == self._prev_merchant_products
+            if (same_as_prev or not has_round) and elapsed < 600:
+                reason = "商品与上一轮重复" if same_as_prev else "常规商品未加载"
+                logger.warning(f"[Rocom] 远行商人{reason}且开盘仅 {elapsed:.0f}s，等待数据更新")
+                return "empty"
+        self._prev_merchant_products = product_names.copy()
         pending_pushes = []
         skipped = 0
         seen_keys = set()
