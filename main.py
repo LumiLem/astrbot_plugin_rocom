@@ -575,6 +575,7 @@ class RocomPlugin(Star):
             or home_pet.get("egg_time")
         )
         egg_ready = bool(egg_time and now_ts >= egg_time)
+        has_egg = bool(raw.get("have_egg") or home_pet.get("have_egg"))
         mutation_type = display.get("mutation_type") if display.get("mutation_type") is not None else raw.get("mutation_type")
         mutation_name = str(display.get("mutation_name") or raw.get("mutation_name") or home_pet.get("mutation_name") or "")
         variant_text = ""
@@ -640,10 +641,10 @@ class RocomPlugin(Star):
             "statusText": status_text,
             "statusClass": status_class,
             "note": self._format_home_remaining(rip_time, now_ts) if has_inspiration else ("家园守卫位" if is_guard else ""),
-            "hasEgg": bool(raw.get("have_egg") or home_pet.get("have_egg")),
-            "eggReady": egg_ready,
+            "hasEgg": has_egg,
+            "eggReady": egg_ready or has_egg,
             "eggTime": egg_time,
-            "eggText": ("可能已生蛋" if egg_ready else f"预计生蛋 {self._format_home_remaining(egg_time, now_ts)}（{datetime.fromtimestamp(egg_time).strftime('%m-%d %H:%M')}）") if egg_time else "",
+            "eggText": ("已生蛋" if has_egg else ("可能已生蛋" if egg_ready else f"预计生蛋 {self._format_home_remaining(egg_time, now_ts)}（{datetime.fromtimestamp(egg_time).strftime('%m-%d %H:%M')}）")) if egg_time else ("已生蛋" if has_egg else ""),
             "inspireReady": inspire_ready,
             "readyAt": rip_time,
             "eventId": f"pet:{raw.get('pos') or index + 1}:{pet_id}:{rip_time}",
