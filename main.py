@@ -55,6 +55,7 @@ class RocomPlugin(Star):
         self.renderer = Renderer(res_path=res_path, render_timeout=render_timeout)
         self.home_plant_map = self._load_home_plant_map(res_path)
         self.nature_map = self._load_nature_map(res_path)
+        self.card_label_map = self._load_card_label_map(res_path)
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -707,6 +708,35 @@ class RocomPlugin(Star):
         except Exception as e:
             logger.warning(f"[Rocom] 加载性格映射失败: {e}")
             return {}
+
+    def _load_card_label_map(self, res_path: str) -> Dict[str, str]:
+        path = os.path.join(res_path, "render", "personal-card", "data", "card_label_conf.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            rows = data.get("RocoDataRows") if isinstance(data, dict) else None
+            if not isinstance(rows, dict):
+                return {}
+            result: Dict[str, str] = {}
+            for key, row in rows.items():
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("label_text") or "").strip()
+                if text:
+                    result[str(key)] = text
+                    result[str(row.get("id", key))] = text
+            return result
+        except Exception as e:
+            logger.warning(f"[Rocom] 加载名片标签映射失败: {e}")
+            return {}
+
+    def _card_label_text(self, label_id: Any) -> str:
+        text = str(label_id or "").strip()
+        if not text or text in {"-", "未设置", "0"}:
+            return ""
+        return self.card_label_map.get(text, text)
 
     def _home_plant_icon(self, icon_id: Any) -> str:
         if not icon_id:
@@ -2848,8 +2878,8 @@ class RocomPlugin(Star):
                     [
                         ("名片皮肤", self._player_field(parsed, "card_skin_selected")),
                         ("名片头像", self._player_field(parsed, "card_icon_selected")),
-                        ("首标签", self._player_field(parsed, "card_label_first_selected")),
-                        ("尾标签", self._player_field(parsed, "card_label_last_selected")),
+                        ("首标签", self._card_label_text(self._player_field(parsed, "card_label_first_selected", ""))),
+                        ("尾标签", self._card_label_text(self._player_field(parsed, "card_label_last_selected", ""))),
                     ],
                 )
             )
