@@ -4127,6 +4127,7 @@ class RocomPlugin(Star):
         if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克玩家。")
             return
+        yield event.plain_result(f"正在查询 UID:{uid or '当前绑定'} 的玩家信息，请稍候...")
         res = await self.client.ingame_player_search(
             uid,
             fw_token=fw_token,
@@ -4135,12 +4136,17 @@ class RocomPlugin(Star):
         if not res:
             yield event.plain_result(f"玩家搜索失败：{self.client.get_last_error()}")
             return
+        parsed = self._parse_ingame_player_payload(res, uid or "当前绑定")
         data = self._build_player_search_render_data(res, uid or "当前绑定")
         img_url = await self.renderer.render_html("render/player-search/index.html", data)
         if img_url:
             yield event.image_result(img_url)
         else:
             yield event.plain_result(self._format_json_payload(res))
+
+        card_image = self._player_field(parsed, "card_bussiness_card_url", "")
+        if card_image and card_image.startswith(("http://", "https://")):
+            yield event.chain_result([Image.fromURL(card_image)])
 
     @filter.command("洛克家园")
     async def rocom_home(self, event: AstrMessageEvent, uid: str = ""):
