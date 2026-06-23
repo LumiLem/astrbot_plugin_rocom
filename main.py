@@ -56,6 +56,7 @@ class RocomPlugin(Star):
         self.home_plant_map = self._load_home_plant_map(res_path)
         self.nature_map = self._load_nature_map(res_path)
         self.card_label_map = self._load_card_label_map(res_path)
+        self.card_icon_map = self._load_card_icon_map(res_path)
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -737,6 +738,36 @@ class RocomPlugin(Star):
         if not text or text in {"-", "未设置", "0"}:
             return ""
         return self.card_label_map.get(text, text)
+
+    def _load_card_icon_map(self, res_path: str) -> Dict[str, str]:
+        path = os.path.join(res_path, "render", "personal-card", "data", "card_icon_conf.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            rows = data.get("RocoDataRows") if isinstance(data, dict) else None
+            if not isinstance(rows, dict):
+                return {}
+            result: Dict[str, str] = {}
+            for key, row in rows.items():
+                if not isinstance(row, dict):
+                    continue
+                res_name = str(row.get("icon_resource_path") or "").strip()
+                if res_name:
+                    result[str(key)] = res_name
+                    result[str(row.get("id", key))] = res_name
+            return result
+        except Exception as e:
+            logger.warning(f"[Rocom] 加载名片头像映射失败: {e}")
+            return {}
+
+    def _card_icon_url(self, avatar_id: Any, gender: str = "0") -> str:
+        text = str(avatar_id or "").strip()
+        res_name = self.card_icon_map.get(text, "") if text and text != "0" else ""
+        if not res_name:
+            res_name = "img_nv" if str(gender) == "2" else "img_nan"
+        return f"https://img.roco.lumlime.cn/{res_name}.png"
 
     def _home_plant_icon(self, icon_id: Any) -> str:
         if not icon_id:
@@ -2899,12 +2930,17 @@ class RocomPlugin(Star):
         ]
         summary_cards = [item for item in summary_cards if item["value"] and item["value"] != "-"]
 
+        avatar_id = self._player_field(parsed, "card_icon_selected", "")
+        gender = self._player_field(parsed, "gender", self._player_field(parsed, "sex", "0"))
+        avatar_url = self._card_icon_url(avatar_id, gender)
+
         return {
             "title": "洛克玩家",
             "subtitle": parsed["title"],
             "heroTitle": "玩家信息",
             "heroValue": parsed["nickname"],
             "heroSubvalue": f"UID {parsed['uid']} · 返回码 {parsed['retCode']}",
+            "avatarUrl": avatar_url,
             "summaryCards": summary_cards[:6],
             "signature": signature,
             "showSignature": bool(signature),
@@ -3661,13 +3697,8 @@ class RocomPlugin(Star):
 
         if not data.get("userAvatarDisplay"):
             gender = self._player_field(player_search_data, "gender", self._player_field(player_search_data, "sex", "0")) if player_search_data else "0"
-            avatar_file = "img/img_nv.png" if gender == "2" else "img/img_nan.png"
-            avatar_path = os.path.join(self.renderer.res_path, avatar_file)
-            try:
-                with open(avatar_path, "rb") as f:
-                    data["userAvatarDisplay"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
-            except Exception:
-                data["userAvatarDisplay"] = ""
+            avatar_id = role.get("avatar", "") or role.get("avatar_id", "")
+            data["userAvatarDisplay"] = self._card_icon_url(avatar_id, gender)
         
         # Radar area scaling (mock base max values)
         max_str, max_coll, max_capt, max_prog = 100, 100, 100, 100

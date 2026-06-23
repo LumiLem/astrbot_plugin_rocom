@@ -13,9 +13,16 @@
     </div>
 
     <div class="hero-card">
-      <div class="hero-title">{{heroTitle}}</div>
-      <div class="hero-value">{{heroValue}}</div>
-      <div class="hero-subvalue">{{heroSubvalue}}</div>
+      {{if avatarUrl}}
+      <div class="hero-avatar">
+        <img class="hero-avatar-img" src="{{avatarUrl}}" alt="{{heroValue}}">
+      </div>
+      {{/if}}
+      <div class="hero-info">
+        <div class="hero-title">{{heroTitle}}</div>
+        <div class="hero-value">{{heroValue}}</div>
+        <div class="hero-subvalue">{{heroSubvalue}}</div>
+      </div>
     </div>
 
     <div class="summary-grid">
