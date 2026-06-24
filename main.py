@@ -30,8 +30,9 @@ from .core.egg_service import EggService, SearchResult
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
-    # lumlime CDN：头像 / 精灵图标 与 BinData 配置
+    # lumlime CDN：头像 / 精灵图标 / 名片皮肤 与 BinData 配置
     LUMLIME_ICON_BASE = "https://rocom.lumlime.cn/Icon/HeadIcon"
+    LUMLIME_CARD_BG_BASE = "https://rocom.lumlime.cn/Icon/BusinessCardBg"
     LUMLIME_BINDATA_BASE = "https://rocom.lumlime.cn/BinData"
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -59,9 +60,12 @@ class RocomPlugin(Star):
         self.renderer = Renderer(res_path=res_path, render_timeout=render_timeout)
         self.home_plant_map = self._load_home_plant_map(res_path)
         self.nature_map = self._load_nature_map(res_path)
-        # 名片标签/头像映射于启动后异步从 CDN 加载，加载完成前各取值方法优雅降级
+        # 名片标签/头像/皮肤映射于启动后异步从 CDN 加载，加载完成前各取值方法优雅降级
         self.card_label_map: Dict[str, str] = {}
-        self.card_icon_map: Dict[str, str] = {}
+        self.card_icon_map: Dict[str, str] = {}        # id -> icon_resource_path（用于图片 URL）
+        self.card_icon_name_map: Dict[str, str] = {}   # id -> icon_resource_name（用于展示名称）
+        self.card_skin_map: Dict[str, str] = {}        # id -> skin_resource_path（用于图片 URL）
+        self.card_skin_name_map: Dict[str, str] = {}   # id -> skin_resource_name（用于展示名称）
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -763,11 +767,13 @@ class RocomPlugin(Star):
             return {}
 
     async def _load_card_data(self):
-        """启动后异步加载名片标签与头像映射"""
+        """启动后异步加载名片标签、头像与皮肤映射"""
         self.card_label_map = await self._build_card_label_map()
         self.card_icon_map = await self._build_card_icon_map()
+        self.card_skin_map = await self._build_card_skin_map()
         logger.info(
-            f"[Rocom] 名片配置加载完成：标签 {len(self.card_label_map)} 条，头像 {len(self.card_icon_map)} 条"
+            f"[Rocom] 名片配置加载完成：标签 {len(self.card_label_map)} 条，"
+            f"头像 {len(self.card_icon_map)} 条，皮肤 {len(self.card_skin_map)} 条"
         )
 
     async def _build_card_label_map(self) -> Dict[str, str]:
@@ -791,13 +797,20 @@ class RocomPlugin(Star):
     async def _build_card_icon_map(self) -> Dict[str, str]:
         rows = await self._fetch_bindata_rows("CARD_ICON_CONF.json")
         result: Dict[str, str] = {}
+        name_map: Dict[str, str] = {}
         for key, row in rows.items():
             if not isinstance(row, dict):
                 continue
             res_name = str(row.get("icon_resource_path") or "").strip()
+            disp_name = str(row.get("icon_resource_name") or "").strip()
+            row_id = str(row.get("id", key))
             if res_name:
                 result[str(key)] = res_name
-                result[str(row.get("id", key))] = res_name
+                result[row_id] = res_name
+            if disp_name:
+                name_map[str(key)] = disp_name
+                name_map[row_id] = disp_name
+        self.card_icon_name_map = name_map
         return result
 
     def _card_icon_url(self, avatar_id: Any, gender: str = "0") -> str:
@@ -806,6 +819,44 @@ class RocomPlugin(Star):
         if not res_name:
             res_name = "img_nv" if str(gender) == "2" else "img_nan"
         return f"{self.LUMLIME_ICON_BASE}/{res_name}.png"
+
+    def _card_icon_name(self, avatar_id: Any) -> str:
+        text = str(avatar_id or "").strip()
+        if not text or text == "0":
+            return ""
+        return self.card_icon_name_map.get(text, text)
+
+    async def _build_card_skin_map(self) -> Dict[str, str]:
+        rows = await self._fetch_bindata_rows("CARD_SKIN_CONF.json")
+        result: Dict[str, str] = {}
+        name_map: Dict[str, str] = {}
+        for key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            res_name = str(row.get("skin_resource_path") or "").strip()
+            disp_name = str(row.get("skin_resource_name") or "").strip()
+            row_id = str(row.get("id", key))
+            if res_name:
+                result[str(key)] = res_name
+                result[row_id] = res_name
+            if disp_name:
+                name_map[str(key)] = disp_name
+                name_map[row_id] = disp_name
+        self.card_skin_name_map = name_map
+        return result
+
+    def _card_skin_url(self, skin_id: Any) -> str:
+        text = str(skin_id or "").strip()
+        res_name = self.card_skin_map.get(text, "") if text and text != "0" else ""
+        if not res_name:
+            return ""
+        return f"{self.LUMLIME_CARD_BG_BASE}/img_{res_name}_Skin.png"
+
+    def _card_skin_name(self, skin_id: Any) -> str:
+        text = str(skin_id or "").strip()
+        if not text or text == "0":
+            return ""
+        return self.card_skin_name_map.get(text, text)
 
     def _home_plant_icon(self, icon_id: Any) -> str:
         if not icon_id:
@@ -2950,14 +3001,16 @@ class RocomPlugin(Star):
             ),
         ]
         if include_card:
+            first_label = self._card_label_text(self._player_field(parsed, "card_label_first_selected", ""))
+            last_label = self._card_label_text(self._player_field(parsed, "card_label_last_selected", ""))
+            title_text = f"{first_label}{last_label}".strip()
             sections.append(
                 pack(
                     "名片信息",
                     [
-                        ("名片皮肤", self._player_field(parsed, "card_skin_selected")),
-                        ("名片头像", self._player_field(parsed, "card_icon_selected")),
-                        ("首标签", self._card_label_text(self._player_field(parsed, "card_label_first_selected", ""))),
-                        ("尾标签", self._card_label_text(self._player_field(parsed, "card_label_last_selected", ""))),
+                        ("名片", self._card_skin_name(self._player_field(parsed, "card_skin_selected", ""))),
+                        ("头像", self._card_icon_name(self._player_field(parsed, "card_icon_selected", ""))),
+                        ("称号", title_text),
                     ],
                 )
             )
@@ -2980,6 +3033,8 @@ class RocomPlugin(Star):
         avatar_id = self._player_field(parsed, "card_icon_selected", "")
         gender = self._player_field(parsed, "gender", self._player_field(parsed, "sex", "0"))
         avatar_url = self._card_icon_url(avatar_id, gender)
+        skin_id = self._player_field(parsed, "card_skin_selected", "")
+        skin_url = self._card_skin_url(skin_id)
 
         return {
             "title": "洛克玩家",
@@ -2988,6 +3043,7 @@ class RocomPlugin(Star):
             "heroValue": parsed["nickname"],
             "heroSubvalue": f"UID {parsed['uid']} · 返回码 {parsed['retCode']}",
             "avatarUrl": avatar_url,
+            "skinUrl": skin_url,
             "summaryCards": summary_cards[:6],
             "signature": signature,
             "showSignature": bool(signature),
@@ -3751,11 +3807,15 @@ class RocomPlugin(Star):
                 ]
                 if value and value != "-" and value != "未设置"
             ]
+            profile_first_label = self._card_label_text(self._player_field(player_search_data, "card_label_first_selected", ""))
+            profile_last_label = self._card_label_text(self._player_field(player_search_data, "card_label_last_selected", ""))
+            profile_title_text = f"{profile_first_label}{profile_last_label}".strip()
             profile_card_items = [
                 {"label": label, "value": value}
                 for label, value in [
-                    ("名片皮肤", self._player_field(player_search_data, "card_skin_selected")),
-                    ("名片头像", self._player_field(player_search_data, "card_icon_selected")),
+                    ("名片", self._card_skin_name(self._player_field(player_search_data, "card_skin_selected", ""))),
+                    ("头像", self._card_icon_name(self._player_field(player_search_data, "card_icon_selected", ""))),
+                    ("称号", profile_title_text),
                 ]
                 if value and value != "-" and value != "未设置"
             ]

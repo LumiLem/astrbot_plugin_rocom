@@ -82,8 +82,21 @@ body {
 }
 
 .hero-info {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
     min-width: 0;
+}
+
+.hero-skin {
+    flex: 1 1 auto;
+    max-width: 560px;
+    margin-left: auto;
+    background: transparent;
+}
+
+.hero-skin-img {
+    width: 100%;
+    height: auto;
+    display: block;
 }
 
 .hero-title {
