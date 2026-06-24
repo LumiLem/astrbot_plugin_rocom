@@ -87,6 +87,7 @@ class RocomPlugin(Star):
         self._merchant_stop = threading.Event()
         self._merchant_check_running = False
         self._prev_merchant_products: set[str] = set()
+        self._prev_round_products: set[str] = set()
         try:
             self._main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1864,15 +1865,24 @@ class RocomPlugin(Star):
         if not products:
             return "empty"
         product_names = {p.get("name", "") for p in products}
+        round_products = {p.get("name", "") for p in products if p.get("product_category") == "round"}
         if product_names:
             elapsed = (datetime.now(self._cn_tz()) - round_info["start_time"]).total_seconds()
-            has_round = any(p.get("product_category") == "round" for p in products)
-            same_as_prev = product_names == self._prev_merchant_products
-            if (same_as_prev or not has_round) and elapsed < 600:
-                reason = "商品与上一轮重复" if same_as_prev else "常规商品未加载"
-                logger.warning(f"[Rocom] 远行商人{reason}且开盘仅 {elapsed:.0f}s，等待数据更新")
-                return "empty"
+            # 仅在开盘初期判断数据是否就绪，超过 5 分钟则直接推送
+            if elapsed < 300:
+                stale = False
+                reason = ""
+                # 常规商品消失（上一轮有但本轮还没加载）
+                if self._prev_round_products and not round_products:
+                    stale, reason = True, "常规商品未加载"
+                # 常规商品与上一轮完全相同（新一轮数据还没刷新）
+                elif round_products and round_products == self._prev_round_products:
+                    stale, reason = True, "常规商品与上一轮相同"
+                if stale:
+                    logger.warning(f"[Rocom] 远行商人{reason}（开盘 {elapsed:.0f}s），等待数据更新")
+                    return "empty"
         self._prev_merchant_products = product_names.copy()
+        self._prev_round_products = round_products.copy()
         pending_pushes = []
         skipped = 0
         seen_keys = set()
