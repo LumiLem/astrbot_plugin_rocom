@@ -30,6 +30,10 @@ from .core.egg_service import EggService, SearchResult
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
+    # lumlime CDN：头像 / 精灵图标 与 BinData 配置
+    LUMLIME_ICON_BASE = "https://rocom.lumlime.cn/Icon/HeadIcon"
+    LUMLIME_BINDATA_BASE = "https://rocom.lumlime.cn/BinData"
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self._instance_id = f"{id(self):x}"
@@ -55,8 +59,9 @@ class RocomPlugin(Star):
         self.renderer = Renderer(res_path=res_path, render_timeout=render_timeout)
         self.home_plant_map = self._load_home_plant_map(res_path)
         self.nature_map = self._load_nature_map(res_path)
-        self.card_label_map = self._load_card_label_map(res_path)
-        self.card_icon_map = self._load_card_icon_map(res_path)
+        # 名片标签/头像映射于启动后异步从 CDN 加载，加载完成前各取值方法优雅降级
+        self.card_label_map: Dict[str, str] = {}
+        self.card_icon_map: Dict[str, str] = {}
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -121,6 +126,10 @@ class RocomPlugin(Star):
         # 启动时检查是否需要开启自动刷新
         logger.info(f"[Rocom] 插件初始化完成，自动刷新启用状态：{self.auto_refresh_enabled}, 刷新时间：{self.auto_refresh_time}, 通知群：{self.auto_refresh_notify_group}")
         self._cancel_stale_background_tasks()
+        self._card_data_task = self._register_background_task(
+            "card_data_load",
+            self._load_card_data(),
+        )
         if self.auto_refresh_enabled:
             self._auto_refresh_task = self._register_background_task(
                 "auto_refresh",
@@ -204,6 +213,14 @@ class RocomPlugin(Star):
             except asyncio.CancelledError:
                 pass
         self._unregister_background_task("auto_refresh", self._auto_refresh_task)
+        card_task = getattr(self, "_card_data_task", None)
+        if card_task and not card_task.done():
+            card_task.cancel()
+            try:
+                await card_task
+            except asyncio.CancelledError:
+                pass
+        self._unregister_background_task("card_data_load", card_task)
         await self.client.close()
         await self.renderer.close()
 
@@ -564,8 +581,8 @@ class RocomPlugin(Star):
         if not asset_id:
             return ""
         if "异色" in variant_text:
-            return f"https://img.roco.lumlime.cn/{asset_id}_1.png"
-        return f"https://img.roco.lumlime.cn/{asset_id}.png"
+            return f"{self.LUMLIME_ICON_BASE}/{asset_id}_1.png"
+        return f"{self.LUMLIME_ICON_BASE}/{asset_id}.png"
 
     def _home_pet_icon_fallback(self, pet_id: Any) -> str:
         asset_id = self._home_pet_asset_id(pet_id)
@@ -731,28 +748,39 @@ class RocomPlugin(Star):
             logger.warning(f"[Rocom] 加载性格映射失败: {e}")
             return {}
 
-    def _load_card_label_map(self, res_path: str) -> Dict[str, str]:
-        path = os.path.join(res_path, "render", "personal-card", "data", "card_label_conf.json")
-        if not os.path.exists(path):
-            return {}
+    async def _fetch_bindata_rows(self, filename: str) -> Dict[str, Any]:
+        """从 lumlime CDN 的 BinData 目录拉取配置 JSON，返回 RocoDataRows。失败返回空 dict。"""
+        url = f"{self.LUMLIME_BINDATA_BASE}/{filename}"
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
+            client = await self.client._get_client()
+            resp = await client.get(url, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
             rows = data.get("RocoDataRows") if isinstance(data, dict) else None
-            if not isinstance(rows, dict):
-                return {}
-            result: Dict[str, str] = {}
-            for key, row in rows.items():
-                if not isinstance(row, dict):
-                    continue
-                text = str(row.get("label_text") or "").strip()
-                if text:
-                    result[str(key)] = text
-                    result[str(row.get("id", key))] = text
-            return result
+            return rows if isinstance(rows, dict) else {}
         except Exception as e:
-            logger.warning(f"[Rocom] 加载名片标签映射失败: {e}")
+            logger.warning(f"[Rocom] 从 CDN 加载 {filename} 失败: {e}")
             return {}
+
+    async def _load_card_data(self):
+        """启动后异步加载名片标签与头像映射"""
+        self.card_label_map = await self._build_card_label_map()
+        self.card_icon_map = await self._build_card_icon_map()
+        logger.info(
+            f"[Rocom] 名片配置加载完成：标签 {len(self.card_label_map)} 条，头像 {len(self.card_icon_map)} 条"
+        )
+
+    async def _build_card_label_map(self) -> Dict[str, str]:
+        rows = await self._fetch_bindata_rows("CARD_LABEL_CONF.json")
+        result: Dict[str, str] = {}
+        for key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("label_text") or "").strip()
+            if text:
+                result[str(key)] = text
+                result[str(row.get("id", key))] = text
+        return result
 
     def _card_label_text(self, label_id: Any) -> str:
         text = str(label_id or "").strip()
@@ -760,35 +788,24 @@ class RocomPlugin(Star):
             return ""
         return self.card_label_map.get(text, text)
 
-    def _load_card_icon_map(self, res_path: str) -> Dict[str, str]:
-        path = os.path.join(res_path, "render", "personal-card", "data", "card_icon_conf.json")
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-            rows = data.get("RocoDataRows") if isinstance(data, dict) else None
-            if not isinstance(rows, dict):
-                return {}
-            result: Dict[str, str] = {}
-            for key, row in rows.items():
-                if not isinstance(row, dict):
-                    continue
-                res_name = str(row.get("icon_resource_path") or "").strip()
-                if res_name:
-                    result[str(key)] = res_name
-                    result[str(row.get("id", key))] = res_name
-            return result
-        except Exception as e:
-            logger.warning(f"[Rocom] 加载名片头像映射失败: {e}")
-            return {}
+    async def _build_card_icon_map(self) -> Dict[str, str]:
+        rows = await self._fetch_bindata_rows("CARD_ICON_CONF.json")
+        result: Dict[str, str] = {}
+        for key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            res_name = str(row.get("icon_resource_path") or "").strip()
+            if res_name:
+                result[str(key)] = res_name
+                result[str(row.get("id", key))] = res_name
+        return result
 
     def _card_icon_url(self, avatar_id: Any, gender: str = "0") -> str:
         text = str(avatar_id or "").strip()
         res_name = self.card_icon_map.get(text, "") if text and text != "0" else ""
         if not res_name:
             res_name = "img_nv" if str(gender) == "2" else "img_nan"
-        return f"https://img.roco.lumlime.cn/{res_name}.png"
+        return f"{self.LUMLIME_ICON_BASE}/{res_name}.png"
 
     def _home_plant_icon(self, icon_id: Any) -> str:
         if not icon_id:
