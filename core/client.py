@@ -408,6 +408,29 @@ class RocomClient:
             json_data=payload,
         )
 
+    async def bind_uid(
+        self, uid: str, user_identifier: str
+    ) -> Optional[Dict]:
+        """手动绑定洛克角色 UID（无需登录），成功后返回 frameworkToken 与 binding 信息"""
+        user_identifier = self._sanitize_uid(user_identifier)
+        uid = self._sanitize_uid(uid)
+        payload = {
+            "uid": uid,
+            "client_type": self.CLIENT_TYPE,
+            "client_id": self.CLIENT_ID,
+        }
+        if user_identifier:
+            payload["user_identifier"] = user_identifier
+        return await self._post(
+            "/api/v1/games/rocom/uid/bind",
+            self._wegame_headers(
+                user_identifier=user_identifier,
+                client_type=self.CLIENT_TYPE,
+                client_id=self.CLIENT_ID,
+            ),
+            json_data=payload,
+        )
+
     async def refresh_binding(
         self, binding_id: str, user_identifier: str
     ) -> Optional[Dict]:

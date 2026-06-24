@@ -246,6 +246,26 @@ class RocomPlugin(Star):
         logger.debug(f"[Rocom] 用户 {user_id} 的主账号 Token: {fw_token[:8]}...")
         return fw_token
 
+    @staticmethod
+    def _is_token_expired_error(message: str) -> bool:
+        """根据错误信息判断是否为凭证过期/失效"""
+        text = str(message or "").lower()
+        keywords = [
+            "401", "403", "过期", "失效", "expired", "unauthorized",
+            "invalid token", "token", "鉴权", "认证失败", "未授权", "登录态",
+            "frameworktoken", "无效",
+        ]
+        return any(kw in text for kw in keywords)
+
+    def _login_error_hint(self, action: str, err_msg: str) -> str:
+        """登录态接口失败时的统一提示：过期则引导重新登录，否则展示具体错误"""
+        if self._is_token_expired_error(err_msg):
+            return (
+                f"{action}失败。\n【凭据已过期】请重新通过 /洛克QQ登录 或 /洛克微信登录 绑定，"
+                "或使用 /洛克绑定UID <UID> 切换为免登录的公开查询。"
+            )
+        return f"{action}失败：{err_msg}"
+
     async def _resolve_ingame_identity(
         self, event: AstrMessageEvent, uid: str = ""
     ) -> tuple[str, str, str]:
@@ -3101,6 +3121,7 @@ class RocomPlugin(Star):
                     "menuItems": [
                         {"cmd": "洛克 QQ 登录", "desc": "使用 QQ 扫码快捷登录及绑定"},
                         {"cmd": "洛克微信登录", "desc": "使用微信扫码快捷登录及绑定"},
+                        {"cmd": "洛克绑定UID <UID>", "desc": "无需登录，直接绑定角色 UID 用于公开查询"},
                         {"cmd": "洛克导入 <ID> <Ticket>", "desc": "通过客户端凭证手动登录"},
                         {"cmd": "洛克刷新", "desc": "刷新当前主账号 QQ 凭证，非必要不要使用，直接重绑"},
                         {"cmd": "洛克刷新所有凭证", "desc": "刷新所有用户的凭证 (管理员，仅作调试或强制兜底，非必要不要使用)"},
@@ -3387,6 +3408,79 @@ class RocomPlugin(Star):
         async for r in self._save_binding_with_role_info(event, fw_token, "manual", user_id):
             yield r
 
+    @filter.command("洛克绑定UID", alias={"绑定UID", "洛克绑定uid", "绑定uid"})
+    async def rocom_bind_uid(self, event: AstrMessageEvent, uid: str = ""):
+        """直接绑定洛克角色 UID（无需登录），用于玩家/家园等公开查询"""
+        uid = str(uid or "").strip()
+        if not uid:
+            yield event.plain_result("格式：/洛克绑定UID <UID>\nUID 即角色资料中的 ID（role.id）。")
+            return
+        if not uid.isdigit():
+            yield event.plain_result("UID 必须为纯数字。")
+            return
+
+        user_id = event.get_sender_id()
+        user_identifier = self._get_user_identifier(event)
+
+        # 保护：若该 UID 已通过登录绑定且凭证仍有效，避免被免登录绑定降级覆盖
+        existing = await self.user_mgr.get_user_bindings(user_id)
+        login_binding = next(
+            (
+                b for b in existing
+                if str(b.get("role_id", "") or "") == uid
+                and (b.get("login_type") or "") in {"qq", "wechat", "manual"}
+                and (b.get("framework_token") or "")
+            ),
+            None,
+        )
+        if login_binding:
+            old_token = login_binding.get("framework_token", "")
+            check = await self.client.get_role(old_token, user_identifier=user_identifier)
+            token_valid = bool(check and check.get("role"))
+            if token_valid:
+                yield event.plain_result(
+                    f"该 UID（{uid}）已通过登录绑定且凭证有效，无需重复绑定。\n"
+                    "如需切换主账号请使用 /洛克切换 <序号>。"
+                )
+                return
+            yield event.plain_result("检测到该 UID 原有登录凭证已失效，将改为免登录 UID 绑定...")
+
+        yield event.plain_result(f"正在绑定 UID：{uid}...")
+        res = await self.client.bind_uid(uid, user_identifier)
+        if res is None:
+            yield event.plain_result(f"UID 绑定失败：{self.client.get_last_error()}")
+            return
+
+        binding_data = res.get("binding") or {}
+        fw_token = str(res.get("frameworkToken") or res.get("framework_token") or "")
+        is_primary = binding_data.get("is_primary", False)
+
+        nickname = "洛克"
+        if fw_token:
+            role_res = await self.client.get_role(fw_token, user_identifier=user_identifier)
+            role = (role_res or {}).get("role") or {}
+            nickname = role.get("name") or nickname
+
+        binding = {
+            "framework_token": fw_token,
+            "binding_id": binding_data.get("binding_id") or binding_data.get("id") or "",
+            "login_type": "uid",
+            "role_id": uid,
+            "nickname": nickname,
+            "bind_time": int(time.time() * 1000),
+            "is_primary": True,
+        }
+        await self.user_mgr.replace_binding_for_role(user_id, binding)
+
+        lines = [
+            "✅ UID 绑定成功！",
+            f"UID：{uid}",
+            f"昵称：{nickname}" if nickname != "洛克" else None,
+            "状态：主账号（首次绑定）" if is_primary else "状态：已绑定",
+            "现在可直接使用 /洛克玩家、/洛克家园 等查询，无需重复输入 UID。",
+        ]
+        yield event.plain_result("\n".join(line for line in lines if line))
+
     @filter.command("洛克绑定列表", alias={"绑定列表"})
     async def rocom_bind_list(self, event: AstrMessageEvent):
         """查看已绑定账号列表"""
@@ -3561,24 +3655,30 @@ class RocomPlugin(Star):
         yield event.plain_result("正在获取洛克王国数据...")
         
         user_identifier = self._get_user_identifier(event)
-        role_task = self.client.get_role(fw_token, user_identifier=user_identifier)
+        # 先单独调用角色接口，确保过期/错误信息可被可靠捕获（避免并发请求互相覆盖 last_error）
+        try:
+            role_res = await self.client.get_role(fw_token, user_identifier=user_identifier)
+        except Exception as e:
+            role_res = e
+
+        if isinstance(role_res, Exception) or not role_res or not role_res.get("role"):
+            if isinstance(role_res, Exception):
+                err_msg = str(role_res)
+            elif isinstance(role_res, dict) and role_res.get("message"):
+                err_msg = str(role_res.get("message"))
+            else:
+                err_msg = self.client.get_last_error("未知错误")
+            yield event.plain_result(self._login_error_hint("获取角色档案", err_msg))
+            return
+
         eval_task = self.client.get_evaluation(fw_token, user_identifier=user_identifier)
         sum_task = self.client.get_pet_summary(fw_token, user_identifier=user_identifier)
         coll_task = self.client.get_collection(fw_token, user_identifier=user_identifier)
         battle_overview_task = self.client.get_battle_overview(fw_token, user_identifier=user_identifier)
         battle_list_task = self.client.get_battle_list(fw_token, page_size=1, user_identifier=user_identifier)
-        
-        results = await asyncio.gather(role_task, eval_task, sum_task, coll_task, battle_overview_task, battle_list_task, return_exceptions=True)
-        role_res, eval_res, sum_res, coll_res, bo_res, bl_res = results
-        
-        if isinstance(role_res, Exception) or not role_res or not role_res.get("role"):
-            err_msg = str(role_res) if isinstance(role_res, Exception) else (role_res.get("message") if isinstance(role_res, dict) else "未知错误")
-            if "401" in err_msg or "403" in err_msg:
-                err_hint = "【凭据过期】请尝试重新通过 QQ/微信 登录绑定。"
-            else:
-                err_hint = f"接口返回错误: {err_msg}"
-            yield event.plain_result(f"获取角色档案失败。\n{err_hint}")
-            return
+
+        results = await asyncio.gather(eval_task, sum_task, coll_task, battle_overview_task, battle_list_task, return_exceptions=True)
+        eval_res, sum_res, coll_res, bo_res, bl_res = results
             
         role = role_res["role"]
         ev = eval_res if isinstance(eval_res, dict) else {}
@@ -3789,8 +3889,13 @@ class RocomPlugin(Star):
         role_res, bo_res, bl_res = results
         
         if isinstance(role_res, Exception) or not role_res or "role" not in role_res:
-             err_msg = str(role_res) if isinstance(role_res, Exception) else (role_res.get("message") if isinstance(role_res, dict) else "未知错误")
-             yield event.plain_result(f"获取战绩数据失败：{err_msg}")
+             if isinstance(role_res, Exception):
+                 err_msg = str(role_res)
+             elif isinstance(role_res, dict) and role_res.get("message"):
+                 err_msg = str(role_res.get("message"))
+             else:
+                 err_msg = self.client.get_last_error("未知错误")
+             yield event.plain_result(self._login_error_hint("获取战绩数据", err_msg))
              return
         
         role = role_res.get("role", {}) if role_res else {}
@@ -3886,8 +3991,13 @@ class RocomPlugin(Star):
         )
         
         if not role_res or "role" not in role_res or not pet_res or "pets" not in pet_res:
-            err_msg = role_res.get("message") if isinstance(role_res, dict) and role_res.get("message") else (pet_res.get("message") if isinstance(pet_res, dict) else "接口异常")
-            yield event.plain_result(f"获取背包数据失败：{err_msg}")
+            if isinstance(role_res, dict) and role_res.get("message"):
+                err_msg = str(role_res.get("message"))
+            elif isinstance(pet_res, dict) and pet_res.get("message"):
+                err_msg = str(pet_res.get("message"))
+            else:
+                err_msg = self.client.get_last_error("接口异常")
+            yield event.plain_result(self._login_error_hint("获取背包数据", err_msg))
             return
         
         role = role_res.get("role", {})
@@ -4330,7 +4440,7 @@ class RocomPlugin(Star):
             fw_token, user_ids, user_identifier=self._get_user_identifier(event)
         )
         if not res:
-            yield event.plain_result(f"好友关系查询失败：{self.client.get_last_error()}")
+            yield event.plain_result(self._login_error_hint("好友关系查询", self.client.get_last_error()))
             return
         data = self._build_friendship_render_data(res, user_ids)
         img_url = await self.renderer.render_html("render/friendship/index.html", data)
@@ -4370,10 +4480,10 @@ class RocomPlugin(Star):
             ),
         )
         if not state_res:
-            yield event.plain_result(f"学生认证状态查询失败：{self.client.get_last_error()}")
+            yield event.plain_result(self._login_error_hint("学生认证状态查询", self.client.get_last_error()))
             return
         if not perks_res:
-            yield event.plain_result(f"学生活动福利查询失败：{self.client.get_last_error()}")
+            yield event.plain_result(self._login_error_hint("学生活动福利查询", self.client.get_last_error()))
             return
         data = self._build_student_render_data(state_res, perks_res, area, account_type)
         img_url = await self.renderer.render_html("render/student/index.html", data)
@@ -4524,8 +4634,11 @@ class RocomPlugin(Star):
                 fw_token, page_no=page_no, user_identifier=self._get_user_identifier(event)
             )
             if not res or "posters" not in res:
-                err_msg = res.get("message") if isinstance(res, dict) else "数据结构异常"
-                yield event.plain_result(f"获取交换大厅数据失败：{err_msg}")
+                if isinstance(res, dict) and res.get("message"):
+                    err_msg = str(res.get("message"))
+                else:
+                    err_msg = self.client.get_last_error("数据结构异常")
+                yield event.plain_result(self._login_error_hint("获取交换大厅数据", err_msg))
                 return
         except Exception as e:
             yield event.plain_result(f"获取交换大厅数据发生异常：{str(e)}")
@@ -4582,7 +4695,8 @@ class RocomPlugin(Star):
         user_identifier = self._get_user_identifier(event)
         res = await self.client.get_lineup_list(fw_token, page_no=1, user_identifier=user_identifier)
         if not res or "lineups" not in res:
-            yield event.plain_result("获取阵容数据失败。")
+            err_msg = res.get("message") if isinstance(res, dict) and res.get("message") else self.client.get_last_error("获取阵容数据失败")
+            yield event.plain_result(self._login_error_hint("获取阵容数据", err_msg))
             return
         
         # 查找匹配的阵容
@@ -4681,11 +4795,8 @@ class RocomPlugin(Star):
             return
 
         if not res or "lineups" not in res:
-            err_msg = res.get("message") if isinstance(res, dict) and res.get("message") else ""
-            if "frameworkToken" in str(err_msg) or "无效" in str(err_msg):
-                yield event.plain_result("【凭据过期】你的登录已过期，请重新使用 /洛克QQ登录 或 /洛克微信登录 绑定账号。")
-            else:
-                yield event.plain_result("获取阵容数据失败。")
+            err_msg = res.get("message") if isinstance(res, dict) and res.get("message") else self.client.get_last_error("获取阵容数据失败")
+            yield event.plain_result(self._login_error_hint("获取阵容数据", err_msg))
             return
             
         # 处理阵容数据
