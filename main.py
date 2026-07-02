@@ -39,6 +39,7 @@ class RocomPlugin(Star):
         super().__init__(context)
         self._instance_id = f"{id(self):x}"
         self.config = config or {}
+        self.copyright = self.config.get("copyright", "AstrBot & WeGame Locke Kingdom Plugin")
         base_url = self.config.get("api_base_url", "https://wegame.shallow.ink")
         wegame_api_key = self.config.get("wegame_api_key", "")
         
@@ -75,7 +76,7 @@ class RocomPlugin(Star):
         
         # 初始化查蛋模块（数据自包含在 render/searcheggs/ 下）
         searcheggs_dir = os.path.join(res_path, "render", "searcheggs")
-        self.egg_searcher = EggService(searcheggs_dir)
+        self.egg_searcher = EggService(searcheggs_dir, copyright=self.copyright)
         self.merchant_subscription_enabled = self.config.get(
             "merchant_subscription_enabled", True
         )
@@ -1274,7 +1275,7 @@ class RocomPlugin(Star):
             "has_more": bool((res or {}).get("has_more")),
             "next_page": (res or {}).get("next_page"),
             "commandHint": "💡 /洛克公告 <页码> | /洛克公告详情 <公告ID> | /洛克公告最新",
-            "footerLine1": "由 AstrBot & WeGame Locke Kingdom Plugin 渲染",
+            "copyright": self.copyright,
             "pageWidth": 680,
         }
 
@@ -1300,7 +1301,7 @@ class RocomPlugin(Star):
                 {"label": "分享", "value": item.get("shareCount", 0)},
             ],
             "commandHint": "💡 /订阅洛克公告 可订阅新公告推送",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
             "pageWidth": 760,
         }
 
@@ -1500,7 +1501,7 @@ class RocomPlugin(Star):
             "now_line": now_line,
             "empty": not bool(items),
             "commandHint": "💡 /洛克活动日历",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
 
@@ -2310,7 +2311,7 @@ class RocomPlugin(Star):
             "updated_at": item.get("updated_at", ""),
             "wiki_url": item.get("url", ""),
             "commandHint": "💡 /洛克wiki <精灵名> | /洛克技能 <技能名>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
 
@@ -2327,7 +2328,7 @@ class RocomPlugin(Star):
             "description": item.get("description", "No description"),
             "updated_at": item.get("updated_at", ""),
             "commandHint": "/洛克技能 <技能名>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _normalize_query_text(self, text: str) -> str:
@@ -2387,7 +2388,7 @@ class RocomPlugin(Star):
             if show_payload and payload
             else "",
             "commandHint": command_hint,
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _format_json_payload(self, payload: Any) -> str:
@@ -2609,7 +2610,7 @@ class RocomPlugin(Star):
             "resultCode": self._stringify_inspect_value(result.get("error_code", 0)),
             "resultDesc": "当前接口只返回 status 字段，尚未提供“好友/非好友/黑名单”等可读关系类型。",
             "commandHint": "💡 /洛克好友关系 <id1,id2>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _build_shop_render_data(self, payload: Dict[str, Any], shop_id: str) -> Dict[str, Any]:
@@ -2727,7 +2728,7 @@ class RocomPlugin(Star):
             "sections": sections,
             "detailItems": detail_items[:18],
             "commandHint": "💡 /洛克商店 <shop_id>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _build_shop_render_data_from_rows(self, payload: Dict[str, Any], shop_id: str) -> Dict[str, Any]:
@@ -2784,7 +2785,7 @@ class RocomPlugin(Star):
             "sections": [{"title": "商品列表", "cards": cards}] if cards else [],
             "detailItems": detail_items,
             "commandHint": "💡 /洛克商店 <shop_id>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _clean_player_field_value(self, field: str, value: str) -> str:
@@ -3049,7 +3050,7 @@ class RocomPlugin(Star):
             "showSignature": bool(signature),
             "sections": curated_sections,
             "commandHint": "💡 /洛克玩家 [UID]",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _build_student_state_render_data(
@@ -3092,7 +3093,7 @@ class RocomPlugin(Star):
             "heroValue": "已通过" if str(certified) == "1" else "未认证",
             "heroSubvalue": school,
             "commandHint": "💡 /洛克学生 [area] [account_type]",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _build_student_perks_render_data(
@@ -3139,7 +3140,7 @@ class RocomPlugin(Star):
             "heroValue": str(len(perk_cards)),
             "heroSubvalue": "当前返回奖励项",
             "commandHint": "💡 /洛克学生 [area] [account_type]",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _build_student_render_data(
@@ -3181,7 +3182,7 @@ class RocomPlugin(Star):
             "stateResult": state_result.get("error_message") or "WG_COMM_SUCC",
             "perksResult": perks_result.get("error_message") or "WG_COMM_SUCC",
             "commandHint": "💡 /洛克学生 [area] [account_type]",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     @filter.command("洛克")
@@ -3254,7 +3255,8 @@ class RocomPlugin(Star):
         data = {
             "pageTitle": "洛克王国插件",
             "pageSubtitle": "AstrBot Roco Kingdom Data Plugin",
-            "menuGroups": menu_groups
+            "menuGroups": menu_groups,
+            "copyright": self.copyright
         }
         img_url = await self.renderer.render_html("render/menu/index.html", data)
         if img_url:
@@ -3585,7 +3587,7 @@ class RocomPlugin(Star):
             "subtitle": f"共找到 {len(bindings)} 个有效绑定账号",
             "bindings": bind_items,
             "commandHint": "💡 /洛克切换 <序号> 切换主账号 | /洛克解绑 <序号> 移除绑定",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin"
+            "copyright": self.copyright
         }
         
         img_url = await self.renderer.render_html("render/bind-list/index.html", data)
@@ -3838,7 +3840,7 @@ class RocomPlugin(Star):
             "fallbackPetImage": f"{{{{_res_path}}}}img/roco_icon.png",
             "scoreText": ev.get("score", "0.0"),
             "commandHint": "💡 /洛克背包 <筛选> <页码> | /洛克战绩 <页码> | /洛克 查看菜单",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
             
             "radarPolygons": [
                 "130,30 230,130 130,230 30,130",
@@ -3879,7 +3881,7 @@ class RocomPlugin(Star):
             "leftTeamPets": [],
             "rightTeamPets": [],
             "commandHint": "💡 /洛克背包 <筛选> <页码> | /洛克战绩 <页码> | /洛克 查看菜单",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin"
+            "copyright": self.copyright
         }
 
         if not data.get("userAvatarDisplay"):
@@ -4018,7 +4020,7 @@ class RocomPlugin(Star):
             "totalPages": 1,
             "battles": parsed_battles,
             "commandHint": "💡 /洛克战绩 <页码> | 默认第1页",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin"
+            "copyright": self.copyright
         }
 
         img_url = await self.renderer.render_html("render/record/index.html", data)
@@ -4130,7 +4132,7 @@ class RocomPlugin(Star):
             "totalPages": total_pages,
             "pageSize": 10,
             "commandHint": hint_str,
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
             "fallbackPetImage": f"{{{{_res_path}}}}img/roco_icon.png",
             "pets": pets_list,
             "emptySlots": list(range(empty_count))
@@ -4742,7 +4744,7 @@ class RocomPlugin(Star):
             "currentPage": page_no,
             "totalPages": res.get("total_pages", 1),
             "commandHint": "💡 /洛克交换大厅 <页码> | 默认第1页，支持别名：/洛克大厅 / /交换大厅",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin"
+            "copyright": self.copyright
         }
         
         img_url = await self.renderer.render_html("render/exchange-hall/index.html", data)
@@ -4907,7 +4909,7 @@ class RocomPlugin(Star):
             "page_no": res.get("page_no", 1),
             "total_pages": res.get("total_pages", 1),
             "commandHint": hint_str,
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
             "fallbackPetImage": f"{{{{_res_path}}}}img/roco_icon.png"
         }
         
@@ -5070,7 +5072,7 @@ class RocomPlugin(Star):
                 backend_detail, compatible_by_group
             )
             data["commandHint"] = "💡 数据来自后端图鉴；后端不可用时自动回退本地查蛋"
-            data["copyright"] = "AstrBot & WeGame Locke Kingdom Plugin"
+            data["copyright"] = self.copyright
             img_url = await self.renderer.render_html("render/searcheggs/index.html", data)
             if img_url:
                 yield event.image_result(img_url)
@@ -5108,7 +5110,7 @@ class RocomPlugin(Star):
         try:
             data = self.egg_searcher.build_search_data(pet)
             data["commandHint"] = "💡 /洛克查蛋 <名称> | /洛克查蛋 身高0.25 体重1.5 | /洛克配种 <父> <母>"
-            data["copyright"] = "AstrBot & WeGame Locke Kingdom Plugin"
+            data["copyright"] = self.copyright
             img_url = await self.renderer.render_html("render/searcheggs/index.html", data)
             if img_url:
                 if hint_prefix:
@@ -5199,7 +5201,7 @@ class RocomPlugin(Star):
             data = self.egg_searcher.build_pair_data(mother, father)
             # 交换显示顺序：模板中 mother=母体(结果跟随), father=父体
             data["commandHint"] = "💡 默认前父后母，孵蛋结果跟随母体 | /洛克配种 <精灵名> 查怎么孵"
-            data["copyright"] = "AstrBot & WeGame Locke Kingdom Plugin"
+            data["copyright"] = self.copyright
             img_url = await self.renderer.render_html("render/searcheggs/pair.html", data)
             if img_url:
                 yield event.image_result(img_url)

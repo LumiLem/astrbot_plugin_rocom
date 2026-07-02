@@ -72,7 +72,8 @@ class SearchResult:
 class EggSearcher:
     """蛋组查询引擎，数据自包含在 render/searcheggs/ 下"""
 
-    def __init__(self, data_dir: str = None):
+    def __init__(self, data_dir: str = None, copyright: str = "AstrBot & WeGame Locke Kingdom Plugin"):
+        self.copyright = copyright
         """
         data_dir: render/searcheggs/ 目录路径。
         若不传则自动取本文件所在目录。

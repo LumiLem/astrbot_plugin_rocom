@@ -63,7 +63,7 @@ class EggService(EggSearcher):
             "total_count": len(perfect) + len(ranged),
             "has_results": bool(perfect or ranged),
             "commandHint": "💡 /洛克查蛋 <精灵名> | /洛克查蛋 0.18m 1.5kg | /洛克查蛋 0.18",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def build_size_search_data_from_api(
@@ -98,7 +98,7 @@ class EggService(EggSearcher):
             "total_count": len(perfect) + len(ranged),
             "has_results": bool(perfect or ranged),
             "commandHint": "💡 /洛克查蛋 <精灵名> | /洛克查蛋 0.18m 1.5kg | /洛克查蛋 0.18",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def build_size_search_text_from_api(
@@ -297,7 +297,7 @@ class EggService(EggSearcher):
             "count": len(candidates),
             "candidates": [self._format_pet_card(p) for p in candidates],
             "commandHint": "💡 请使用更精确的名称重新查询",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _api_egg_groups(self, value: Any) -> list[Any]:
@@ -359,7 +359,7 @@ class EggService(EggSearcher):
             "fathers": [self._format_pet_card(p) for p in fathers[:30]],
             "father_count": len(fathers),
             "commandHint": "💡 /洛克配种 <父体> <母体> 查看详细结果",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "copyright": self.copyright,
         }
 
     def _format_pet_card(
