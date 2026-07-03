@@ -42,10 +42,12 @@ class RocomPlugin(Star):
         self.copyright = self.config.get("copyright", "AstrBot & WeGame Locke Kingdom Plugin")
         base_url = self.config.get("api_base_url", "https://wegame.shallow.ink")
         wegame_api_key = self.config.get("wegame_api_key", "")
+        rkpp_proxy_url = self.config.get("rkpp_proxy_url", "http://localhost:8800")
         
         self.client = RocomClient(
             base_url=base_url,
             wegame_api_key=wegame_api_key,
+            rkpp_proxy_url=rkpp_proxy_url,
         )
         
         data_dir = str(StarTools.get_data_dir())

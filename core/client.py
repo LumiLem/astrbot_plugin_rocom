@@ -25,8 +25,10 @@ class RocomClient:
         base_url: str = "https://wegame.shallow.ink",
         wegame_api_key: str = "",
         timeout: float = 15.0,
+        rkpp_proxy_url: str = "",
     ):
         self.base_url = base_url.rstrip("/")
+        self.rkpp_proxy_url = rkpp_proxy_url.rstrip("/")
         self.wegame_api_key = wegame_api_key
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
@@ -994,3 +996,63 @@ class RocomClient:
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    # ─── RKPP 代理服务 ───
+
+    async def rkpp_query(self, opcode: str, json_data: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        向 RKPP 代理服务发送原始 protobuf 请求，获取响应。
+        使用独立于 WeGame API 的代理地址与头部。
+        """
+        if not self.rkpp_proxy_url:
+            self._set_last_error("RKPP 代理未配置，请在设置中配置 rkpp_proxy_url")
+            return None
+
+        if json_data is None:
+            json_data = {}
+
+        try:
+            self._clear_last_error()
+            client = await self._get_client()
+            url = f"{self.rkpp_proxy_url}/api/query/{opcode}"
+            
+            resp = await client.post(url, json=json_data)
+            
+            if resp.status_code != 200:
+                body_hint = resp.text[:300] if resp.text else ""
+                try:
+                    body_json = resp.json()
+                    body_hint = body_json.get("message") or body_hint
+                except Exception:
+                    pass
+                logger.warning(f"[Rocom API RKPP] {opcode} HTTP 错误: {resp.status_code} {body_hint}")
+                self._set_last_error(f"HTTP {resp.status_code}: {body_hint}".strip(": "))
+                return None
+
+            try:
+                data = resp.json()
+            except Exception as json_err:
+                logger.warning(f"[Rocom API RKPP] {opcode} JSON 解析失败: {json_err}, 响应: {resp.text[:200]}")
+                self._set_last_error("JSON 解析失败")
+                return None
+
+            if data.get("status") != "ok":
+                err_message = data.get("message", "未知错误")
+                logger.warning(f"[Rocom API RKPP] {opcode} 错误: {err_message}")
+                self._set_last_error(str(err_message))
+                return None
+                
+            return data
+        except httpx.TimeoutException:
+            logger.error(f"[Rocom API RKPP] {opcode} 请求超时")
+            self._set_last_error("请求超时")
+            return None
+        except httpx.RequestError as e:
+            logger.error(f"[Rocom API RKPP] {opcode} 请求失败: {e}")
+            self._set_last_error(f"请求失败: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[Rocom API RKPP] {opcode} 异常: {e}")
+            self._set_last_error(f"异常: {e}")
+            return None
+

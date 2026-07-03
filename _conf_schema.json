@@ -11,6 +11,12 @@
     "hint": "API 服务器地址，不要动",
     "default": "https://wegame.shallow.ink"
   },
+  "rkpp_proxy_url": {
+    "type": "string",
+    "description": "RKPP 代理服务器地址",
+    "hint": "RKPP 协议解析代理 API 的地址，例如 http://localhost:8800，留空则不使用",
+    "default": "http://localhost:8800"
+  },
   "render_timeout": {
     "type": "int",
     "description": "渲染超时时间",
