@@ -288,3 +288,28 @@ class AnnouncementSubscriptionManager(AsyncDataManager):
     async def get_all_subscriptions(self) -> Dict[str, Dict[str, Any]]:
         async with self.lock:
             return copy.deepcopy(self.data)
+
+
+class BroadcastTaskManager(AsyncDataManager):
+    """Persistent storage for scheduled broadcast tasks."""
+
+    def __init__(self, data_dir: str):
+        super().__init__(data_dir, "rocom_broadcast_tasks.json", {})
+
+    async def add_task(self, task_id: str, task_data: Dict[str, Any]):
+        async with self.lock:
+            self.data[str(task_id)] = copy.deepcopy(task_data)
+            await self._save()
+
+    async def get_all_tasks(self) -> Dict[str, Dict[str, Any]]:
+        async with self.lock:
+            return copy.deepcopy(self.data)
+
+    async def delete_task(self, task_id: str) -> bool:
+        async with self.lock:
+            key = str(task_id)
+            if key not in self.data:
+                return False
+            del self.data[key]
+            await self._save()
+            return True

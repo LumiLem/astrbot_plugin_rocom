@@ -22,6 +22,7 @@ from .core.user import (
     MerchantSubscriptionManager,
     HomeSubscriptionManager,
     AnnouncementSubscriptionManager,
+    BroadcastTaskManager,
 )
 from .core.render import Renderer
 from .core.egg_service import EggService, SearchResult
@@ -55,6 +56,7 @@ class RocomPlugin(Star):
         self.merchant_sub_mgr = MerchantSubscriptionManager(data_dir)
         self.home_sub_mgr = HomeSubscriptionManager(data_dir)
         self.announcement_sub_mgr = AnnouncementSubscriptionManager(data_dir)
+        self.broadcast_task_mgr = BroadcastTaskManager(data_dir)
         
         render_timeout = self.config.get("render_timeout", 30000)
         self.help_prefix_display = str(self.config.get("help_prefix_display", "") or "")
@@ -156,6 +158,14 @@ class RocomPlugin(Star):
             self._merchant_thread.start()
         else:
             logger.info("[Rocom] 远行商人订阅功能未启用，跳过调度线程")
+            
+        # 始终启动广播轮询任务，支持定时持久化群发
+        logger.info("[Rocom] 广播持久化轮询任务已启动")
+        self._broadcast_poll_task = self._register_background_task(
+            "broadcast_poll",
+            self._broadcast_poll_loop(),
+        )
+
         if self.home_subscription_enabled or self.announcement_subscription_enabled:
             logger.info("[Rocom] 订阅轮询功能已启用，启动统一轮询任务")
             self._subscription_poll_task = self._register_background_task(
@@ -999,6 +1009,69 @@ class RocomPlugin(Star):
             "guardEmptyText": "后端当前返回中没有守卫精灵字段",
             "updatedAt": updated_at,
         }
+
+    async def _broadcast_poll_loop(self):
+        """持久化定时广播轮询"""
+        while True:
+            try:
+                now = time.time()
+                tasks = await self.broadcast_task_mgr.get_all_tasks()
+                for task_id, task in tasks.items():
+                    target_ts = task.get("target_ts", 0)
+                    if now >= target_ts:
+                        logger.info(f"[Rocom] 开始执行持久化定时群发任务: {task_id}")
+                        chain = MessageChain()
+                        for comp in task.get("components", []):
+                            if comp["type"] == "plain":
+                                chain.message(comp["text"])
+                            elif comp["type"] == "image":
+                                file_url = comp["file"]
+                                chain.file_image(file_url)
+                        
+                        umos = set()
+                        specific_targets = task.get("specific_targets", [])
+                        if specific_targets:
+                            for t in specific_targets:
+                                umos.add(t)
+                        else:
+                            merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+                            for sub in merch_subs.values():
+                                if umo := sub.get("umo"): umos.add(umo)
+                                    
+                            ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+                            for sub in ann_subs.values():
+                                if umo := sub.get("umo"): umos.add(umo)
+                                    
+                            home_subs = await self.home_sub_mgr.get_all_subscriptions()
+                            for sub in home_subs.values():
+                                if umo := sub.get("umo"): umos.add(umo)
+                                
+                        success_count = 0
+                        for umo in umos:
+                            try:
+                                send_chain = MessageChain()
+                                send_chain.chain = list(chain.chain)
+                                await self.context.send_message(umo, send_chain)
+                                success_count += 1
+                                await asyncio.sleep(0.5)
+                            except Exception as e:
+                                logger.warning(f"[Rocom] 定时群发推送失败 ({umo}): {e}")
+                                
+                        try:
+                            if issuer_umo := task.get("issuer_umo"):
+                                issue_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(task.get('created_at', now)))
+                                await self.context.send_message(
+                                    issuer_umo, 
+                                    MessageChain().message(f"✅ 您于 {issue_time_str} 安排的定时群发任务已执行完成，成功送达 {success_count} 个目标。")
+                                )
+                        except Exception:
+                            pass
+                            
+                        await self.broadcast_task_mgr.delete_task(task_id)
+            except Exception as e:
+                logger.error(f"[Rocom] 持久化广播轮询异常: {e}")
+                
+            await asyncio.sleep(15)
 
     async def _subscription_poll_loop(self):
         """统一轮询：家园 + 公告订阅，60s 步长，wall clock 绝对时间"""
@@ -4286,6 +4359,138 @@ class RocomPlugin(Star):
             yield event.plain_result("已取消当前会话的洛克公告订阅。")
         else:
             yield event.plain_result("当前会话没有洛克公告订阅。")
+
+    @filter.command("洛克群发公告")
+    async def rocom_broadcast(self, event: AstrMessageEvent):
+        """管理员向所有订阅用户群发图文公告"""
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+            
+        import uuid
+        chain = MessageChain()
+        components_data = []
+        has_content = False
+        first_plain_processed = False
+        target_ts = 0
+        time_hint = ""
+        specific_targets = []
+        
+        for comp in event.message_obj.message:
+            if isinstance(comp, Plain):
+                text = comp.text
+                if not first_plain_processed:
+                    text = re.sub(r'^[/.#]*洛克群发公告\s*', '', text, count=1).strip()
+                    
+                    while True:
+                        u_match = re.match(r'^-u\s+([\w,-]+)\s*', text)
+                        d_match = re.match(r'^-d\s+(\d+)(?:m|分钟)?\s*', text)
+                        t_match = re.match(r'^-t\s+(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}|\d{2}:\d{2})\s*', text)
+                        
+                        if u_match:
+                            targets_str = u_match.group(1)
+                            specific_targets.extend([t.strip() for t in targets_str.split(',') if t.strip()])
+                            text = text[u_match.end():]
+                        elif d_match:
+                            delay_minutes = int(d_match.group(1))
+                            target_ts = int(time.time()) + delay_minutes * 60
+                            time_hint = f"延时 {delay_minutes} 分钟后 ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(target_ts))})"
+                            text = text[d_match.end():]
+                        elif t_match:
+                            time_str = t_match.group(1)
+                            if len(time_str) == 5:
+                                # 仅提供了 HH:MM，补充当天日期
+                                time_str = time.strftime('%Y-%m-%d ') + time_str
+                            try:
+                                target_ts = int(time.mktime(time.strptime(time_str, "%Y-%m-%d %H:%M")))
+                                time_hint = f"定时 {time_str}"
+                                text = text[t_match.end():]
+                            except ValueError:
+                                yield event.plain_result(f"时间格式错误，请使用 YYYY-MM-DD HH:MM 或 HH:MM 格式，例如：-t {time.strftime('%H:%M')}")
+                                return
+                        else:
+                            break
+                            
+                    first_plain_processed = True
+                if text:
+                    chain.message(text)
+                    components_data.append({"type": "plain", "text": text})
+                    has_content = True
+            elif isinstance(comp, Image):
+                chain.chain.append(comp)
+                file_url = getattr(comp, "file", None) or getattr(comp, "url", None)
+                if file_url:
+                    components_data.append({"type": "image", "file": file_url})
+                has_content = True
+            else:
+                chain.chain.append(comp)
+                
+        if not has_content:
+            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在开头加上“延时X分钟”或“定时YYYY-MM-DD HH:MM”。")
+            return
+            
+        umos = set()
+        
+        if specific_targets:
+            for t in specific_targets:
+                umos.add(t)
+        else:
+            # 远行商人订阅
+            merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+            for sub in merch_subs.values():
+                umo = sub.get("umo")
+                if umo:
+                    umos.add(umo)
+                    
+            # 洛克公告订阅
+            ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+            for sub in ann_subs.values():
+                umo = sub.get("umo")
+                if umo:
+                    umos.add(umo)
+                    
+            # 家园订阅
+            home_subs = await self.home_sub_mgr.get_all_subscriptions()
+            for sub in home_subs.values():
+                umo = sub.get("umo")
+                if umo:
+                    umos.add(umo)
+                
+        if not umos:
+            yield event.plain_result("当前没有任何订阅用户/群组。")
+            return
+            
+        if target_ts > 0:
+            if target_ts <= time.time():
+                yield event.plain_result("设定的时间已经过去，请设置未来的时间。")
+                return
+                
+            task_id = str(uuid.uuid4())
+            await self.broadcast_task_mgr.add_task(task_id, {
+                "target_ts": target_ts,
+                "components": components_data,
+                "issuer_umo": str(event.unified_msg_origin),
+                "created_at": int(time.time()),
+                "specific_targets": specific_targets
+            })
+            yield event.plain_result(f"✅ 已成功建立持久化定时任务！\n执行时间：{time_hint}\n预计发送至 {len(umos)} 个目标。\n重启机器人该任务也不会丢失。")
+            return
+            
+        yield event.plain_result(f"正在准备向 {len(umos)} 个订阅目标发送公告，请稍候...")
+        
+        success_count = 0
+        for umo in umos:
+            try:
+                # 重新构建 MessageChain，防止被底层修改
+                send_chain = MessageChain()
+                send_chain.chain = list(chain.chain)
+                await self.context.send_message(umo, send_chain)
+                success_count += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"[Rocom] 群发公告推送失败 ({umo}): {e}")
+                
+        yield event.plain_result(f"群发完成！成功发送给 {success_count} 个订阅目标。")
 
     @filter.command("远行商人", alias={"yxsr"})
     async def rocom_merchant(self, event: AstrMessageEvent):
