@@ -1036,8 +1036,8 @@ class RocomClient:
                 self._set_last_error("JSON 解析失败")
                 return None
 
-            if data.get("status") != "ok":
-                err_message = data.get("message", "未知错误")
+            if "payload" not in data and "error" in data:
+                err_message = data.get("error", "未知错误")
                 logger.warning(f"[Rocom API RKPP] {opcode} 错误: {err_message}")
                 self._set_last_error(str(err_message))
                 return None

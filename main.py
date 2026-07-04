@@ -4562,11 +4562,18 @@ class RocomPlugin(Star):
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
             return
         yield event.plain_result(f"正在查询 UID:{uid} 的家园信息，请稍候...")
-        res = await self.client.ingame_home_info(
-            uid,
-            fw_token=fw_token,
-            user_identifier=user_identifier,
-        )
+        # --- 数据源切换（可根据需要注释/解开注释） ---
+        # 1. 走 RKPP 代理服务
+        rkpp_res = await self.client.rkpp_query("ZoneHomeQueryFriendHomeInfoReq", {"uin": int(uid)})
+        res = rkpp_res.get("payload") if rkpp_res else None
+        
+        # 2. 走原版 WeGame API
+        # res = await self.client.ingame_home_info(
+        #     uid,
+        #     fw_token=fw_token,
+        #     user_identifier=user_identifier,
+        # )
+        # ---------------------------------------------
         if not res:
             yield event.plain_result(f"家园查询失败：{self.client.get_last_error()}")
             return
