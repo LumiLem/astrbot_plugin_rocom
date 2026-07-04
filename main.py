@@ -697,7 +697,7 @@ class RocomPlugin(Star):
             "isGuard": is_guard,
             "statusText": status_text,
             "statusClass": status_class,
-            "note": self._format_home_remaining(rip_time, now_ts) if has_inspiration else ("家园守卫位" if is_guard else ""),
+            "note": f"{self._format_home_remaining(rip_time, now_ts)}（{datetime.fromtimestamp(rip_time).strftime('%m-%d %H:%M')}）" if has_inspiration else ("家园守卫位" if is_guard else ""),
             "hasEgg": has_egg,
             "eggReady": egg_ready or has_egg,
             "eggTime": egg_time,
@@ -705,6 +705,8 @@ class RocomPlugin(Star):
             "inspireReady": inspire_ready,
             "readyAt": rip_time,
             "eventId": f"pet:{raw.get('pos') or index + 1}:{pet_id}:{rip_time}",
+            "voice": raw.get("voice"),
+            "voiceLabel": "婉转声" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") >= 96 else ("粗嗓门" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") <= -96 else ""),
         }
 
     def _home_pet_sources(self, home_info: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -4577,7 +4579,51 @@ class RocomPlugin(Star):
         if not res:
             yield event.plain_result(f"家园查询失败：{self.client.get_last_error()}")
             return
+
+        # 获取精灵嗓音
+        cell = res.get("friend_cell_home_brief_info") or res.get("cell_home_brief_info") or {}
+        home_pets = cell.get("home_pets")
+        voice_fetched = False
+        if isinstance(home_pets, list):
+            async def fetch_voice(pet: Dict[str, Any]) -> bool:
+                nonlocal voice_fetched
+                home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
+                pet_gid = home_pet.get("pet_gid") or pet.get("pet_gid")
+                if not pet_gid:
+                    return True
+                try:
+                    voice_resp = await self.client.rkpp_query("ZoneQueryNpcPetDataReq", {
+                        "target_uin": int(uid),
+                        "target_pet_gid": int(pet_gid)
+                    })
+                    if not voice_resp or not voice_resp.get("payload"):
+                        return False
+                    
+                    target_data = voice_resp["payload"].get("target_pet_data")
+                    if not target_data:
+                        # 如果 payload 里连 target_pet_data 都没有（例如返回了 ret_code: 2004），通常代表玩家离线
+                        return False
+                        
+                    voice = target_data.get("voice")
+                    if voice is not None:
+                        pet["voice"] = voice
+                        voice_fetched = True
+                    return True
+                except Exception as e:
+                    logger.warning(f"[Rocom] 获取精灵 {pet_gid} 嗓音失败: {e}")
+                    return False
+
+            # 为了防止并发过快导致账号异常或触发风控，改为顺序请求并增加随机小延迟
+            for pet in home_pets:
+                if isinstance(pet, dict):
+                    success = await fetch_voice(pet)
+                    if not success:
+                        # 如果获取失败（大概率玩家离线），则直接中断后续所有获取，避免无意义的风控和漫长的超时等待
+                        break
+                    await asyncio.sleep(0.15)  # 每次请求间隔 150 毫秒
+
         data = self._build_home_render_data(res, uid or "当前绑定")
+        data["voiceFailed"] = (not voice_fetched) and (isinstance(home_pets, list) and len(home_pets) > 0)
         img_url = await self.renderer.render_html(
             "render/home/index.html",
             data,

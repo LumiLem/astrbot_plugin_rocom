@@ -43,7 +43,7 @@
         <div class="panel-head">
           <div>
             <div class="panel-label">Indoor Pets</div>
-            <h2>室内精灵</h2>
+            <h2>室内精灵{{if voiceFailed}}<span class="voice-failed-hint">（精灵声音等部分数据需要玩家在线）</span>{{/if}}</h2>
           </div>
           <span class="panel-count">{{indoorCount}}</span>
         </div>
@@ -73,12 +73,19 @@
               {{if item.variantText == "噩梦污染"}}
               <img class="pet-variant-icon" src="{{_res_path}}img/噩梦污染.png" alt="噩梦污染">
               {{/if}}
+              {{if item.voiceLabel}}
+              <div class="voice-badge {{if item.voice >= 96}}voice-badge-high{{else}}voice-badge-low{{/if}}">{{item.voiceLabel}}</div>
+              {{/if}}
             </div>
             <div class="pet-info">
-              <div class="pet-name"><span>{{item.name}}</span>{{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}</div>
+              <div class="pet-name">
+                <span>{{item.name}}</span>
+                <span class="pet-level">Lv.{{item.level}}</span>
+                {{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}
+              </div>
               <div class="pet-meta">
-                <span>Lv.{{item.level}}</span>
                 {{if item.natureName}}<span class="nature-tag">{{item.natureName}}</span>{{/if}}
+                {{if item.voice != null}}<span class="voice-tag">声音 {{item.voice}} dB</span>{{/if}}
                 {{if item.statusText}}<span class="status-pill status-{{item.statusClass}}">{{item.statusText}}</span>{{/if}}
                 {{if item.feedRound}}<span class="feed-round">喂养 {{item.feedRound}} 轮</span>{{/if}}
               </div>

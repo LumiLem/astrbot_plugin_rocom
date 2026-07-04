@@ -222,6 +222,14 @@ h2 {
     line-height: 1.1;
 }
 
+.voice-failed-hint {
+    font-size: 15px;
+    color: #ff6a80;
+    font-weight: normal;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
 .garden-title-row {
     display: flex;
     align-items: center;
@@ -498,6 +506,27 @@ h2 {
     filter: drop-shadow(0 4px 6px rgba(93, 58, 12, 0.20));
 }
 
+.voice-badge {
+    position: absolute;
+    bottom: -6px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 11px;
+    color: #fff;
+    white-space: nowrap;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.voice-badge-high {
+    background: linear-gradient(135deg, #ff8da1, #ff577d);
+}
+
+.voice-badge-low {
+    background: linear-gradient(135deg, #6096db, #346cb3);
+}
+
 .pet-info {
     min-width: 0;
     flex: 1;
@@ -511,10 +540,17 @@ h2 {
     font-size: 24px;
 }
 
-.pet-name span {
+.pet-name span:first-child {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.pet-level {
+    margin-left: 4px;
+    font-size: 16px;
+    color: #8b7355;
+    font-weight: 500;
 }
 
 .pet-gender-icon {
