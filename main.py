@@ -1023,41 +1023,60 @@ class RocomPlugin(Star):
                     if now >= target_ts:
                         logger.info(f"[Rocom] 开始执行持久化定时群发任务: {task_id}")
                         chain = MessageChain()
+                        has_at_all = False
                         for comp in task.get("components", []):
                             if comp["type"] == "plain":
                                 chain.message(comp["text"])
                             elif comp["type"] == "image":
                                 file_url = comp["file"]
                                 chain.file_image(file_url)
+                            elif comp["type"] == "at_all":
+                                chain.at_all()
+                                has_at_all = True
                         
-                        umos = set()
+                        umos = {}
                         specific_targets = task.get("specific_targets", [])
                         if specific_targets:
                             for t in specific_targets:
-                                umos.add(t)
+                                umos[t] = t
                         else:
                             merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
-                            for sub in merch_subs.values():
-                                if umo := sub.get("umo"): umos.add(umo)
+                            for key, sub in merch_subs.items():
+                                if umo := sub.get("umo"): umos[umo] = key
                                     
                             ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
-                            for sub in ann_subs.values():
-                                if umo := sub.get("umo"): umos.add(umo)
+                            for key, sub in ann_subs.items():
+                                if umo := sub.get("umo"): umos[umo] = key
                                     
                             home_subs = await self.home_sub_mgr.get_all_subscriptions()
-                            for sub in home_subs.values():
-                                if umo := sub.get("umo"): umos.add(umo)
+                            for key, sub in home_subs.items():
+                                if umo := sub.get("umo"): umos[umo] = key
                                 
                         success_count = 0
-                        for umo in umos:
+                        for umo, key in umos.items():
                             try:
                                 send_chain = MessageChain()
-                                send_chain.chain = list(chain.chain)
+                                is_private = isinstance(key, str) and key.startswith("private_")
+                                if is_private:
+                                    send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                                else:
+                                    send_chain.chain = list(chain.chain)
                                 await self.context.send_message(umo, send_chain)
                                 success_count += 1
                                 await asyncio.sleep(0.5)
                             except Exception as e:
-                                logger.warning(f"[Rocom] 定时群发推送失败 ({umo}): {e}")
+                                if has_at_all:
+                                    logger.warning(f"[Rocom] 定时群发推送失败 ({umo})，尝试降级纯文本: {e}")
+                                    try:
+                                        fallback_chain = MessageChain()
+                                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ != "AtAll"]
+                                        await self.context.send_message(umo, fallback_chain)
+                                        success_count += 1
+                                        await asyncio.sleep(0.5)
+                                    except Exception as fallback_e:
+                                        logger.warning(f"[Rocom] 定时群发降级推送失败 ({umo}): {fallback_e}")
+                                else:
+                                    logger.warning(f"[Rocom] 定时群发推送失败 ({umo}): {e}")
                                 
                         try:
                             if issuer_umo := task.get("issuer_umo"):
@@ -4375,6 +4394,7 @@ class RocomPlugin(Star):
         target_ts = 0
         time_hint = ""
         specific_targets = []
+        mention_all = False
         
         for comp in event.message_obj.message:
             if isinstance(comp, Plain):
@@ -4386,6 +4406,7 @@ class RocomPlugin(Star):
                         u_match = re.match(r'^-u\s+([\w,-]+)\s*', text)
                         d_match = re.match(r'^-d\s+(\d+)(?:m|分钟)?\s*', text)
                         t_match = re.match(r'^-t\s+(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}|\d{2}:\d{2})\s*', text)
+                        a_match = re.match(r'^-a\s*', text)
                         
                         if u_match:
                             targets_str = u_match.group(1)
@@ -4408,6 +4429,9 @@ class RocomPlugin(Star):
                             except ValueError:
                                 yield event.plain_result(f"时间格式错误，请使用 YYYY-MM-DD HH:MM 或 HH:MM 格式，例如：-t {time.strftime('%H:%M')}")
                                 return
+                        elif a_match:
+                            mention_all = True
+                            text = text[a_match.end():]
                         else:
                             break
                             
@@ -4425,36 +4449,40 @@ class RocomPlugin(Star):
             else:
                 chain.chain.append(comp)
                 
+        if mention_all:
+            chain.at_all()
+            components_data.append({"type": "at_all"})
+            
         if not has_content:
-            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在开头加上“延时X分钟”或“定时YYYY-MM-DD HH:MM”。")
+            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。")
             return
             
-        umos = set()
+        umos = {}
         
         if specific_targets:
             for t in specific_targets:
-                umos.add(t)
+                umos[t] = t
         else:
             # 远行商人订阅
             merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
-            for sub in merch_subs.values():
+            for key, sub in merch_subs.items():
                 umo = sub.get("umo")
                 if umo:
-                    umos.add(umo)
+                    umos[umo] = key
                     
             # 洛克公告订阅
             ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
-            for sub in ann_subs.values():
+            for key, sub in ann_subs.items():
                 umo = sub.get("umo")
                 if umo:
-                    umos.add(umo)
+                    umos[umo] = key
                     
             # 家园订阅
             home_subs = await self.home_sub_mgr.get_all_subscriptions()
-            for sub in home_subs.values():
+            for key, sub in home_subs.items():
                 umo = sub.get("umo")
                 if umo:
-                    umos.add(umo)
+                    umos[umo] = key
                 
         if not umos:
             yield event.plain_result("当前没有任何订阅用户/群组。")
@@ -4479,16 +4507,31 @@ class RocomPlugin(Star):
         yield event.plain_result(f"正在准备向 {len(umos)} 个订阅目标发送公告，请稍候...")
         
         success_count = 0
-        for umo in umos:
+        for umo, key in umos.items():
             try:
                 # 重新构建 MessageChain，防止被底层修改
                 send_chain = MessageChain()
-                send_chain.chain = list(chain.chain)
+                is_private = isinstance(key, str) and key.startswith("private_")
+                if is_private:
+                    send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                else:
+                    send_chain.chain = list(chain.chain)
                 await self.context.send_message(umo, send_chain)
                 success_count += 1
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logger.warning(f"[Rocom] 群发公告推送失败 ({umo}): {e}")
+                if mention_all:
+                    logger.warning(f"[Rocom] 群发公告推送失败 ({umo})，尝试降级纯文本: {e}")
+                    try:
+                        fallback_chain = MessageChain()
+                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ != "AtAll"]
+                        await self.context.send_message(umo, fallback_chain)
+                        success_count += 1
+                        await asyncio.sleep(0.5)
+                    except Exception as fallback_e:
+                        logger.warning(f"[Rocom] 群发降级推送失败 ({umo}): {fallback_e}")
+                else:
+                    logger.warning(f"[Rocom] 群发公告推送失败 ({umo}): {e}")
                 
         yield event.plain_result(f"群发完成！成功发送给 {success_count} 个订阅目标。")
 
