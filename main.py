@@ -2038,11 +2038,11 @@ class RocomPlugin(Star):
             if elapsed < 300:
                 stale = False
                 reason = ""
-                # 常规商品消失（上一轮有但本轮还没加载）
-                if self._prev_round_products and not round_products:
+                # 常规商品未加载
+                if not round_products:
                     stale, reason = True, "常规商品未加载"
                 # 常规商品与上一轮完全相同（新一轮数据还没刷新）
-                elif round_products and round_products == self._prev_round_products:
+                elif round_products == self._prev_round_products:
                     stale, reason = True, "常规商品与上一轮相同"
                 if stale:
                     logger.warning(f"[Rocom] 远行商人{reason}（开盘 {elapsed:.0f}s），等待数据更新")
@@ -2116,20 +2116,18 @@ class RocomPlugin(Star):
                         lines.append(f"{category_labels[cat]}：{names}")
                 else:
                     lines.append(f"商品：{'、'.join(product_names)}")
-                text_chain.message("\n".join(lines).strip())
+                msg_text = "\n".join(lines).strip()
             else:
-                text_chain.message(
-                    f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
-                )
+                msg_text = f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
+            
+            text_chain.message(msg_text)
             push_ok = False
             try:
                 await self.context.send_message(sub["umo"], text_chain)
                 push_ok = True
             except Exception as e:
                 logger.warning(f"[Rocom] 远行商人文本推送失败: {e}")
-                fallback = MessageChain().message(
-                    f"远行商人本轮命中订阅商品：{'、'.join(matched)}"
-                )
+                fallback = MessageChain().message(msg_text)
                 try:
                     await self.context.send_message(sub["umo"], fallback)
                     push_ok = True
