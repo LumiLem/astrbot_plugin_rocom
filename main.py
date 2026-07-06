@@ -73,6 +73,9 @@ class RocomPlugin(Star):
         self.announcement_sub_mgr = AnnouncementSubscriptionManager(data_dir)
         self.broadcast_task_mgr = BroadcastTaskManager(data_dir)
         
+        self.settings_file = os.path.join(data_dir, "rocom_settings.json")
+        self.rocom_settings = self._load_settings()
+        
         render_timeout = self.config.get("render_timeout", 30000)
         self.low_bandwidth_mode = bool(self.config.get("low_bandwidth_mode", False))
         self.help_prefix_display = str(self.config.get("help_prefix_display", "") or "")
@@ -199,6 +202,23 @@ class RocomPlugin(Star):
             registry = {}
             setattr(loop, self._BACKGROUND_REGISTRY_KEY, registry)
         return registry
+
+    def _load_settings(self) -> Dict[str, Any]:
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"[Rocom] 读取设置文件失败: {e}")
+        return {"home": 1}  # 默认 1 代表 RKPP
+
+    def _save_settings(self):
+        try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump(self.rocom_settings, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"[Rocom] 保存设置文件失败: {e}")
 
     def _cancel_stale_background_tasks(self):
         registry = self._background_task_registry()
@@ -5324,6 +5344,28 @@ class RocomPlugin(Star):
         if card_image and card_image.startswith(("http://", "https://")):
             yield event.chain_result([Image.fromURL(card_image)])
 
+    @filter.command("切换数据源")
+    async def toggle_data_source(self, event: AstrMessageEvent, source: int, feature: str = "家园"):
+        """管理员指令：切换查询数据源 (0: WeGame API, 1: RKPP 代理)
+        示例：/切换数据源 0 家园"""
+        if not event.is_admin() and not await self._is_group_admin(event):
+            yield event.plain_result("抱歉，只有管理员才能使用此命令。")
+            return
+
+        if feature != "家园":
+            yield event.plain_result(f"暂不支持切换【{feature}】的数据源，目前仅支持：家园")
+            return
+
+        if source not in (0, 1):
+            yield event.plain_result("数据源参数错误，请使用 0 (WeGame) 或 1 (RKPP)。")
+            return
+
+        self.rocom_settings["home"] = source
+        self._save_settings()
+        
+        source_name = "WeGame API" if source == 0 else "RKPP 代理服务"
+        yield event.plain_result(f"已成功将【{feature}】查询的数据源切换为：{source_name} ({source})")
+
     @filter.command("洛克家园")
     async def rocom_home(self, event: AstrMessageEvent, uid: str = ""):
         """通过 UID 查询洛克家园菜园、守卫精灵与室内精灵"""
@@ -5332,63 +5374,100 @@ class RocomPlugin(Star):
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
             return
         yield event.plain_result(f"正在查询 UID:{uid} 的家园信息，请稍候...")
-        # --- 数据源切换（可根据需要注释/解开注释） ---
-        # 1. 走 RKPP 代理服务
-        rkpp_res = await self.client.rkpp_query("ZoneHomeQueryFriendHomeInfoReq", {"uin": int(uid)})
-        res = rkpp_res.get("payload") if rkpp_res else None
-        
-        # 2. 走原版 WeGame API
-        # res = await self.client.ingame_home_info(
-        #     uid,
-        #     fw_token=fw_token,
-        #     user_identifier=user_identifier,
-        # )
+        # --- 数据源切换 ---
+        source = self.rocom_settings.get("home", 1)
+        if source == 0:
+            # 走原版 WeGame API
+            res = await self.client.ingame_home_info(
+                uid,
+                fw_token=fw_token,
+                user_identifier=user_identifier,
+            )
+        else:
+            # 走 RKPP 代理服务
+            rkpp_res = await self.client.rkpp_query("ZoneHomeQueryFriendHomeInfoReq", {"uin": int(uid)})
+            res = rkpp_res.get("payload") if rkpp_res else None
         # ---------------------------------------------
         if not res:
             yield event.plain_result(f"家园查询失败：{self.client.get_last_error()}")
             return
 
         # 获取精灵嗓音
-        cell = res.get("friend_cell_home_brief_info") or res.get("cell_home_brief_info") or {}
+        home_info = self._home_info_payload(res)
+        cell = home_info.get("friend_cell_home_brief_info") or home_info.get("cell_home_brief_info") or {}
         home_pets = cell.get("home_pets")
         voice_fetched = False
-        if isinstance(home_pets, list):
-            async def fetch_voice(pet: Dict[str, Any]) -> bool:
-                nonlocal voice_fetched
-                home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
-                pet_gid = home_pet.get("pet_gid") or pet.get("pet_gid")
-                if not pet_gid:
-                    return True
+        if isinstance(home_pets, list) and len(home_pets) > 0:
+            source = self.rocom_settings.get("home", 1)
+            if source == 0:
+                # WeGame API 批量查询优化
                 try:
-                    voice_resp = await self.client.rkpp_query("ZoneQueryNpcPetDataReq", {
-                        "target_uin": int(uid),
-                        "target_pet_gid": int(pet_gid)
-                    })
-                    if not voice_resp or not voice_resp.get("payload"):
-                        return False
-                    
-                    target_data = voice_resp["payload"].get("target_pet_data")
-                    if not target_data:
-                        # 如果 payload 里连 target_pet_data 都没有（例如返回了 ret_code: 2004），通常代表玩家离线
-                        return False
-                        
-                    voice = target_data.get("voice")
-                    if voice is not None:
-                        pet["voice"] = voice
-                        voice_fetched = True
-                    return True
+                    voice_resp = await self.client.ingame_pet_data(
+                        uid,
+                        fw_token=fw_token,
+                        user_identifier=user_identifier,
+                    )
+                    if voice_resp:
+                        npc_pets = voice_resp.get("npc_pets")
+                        if npc_pets and isinstance(npc_pets, list):
+                            # 首先检查第一个宠物的状态，如果非 ok 则大概率离线，直接熔断
+                            if len(npc_pets) > 0 and npc_pets[0].get("status") != "ok":
+                                voice_fetched = False
+                            else:
+                                voice_map = {}
+                                for pet_res in npc_pets:
+                                    if pet_res.get("status") == "ok":
+                                        p_gid = pet_res.get("pet_gid")
+                                        target_data = pet_res.get("npc_pet", {}).get("pet")
+                                        if p_gid and target_data and target_data.get("voice") is not None:
+                                            voice_map[p_gid] = target_data.get("voice")
+                                
+                                # 将嗓音数据映射回 home_pets
+                                for pet in home_pets:
+                                    if isinstance(pet, dict):
+                                        home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
+                                        pet_gid = home_pet.get("pet_gid") or pet.get("pet_gid")
+                                        if pet_gid and pet_gid in voice_map:
+                                            pet["voice"] = voice_map[pet_gid]
+                                            voice_fetched = True
                 except Exception as e:
-                    logger.warning(f"[Rocom] 获取精灵 {pet_gid} 嗓音失败: {e}")
-                    return False
+                    logger.warning(f"[Rocom] WeGame API 批量获取精灵嗓音失败: {e}")
+            else:
+                # RKPP 代理服务 逐个延迟查询
+                async def fetch_voice_rkpp(pet: Dict[str, Any]) -> bool:
+                    nonlocal voice_fetched
+                    home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
+                    pet_gid = home_pet.get("pet_gid") or pet.get("pet_gid")
+                    if not pet_gid:
+                        return True
+                    try:
+                        voice_resp = await self.client.rkpp_query("ZoneQueryNpcPetDataReq", {
+                            "target_uin": int(uid),
+                            "target_pet_gid": int(pet_gid)
+                        })
+                        if not voice_resp or not voice_resp.get("payload"):
+                            return False
+                        
+                        target_data = voice_resp["payload"].get("target_pet_data")
+                        if not target_data:
+                            # 离线熔断
+                            return False
+                            
+                        voice = target_data.get("voice")
+                        if voice is not None:
+                            pet["voice"] = voice
+                            voice_fetched = True
+                        return True
+                    except Exception as e:
+                        logger.warning(f"[Rocom] RKPP 获取精灵 {pet_gid} 嗓音失败: {e}")
+                        return False
 
-            # 为了防止并发过快导致账号异常或触发风控，改为顺序请求并增加随机小延迟
-            for pet in home_pets:
-                if isinstance(pet, dict):
-                    success = await fetch_voice(pet)
-                    if not success:
-                        # 如果获取失败（大概率玩家离线），则直接中断后续所有获取，避免无意义的风控和漫长的超时等待
-                        break
-                    await asyncio.sleep(0.15)  # 每次请求间隔 150 毫秒
+                for pet in home_pets:
+                    if isinstance(pet, dict):
+                        success = await fetch_voice_rkpp(pet)
+                        if not success:
+                            break
+                        await asyncio.sleep(0.15)
 
         data = self._build_home_render_data(res, uid or "当前绑定")
         data["voiceFailed"] = (not voice_fetched) and (isinstance(home_pets, list) and len(home_pets) > 0)
