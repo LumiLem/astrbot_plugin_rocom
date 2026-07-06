@@ -722,15 +722,32 @@ class RocomPlugin(Star):
         height = raw.get("height")
         weight = raw.get("weight")
         size_info = {}
-        if weight is not None and size_lookup:
+        height_pct = None
+        weight_pct = None
+        if size_lookup and (height is not None or weight is not None):
             wiki_pet_id = self._pet_data_wiki_pet_id(pet_id)
             if wiki_pet_id:
                 wiki_pet = size_lookup.get(wiki_pet_id)
                 if wiki_pet:
-                    # 使用临时的 dummy 字典传递 weight 进去计算
-                    dummy_pet = {"weight": weight}
-                    size_info = self._pet_data_weight_size_info(dummy_pet, wiki_pet)
-                    
+                    if weight is not None:
+                        dummy_pet = {"weight": weight}
+                        size_info = self._pet_data_weight_size_info(dummy_pet, wiki_pet)
+                        if size_info.get("percent") is not None:
+                            weight_pct = size_info["percent"]
+                    if height is not None:
+                        body_size = wiki_pet.get("body_size") if isinstance(wiki_pet, dict) else {}
+                        height_range = body_size.get("height") if isinstance(body_size, dict) else {}
+                        if isinstance(height_range, dict) and "min_cm" in height_range and "max_cm" in height_range:
+                            try:
+                                h_cur = float(height)
+                                h_low = float(height_range["min_cm"])
+                                h_high = float(height_range["max_cm"])
+                                h_span = h_high - h_low
+                                h_p = (h_cur - h_low) / h_span * 100 if h_span > 0 else 0
+                                height_pct = max(0.0, min(100.0, float(h_p)))
+                            except (TypeError, ValueError):
+                                pass
+
         return {
             "id": str(pet_id),
             "pos": raw.get("pos") or raw.get("position") or index + 1,
@@ -760,8 +777,10 @@ class RocomPlugin(Star):
             "voiceLabel": "婉转声" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") >= 96 else ("粗嗓门" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") <= -96 else ""),
             "height": height,
             "heightText": f"{(float(height) / 100):g}" if height is not None else "",
+            "heightPercent": f"{round(height_pct, 2):g}%" if height_pct is not None else "",
             "weight": weight,
-            "weightText": f"{(float(weight) / 1000):g}" if weight is not None else "",
+            "weightText": f"{(float(weight) / 1000):g}kg" if weight is not None else "",
+            "weightPercent": f"{round(weight_pct, 2):g}%" if weight_pct is not None else "",
             "sizeInfo": size_info,
         }
 
@@ -1188,26 +1207,32 @@ class RocomPlugin(Star):
             return {}
 
         span = high - low
+        pct = (current - low) / span * 100 if span > 0 else 0
+        pct_val = max(0.0, min(100.0, float(pct)))
         small_cut = low + span * 0.05
         large_cut = high - span * 0.05
         range_text = f"{self._pet_data_kg_compact(low)}-{self._pet_data_kg_compact(high)}"
+        
+        result = {"percent": pct_val}
         if current <= small_cut:
-            return {
-                "label": "小块头",
+            result.update({
+                "label": "小不点",
                 "className": "size-small",
-                "hint": f"小块头 · ≤{self._pet_data_kg_compact(small_cut)} · 范围 {range_text}",
-            }
-        if current >= large_cut:
-            return {
+                "hint": f"小不点 · ≤{self._pet_data_kg_compact(small_cut)} · 范围 {range_text}",
+            })
+        elif current >= large_cut:
+            result.update({
                 "label": "大块头",
                 "className": "size-large",
                 "hint": f"大块头 · ≥{self._pet_data_kg_compact(large_cut)} · 范围 {range_text}",
-            }
-        return {
-            "label": "",
-            "className": "",
-            "hint": f"范围 {range_text}",
-        }
+            })
+        else:
+            result.update({
+                "label": "",
+                "className": "",
+                "hint": f"范围 {range_text}",
+            })
+        return result
 
     def _pet_data_option_maps(self, options: Dict[str, Any] | None) -> Dict[str, Dict[str, str]]:
         pet_options = (options or {}).get("pet") if isinstance(options, dict) else {}

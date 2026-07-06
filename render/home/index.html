@@ -90,13 +90,29 @@
             </div>
             <div class="pet-info">
               <div class="pet-name">
-                <span>{{item.name}}</span>
-                <span class="pet-level">Lv.{{item.level}}</span>
-                {{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}
-                {{if item.heightText || item.weightText}}
-                <span class="pet-level" style="margin-left: 4px; font-weight: normal; color: #666;">
-                  {{if item.heightText}}{{item.heightText}}m{{/if}}{{if item.heightText && item.weightText}} / {{/if}}{{if item.weightText}}{{item.weightText}}kg{{/if}}
-                </span>
+                <div class="pet-name-left">
+                  <span>{{item.name}}</span>
+                  <span class="pet-level">Lv.{{item.level}}</span>
+                  {{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}
+                </div>
+                {{if item.heightText && item.weightText}}
+                <div class="pet-size-grid">
+                  <span class="grid-left">{{item.heightText}}m</span>
+                  <span class="grid-mid">/</span>
+                  <span class="grid-right">{{item.weightText}}</span>
+                  {{if item.heightPercent || item.weightPercent}}
+                  <span class="grid-left pct-col">({{item.heightPercent || '--'}}</span>
+                  <span class="grid-mid pct-col">/</span>
+                  <span class="grid-right pct-col">{{item.weightPercent || '--'}})</span>
+                  {{/if}}
+                </div>
+                {{else if item.heightText || item.weightText}}
+                <div class="pet-size-box">
+                  <div class="size-val">{{if item.heightText}}{{item.heightText}}m{{/if}}{{if item.weightText}}{{item.weightText}}{{/if}}</div>
+                  {{if item.heightPercent || item.weightPercent}}
+                  <div class="size-pct">({{if item.heightPercent}}{{item.heightPercent}}{{/if}}{{if item.weightPercent}}{{item.weightPercent}}{{/if}})</div>
+                  {{/if}}
+                </div>
                 {{/if}}
               </div>
               <div class="pet-meta">
