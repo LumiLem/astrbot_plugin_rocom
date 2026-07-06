@@ -73,15 +73,31 @@
               {{if item.variantText == "噩梦污染"}}
               <img class="pet-variant-icon" src="{{_res_path}}img/噩梦污染.png" alt="噩梦污染">
               {{/if}}
-              {{if item.voiceLabel}}
-              <div class="voice-badge {{if item.voice >= 96}}voice-badge-high{{else}}voice-badge-low{{/if}}">{{item.voiceLabel}}</div>
-              {{/if}}
+              <div class="pet-corner-tags">
+                {{if item.sizeInfo && item.sizeInfo.label == '大块头'}}
+                <img class="pet-corner-icon" src="{{_res_path}}img/img_MedalIcon_Huge.png" alt="大块头">
+                {{/if}}
+                {{if item.sizeInfo && item.sizeInfo.label == '小不点'}}
+                <img class="pet-corner-icon" src="{{_res_path}}img/img_MedalIcon_Mini.png" alt="小不点">
+                {{/if}}
+                {{if item.voiceLabel == '婉转声'}}
+                <img class="pet-corner-icon" src="{{_res_path}}img/img_MedalIcon_high.png" alt="婉转声">
+                {{/if}}
+                {{if item.voiceLabel == '粗嗓门'}}
+                <img class="pet-corner-icon" src="{{_res_path}}img/img_MedalIcon_low.png" alt="粗嗓门">
+                {{/if}}
+              </div>
             </div>
             <div class="pet-info">
               <div class="pet-name">
                 <span>{{item.name}}</span>
                 <span class="pet-level">Lv.{{item.level}}</span>
                 {{if item.gender == 1}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_1.png" alt="公">{{/if}}{{if item.gender == 2}}<img class="pet-gender-icon" src="{{_res_path}}img/gender_2.png" alt="母">{{/if}}
+                {{if item.heightText || item.weightText}}
+                <span class="pet-level" style="margin-left: 4px; font-weight: normal; color: #666;">
+                  {{if item.heightText}}{{item.heightText}}m{{/if}}{{if item.heightText && item.weightText}} / {{/if}}{{if item.weightText}}{{item.weightText}}kg{{/if}}
+                </span>
+                {{/if}}
               </div>
               <div class="pet-meta">
                 {{if item.natureName}}<span class="nature-tag">{{item.natureName}}</span>{{/if}}

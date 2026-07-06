@@ -644,7 +644,7 @@ class RocomPlugin(Star):
             return ""
         return f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{asset_id}/icon.png"
 
-    def _extract_home_pet(self, raw: Dict[str, Any], index: int, guard: bool = False) -> Dict[str, Any] | None:
+    def _extract_home_pet(self, raw: Dict[str, Any], index: int, guard: bool = False, size_lookup: Dict[str, Dict[str, Any]] | None = None) -> Dict[str, Any] | None:
         if not isinstance(raw, dict):
             return None
         home_pet = raw.get("home_pet_info") if isinstance(raw.get("home_pet_info"), dict) else raw
@@ -717,6 +717,20 @@ class RocomPlugin(Star):
         else:
             status_text = ""
             status_class = ""
+            
+        # 处理身高体重和体型评价
+        height = raw.get("height")
+        weight = raw.get("weight")
+        size_info = {}
+        if weight is not None and size_lookup:
+            wiki_pet_id = self._pet_data_wiki_pet_id(pet_id)
+            if wiki_pet_id:
+                wiki_pet = size_lookup.get(wiki_pet_id)
+                if wiki_pet:
+                    # 使用临时的 dummy 字典传递 weight 进去计算
+                    dummy_pet = {"weight": weight}
+                    size_info = self._pet_data_weight_size_info(dummy_pet, wiki_pet)
+                    
         return {
             "id": str(pet_id),
             "pos": raw.get("pos") or raw.get("position") or index + 1,
@@ -744,6 +758,11 @@ class RocomPlugin(Star):
             "eventId": f"pet:{raw.get('pos') or index + 1}:{pet_id}:{rip_time}",
             "voice": raw.get("voice"),
             "voiceLabel": "婉转声" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") >= 96 else ("粗嗓门" if isinstance(raw.get("voice"), (int, float)) and raw.get("voice") <= -96 else ""),
+            "height": height,
+            "heightText": f"{(float(height) / 100):g}" if height is not None else "",
+            "weight": weight,
+            "weightText": f"{(float(weight) / 1000):g}" if weight is not None else "",
+            "sizeInfo": size_info,
         }
 
     def _home_pet_sources(self, home_info: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1005,14 +1024,14 @@ class RocomPlugin(Star):
             })
         return result
 
-    def _build_home_render_data(self, res: Dict[str, Any] | None, uid: str) -> Dict[str, Any]:
+    def _build_home_render_data(self, res: Dict[str, Any] | None, uid: str, size_lookup: Dict[str, Dict[str, Any]] | None = None) -> Dict[str, Any]:
         home_info = self._home_info_payload(res)
         brief = self._home_brief_info(home_info)
         indoor_sources, guard_sources = self._home_pet_sources(home_info)
         indoor_pets = []
         guard_pets = []
         for index, raw in enumerate(indoor_sources):
-            item = self._extract_home_pet(raw, index)
+            item = self._extract_home_pet(raw, index, size_lookup=size_lookup)
             if not item:
                 continue
             if item["isGuard"]:
@@ -1020,7 +1039,7 @@ class RocomPlugin(Star):
             else:
                 indoor_pets.append(item)
         for index, raw in enumerate(guard_sources):
-            item = self._extract_home_pet(raw, index, guard=True)
+            item = self._extract_home_pet(raw, index, guard=True, size_lookup=size_lookup)
             if item:
                 guard_pets.append(item)
         garden_plots = self._extract_home_plants(home_info)
@@ -5414,24 +5433,34 @@ class RocomPlugin(Star):
                             if len(npc_pets) > 0 and npc_pets[0].get("status") != "ok":
                                 voice_fetched = False
                             else:
-                                voice_map = {}
+                                pet_data_map = {}
                                 for pet_res in npc_pets:
                                     if pet_res.get("status") == "ok":
                                         p_gid = pet_res.get("pet_gid")
                                         target_data = pet_res.get("npc_pet", {}).get("pet")
-                                        if p_gid and target_data and target_data.get("voice") is not None:
-                                            voice_map[p_gid] = target_data.get("voice")
+                                        if p_gid and target_data:
+                                            pet_data_map[p_gid] = {
+                                                "voice": target_data.get("voice"),
+                                                "height": target_data.get("height"),
+                                                "weight": target_data.get("weight"),
+                                            }
                                 
-                                # 将嗓音数据映射回 home_pets
+                                # 将数据映射回 home_pets
                                 for pet in home_pets:
                                     if isinstance(pet, dict):
                                         home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
                                         pet_gid = home_pet.get("pet_gid") or pet.get("pet_gid")
-                                        if pet_gid and pet_gid in voice_map:
-                                            pet["voice"] = voice_map[pet_gid]
-                                            voice_fetched = True
+                                        if pet_gid and pet_gid in pet_data_map:
+                                            pd = pet_data_map[pet_gid]
+                                            if pd.get("voice") is not None:
+                                                pet["voice"] = pd["voice"]
+                                                voice_fetched = True
+                                            if pd.get("height") is not None:
+                                                pet["height"] = pd["height"]
+                                            if pd.get("weight") is not None:
+                                                pet["weight"] = pd["weight"]
                 except Exception as e:
-                    logger.warning(f"[Rocom] WeGame API 批量获取精灵嗓音失败: {e}")
+                    logger.warning(f"[Rocom] WeGame API 批量获取精灵附加数据失败: {e}")
             else:
                 # RKPP 代理服务 逐个延迟查询
                 async def fetch_voice_rkpp(pet: Dict[str, Any]) -> bool:
@@ -5457,9 +5486,13 @@ class RocomPlugin(Star):
                         if voice is not None:
                             pet["voice"] = voice
                             voice_fetched = True
+                        if target_data.get("height") is not None:
+                            pet["height"] = target_data.get("height")
+                        if target_data.get("weight") is not None:
+                            pet["weight"] = target_data.get("weight")
                         return True
                     except Exception as e:
-                        logger.warning(f"[Rocom] RKPP 获取精灵 {pet_gid} 嗓音失败: {e}")
+                        logger.warning(f"[Rocom] RKPP 获取精灵 {pet_gid} 附加数据失败: {e}")
                         return False
 
                 for pet in home_pets:
@@ -5468,8 +5501,38 @@ class RocomPlugin(Star):
                         if not success:
                             break
                         await asyncio.sleep(0.15)
+                        
+        # Fetch size info from wiki
+        size_lookup = {}
+        if isinstance(home_pets, list) and len(home_pets) > 0:
+            wiki_ids = []
+            for pet in home_pets:
+                if isinstance(pet, dict):
+                    home_pet = pet.get("home_pet_info") if isinstance(pet.get("home_pet_info"), dict) else pet
+                    pet_cfg_id = home_pet.get("pet_cfg_id") or home_pet.get("pet_id") or home_pet.get("pet_base_id") or pet.get("pet_cfg_id") or pet.get("pet_id") or pet.get("id")
+                    if pet_cfg_id:
+                        wiki_pet_id = self._pet_data_wiki_pet_id(pet_cfg_id)
+                        if wiki_pet_id and wiki_pet_id not in wiki_ids:
+                            wiki_ids.append(wiki_pet_id)
+            if wiki_ids:
+                size_lookup_promises = []
+                for pet_id in wiki_ids:
+                    cached = self._wiki_pet_size_cache.get(pet_id)
+                    if isinstance(cached, dict):
+                        size_lookup[pet_id] = cached
+                    else:
+                        size_lookup_promises.append(pet_id)
+                if size_lookup_promises:
+                    semaphore = asyncio.Semaphore(6)
+                    async def _fetch_wiki_size(p_id):
+                        async with semaphore:
+                            detail = await self.client.get_wiki_pet(p_id)
+                        if isinstance(detail, dict):
+                            self._wiki_pet_size_cache[p_id] = detail
+                            size_lookup[p_id] = detail
+                    await asyncio.gather(*[_fetch_wiki_size(pid) for pid in size_lookup_promises])
 
-        data = self._build_home_render_data(res, uid or "当前绑定")
+        data = self._build_home_render_data(res, uid or "当前绑定", size_lookup=size_lookup)
         data["voiceFailed"] = (not voice_fetched) and (isinstance(home_pets, list) and len(home_pets) > 0)
         img_url = await self.renderer.render_html(
             "render/home/index.html",
