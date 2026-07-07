@@ -1209,8 +1209,8 @@ class RocomPlugin(Star):
         span = high - low
         pct = (current - low) / span * 100 if span > 0 else 0
         pct_val = max(0.0, min(100.0, float(pct)))
-        small_cut = low + span * 0.05
-        large_cut = high - span * 0.05
+        small_cut = low + span * 0.02
+        large_cut = high - span * 0.02
         range_text = f"{self._pet_data_kg_compact(low)}-{self._pet_data_kg_compact(high)}"
         
         result = {"percent": pct_val}
