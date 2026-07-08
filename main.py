@@ -120,8 +120,6 @@ class RocomPlugin(Star):
         self._merchant_thread = None
         self._merchant_stop = threading.Event()
         self._merchant_check_running = False
-        self._prev_merchant_products: set[str] = set()
-        self._prev_round_products: set[str] = set()
         try:
             self._main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1763,11 +1761,17 @@ class RocomPlugin(Star):
             try:
                 now = time.time()
                 if home_enabled and now >= next_home:
-                    await self._check_home_subscriptions()
                     next_home = time.time() + home_interval
+                    try:
+                        await self._check_home_subscriptions()
+                    except Exception as e:
+                        logger.error(f"[Rocom] 家园订阅检查异常（iteration={iteration}）: {e}")
                 if announce_enabled and now >= next_announce:
-                    await self._check_announcement_subscriptions()
                     next_announce = time.time() + announce_interval
+                    try:
+                        await self._check_announcement_subscriptions()
+                    except Exception as e:
+                        logger.error(f"[Rocom] 公告订阅检查异常（iteration={iteration}）: {e}")
                 remaining = min(next_home, next_announce) - time.time()
                 sleep_duration = min(60, remaining) if remaining > 0 else 1
                 await asyncio.sleep(max(1, sleep_duration))
@@ -1776,6 +1780,8 @@ class RocomPlugin(Star):
                 raise
             except Exception as e:
                 logger.error(f"[Rocom] 订阅轮询异常（iteration={iteration}）: {e}")
+                next_home = time.time() + home_interval
+                next_announce = time.time() + announce_interval
                 await asyncio.sleep(60)
 
     def _home_subscription_state(
@@ -2268,13 +2274,18 @@ class RocomPlugin(Star):
         logger.debug(f"[Rocom] 公告检查：最新 id={latest_id} title={latest.get('title', '?')}")
         detail = None
         img_url = None
+        latest_title = str(latest.get("title") or "").strip()
         pushed = 0
         for key, sub in all_subs.items():
             last_id = str(sub.get("last_id") or "")
             last_ts = int(sub.get("since_ts") or 0)
+            last_title = str(sub.get("last_title") or "").strip()
             if latest_id == last_id:
                 continue
             if latest_ts and last_ts and latest_ts <= last_ts:
+                continue
+            if latest_title and last_title and latest_title == last_title:
+                logger.info(f"[Rocom] 公告订阅：标题匹配跳过 {key} title={latest_title}")
                 continue
             if img_url is None:
                 logger.info(f"[Rocom] 公告订阅：新公告 id={latest_id} title={latest.get('title', '?')}，渲染中")
@@ -2300,6 +2311,7 @@ class RocomPlugin(Star):
                 logger.warning(f"[Rocom] 公告订阅推送失败: {e}")
                 continue
             sub["last_id"] = latest_id
+            sub["last_title"] = latest_title
             sub["since_ts"] = latest_ts or int(time.time())
             sub["updated_at"] = int(time.time())
             await self.announcement_sub_mgr.upsert_subscription(key, sub)
@@ -2664,25 +2676,27 @@ class RocomPlugin(Star):
         return img_url
 
     async def _run_merchant_subscription_window(self):
+        """开盘后渐进式快速轮询，数据就绪即推送，最长等待约 5 分钟"""
         window_start = datetime.now(self._cn_tz())
-        for retry_index in range(self._merchant_retry_times + 1):
-            if retry_index > 0:
-                delay = max(
-                    1,
-                    self._merchant_retry_delay_seconds
-                    + random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds),
-                )
-                logger.warning(
-                    f"[Rocom] 远行商人返回为空，{delay:.1f} 秒后进行第 {retry_index} 次重试"
-                )
-                await asyncio.sleep(delay)
+
+        # 第 1 次立即检查
+        status = await self._check_merchant_subscriptions()
+        if status != "empty":
+            return
+
+        # 渐进式轮询间隔，累计 ~300s（配合 _check_merchant_subscriptions 内 5 分钟截止）
+        delays = [15, 15, 30, 30, 60, 60, 90]
+        for attempt, delay in enumerate(delays, 1):
+            logger.info(
+                f"[Rocom] 远行商人数据未就绪，{delay}s 后第 {attempt} 次重试"
+            )
+            await asyncio.sleep(delay)
             status = await self._check_merchant_subscriptions()
             if status != "empty":
                 return
-            if retry_index >= self._merchant_retry_times:
-                elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
-                logger.warning(f"[Rocom] 远行商人订阅检查连续为空，已暂停本轮重试（耗时={elapsed:.1f}s）")
-                return
+
+        elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
+        logger.warning(f"[Rocom] 远行商人轮询窗口超时（{elapsed:.0f}s），本轮放弃")
 
     async def _check_merchant_subscriptions(self) -> str:
         all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
@@ -2705,21 +2719,10 @@ class RocomPlugin(Star):
         round_products = {p.get("name", "") for p in products if p.get("product_category") == "round"}
         if product_names:
             elapsed = (datetime.now(self._cn_tz()) - round_info["start_time"]).total_seconds()
-            # 仅在开盘初期判断数据是否就绪，超过 5 分钟则直接推送
-            if elapsed < 300:
-                stale = False
-                reason = ""
-                # 常规商品未加载
-                if not round_products:
-                    stale, reason = True, "常规商品未加载"
-                # 常规商品与上一轮完全相同（新一轮数据还没刷新）
-                elif round_products == self._prev_round_products:
-                    stale, reason = True, "常规商品与上一轮相同"
-                if stale:
-                    logger.warning(f"[Rocom] 远行商人{reason}（开盘 {elapsed:.0f}s），等待数据更新")
-                    return "empty"
-        self._prev_merchant_products = product_names.copy()
-        self._prev_round_products = round_products.copy()
+            # 仅在开盘 5 分钟内判断：常规商品未加载则视为数据未就绪
+            if elapsed < 300 and not round_products:
+                logger.warning(f"[Rocom] 远行商人常规商品未加载（开盘 {elapsed:.0f}s），等待数据更新")
+                return "empty"
         pending_pushes = []
         skipped = 0
         seen_keys = set()
@@ -5144,6 +5147,7 @@ class RocomPlugin(Star):
         latest = await self.client.get_announcement_latest()
         latest_id = self._announcement_id(latest) if latest else ""
         latest_ts = self._announcement_ts(latest) if latest else int(time.time())
+        latest_title = str((latest or {}).get("title") or "").strip()
         await self.announcement_sub_mgr.upsert_subscription(
             key,
             {
@@ -5151,6 +5155,7 @@ class RocomPlugin(Star):
                 "umo": event.unified_msg_origin,
                 "updated_by": str(event.get_sender_id()),
                 "last_id": latest_id,
+                "last_title": latest_title,
                 "since_ts": latest_ts,
                 "updated_at": int(time.time()),
             },
