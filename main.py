@@ -2295,6 +2295,21 @@ class RocomPlugin(Star):
                     self._build_announcement_detail_render_data(detail),
                     {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
                 )
+                # PNG 过大时转 JPEG 压缩，避免 QQ rich media transfer failed
+                if img_url and os.path.getsize(img_url) > 10 * 1024 * 1024:
+                    try:
+                        from PIL import Image as PILImage
+                        img = PILImage.open(img_url)
+                        jpg_path = img_url.rsplit(".", 1)[0] + ".jpg"
+                        img.convert("RGB").save(jpg_path, "JPEG", quality=80)
+                        orig_size = os.path.getsize(img_url)
+                        new_size = os.path.getsize(jpg_path)
+                        logger.info(
+                            f"[Rocom] 公告图片压缩: PNG {orig_size / 1024:.0f}KB → JPEG {new_size / 1024:.0f}KB"
+                        )
+                        img_url = jpg_path
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 公告图片压缩失败，保持原图: {e}")
             chain = MessageChain().message(
                 f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n"
             )
@@ -2302,14 +2317,34 @@ class RocomPlugin(Star):
                 chain.file_image(img_url)
             elif latest.get("summary"):
                 chain.message(str(latest.get("summary")))
+            push_ok = False
             try:
                 await self.context.send_message(sub["umo"], chain)
                 logger.info(f"[Rocom] 公告订阅推送成功 → {key}")
-                logger.debug(f"[Rocom] 公告检查：已更新订阅 {key} last_id={latest_id}")
-                pushed += 1
+                push_ok = True
             except Exception as e:
-                logger.warning(f"[Rocom] 公告订阅推送失败: {e}")
+                logger.warning(f"[Rocom] 公告订阅图文推送失败: {e}")
+                # 降级为纯文本重试（如图片过大导致 rich media transfer failed）
+                if img_url:
+                    try:
+                        content_text = ""
+                        if isinstance(detail, dict):
+                            content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+                            html_text = content.get("text") or detail.get("summary") or ""
+                            content_text = re.sub(r'<[^>]+>', '', html_text).strip()
+                            if len(content_text) > 500:
+                                content_text = content_text[:500] + "…"
+                        text_only = MessageChain().message(
+                            f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n\n{content_text}"
+                        )
+                        await self.context.send_message(sub["umo"], text_only)
+                        logger.info(f"[Rocom] 公告订阅降级纯文本推送成功 → {key}")
+                        push_ok = True
+                    except Exception as text_e:
+                        logger.warning(f"[Rocom] 公告订阅降级纯文本也失败: {text_e}")
+            if not push_ok:
                 continue
+            pushed += 1
             sub["last_id"] = latest_id
             sub["last_title"] = latest_title
             sub["since_ts"] = latest_ts or int(time.time())
