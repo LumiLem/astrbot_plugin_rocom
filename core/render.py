@@ -475,6 +475,21 @@ class Renderer:
                             "y": round(float(box["y"]), 2),
                         }
                     )
+                    # If resizing the viewport changed the layout (e.g., height increased due to text wrap or media query),
+                    # we must resize the viewport again to accommodate the new height before taking the screenshot.
+                    # We MUST NOT shrink the width or height, otherwise centered elements will re-center again causing an offset.
+                    current_vp = page.viewport_size
+                    new_width = current_vp["width"] if current_vp else 200
+                    new_height = current_vp["height"] if current_vp else 200
+                    target_width = max(int(box["x"] + box["width"]) + 8, 200)
+                    target_height = max(int(box["y"] + box["height"]) + 8, 200)
+                    await page.set_viewport_size(
+                        {
+                            "width": max(new_width, target_width),
+                            "height": max(new_height, target_height),
+                        }
+                    )
+                    await page.wait_for_timeout(50)
                 screenshot_options = {
                     "path": output_path,
                     "type": image_format,
