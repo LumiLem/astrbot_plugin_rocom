@@ -2052,7 +2052,7 @@ class RocomPlugin(Star):
             cmd = [
                 "ffmpeg", "-y", "-i", orig_path,
                 "-c:v", "libx264", 
-                "-preset", "medium", 
+                "-preset", "veryfast", 
                 "-crf", "24", 
                 "-vf", "scale=-2:720",
                 "-c:a", "aac", 
