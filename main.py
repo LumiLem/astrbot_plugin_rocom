@@ -7,6 +7,7 @@ import threading
 import re
 import json
 import random
+import hashlib
 from datetime import datetime, timedelta, timezone
 import shutil
 import zipfile
@@ -18,7 +19,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Plain, Image
+from astrbot.core.message.components import Plain, Image, Video
 
 from .core.client import RocomClient
 from .core.user import (
@@ -1987,6 +1988,97 @@ class RocomPlugin(Star):
             result.append(url)
         return result
 
+    def _extract_videos(self, item: Dict[str, Any] | None) -> List[Dict[str, str]]:
+        videos = []
+        content = (item or {}).get("content") if isinstance((item or {}).get("content"), dict) else {}
+        for index in content.get("indexes") or []:
+            if isinstance(index, dict) and index.get("type") == 102:
+                v_urls = index.get("videoUrl") or index.get("video")
+                v_covers = index.get("videoCover")
+                if isinstance(v_urls, list) and v_urls:
+                    cover_url = v_covers[0] if isinstance(v_covers, list) and v_covers else ""
+                    video_url = str(v_urls[0])
+                    # 替换视频代理地址为直连地址，避免 resource too large
+                    video_url = video_url.replace(
+                        "https://wegame.shallow.ink/api/v1/resources/rocom/vod/", 
+                        "https://1500043685.vod-qcloud.com/"
+                    )
+                    videos.append({
+                        "url": video_url,
+                        "cover": str(cover_url)
+                    })
+        return videos
+
+    async def _download_and_compress_video(self, video_url: str) -> str:
+        """异步下载并压缩视频，返回本地路径"""
+        url_hash = hashlib.md5(video_url.encode()).hexdigest()
+        temp_dir = os.path.join(os.path.dirname(self.settings_file), "rocom_videos")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 清理超过 3 天的旧缓存视频
+        try:
+            now = time.time()
+            for fname in os.listdir(temp_dir):
+                fpath = os.path.join(temp_dir, fname)
+                if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 3 * 86400: # 3天
+                    os.remove(fpath)
+        except Exception as e:
+            logger.warning(f"[Rocom] 清理旧视频缓存失败: {e}")
+            
+        orig_path = os.path.join(temp_dir, f"{url_hash}_orig.mp4")
+        comp_path = os.path.join(temp_dir, f"{url_hash}_comp.mp4")
+        
+        if os.path.exists(comp_path):
+            return comp_path
+            
+        if not os.path.exists(orig_path):
+            try:
+                async with httpx.AsyncClient(verify=False) as client:
+                    async with client.stream("GET", video_url) as resp:
+                        resp.raise_for_status()
+                        with open(orig_path, "wb") as f:
+                            async for chunk in resp.aiter_bytes():
+                                f.write(chunk)
+            except Exception as e:
+                logger.error(f"[Rocom] 视频下载失败: {e}")
+                return video_url
+                
+        size_mb = os.path.getsize(orig_path) / (1024 * 1024)
+        if size_mb < 50.0: # 小于50MB不压缩
+            return orig_path
+            
+        try:
+            logger.info(f"[Rocom] 开始压缩视频: {video_url} ({size_mb:.2f}MB)")
+            cmd = [
+                "ffmpeg", "-y", "-i", orig_path,
+                "-c:v", "libx264", 
+                "-preset", "medium", 
+                "-crf", "24", 
+                "-vf", "scale=-2:720",
+                "-c:a", "aac", 
+                "-b:a", "128k",
+                comp_path
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode == 0 and os.path.exists(comp_path):
+                new_size = os.path.getsize(comp_path) / (1024 * 1024)
+                logger.info(f"[Rocom] 视频压缩成功: {size_mb:.2f}MB -> {new_size:.2f}MB")
+                return comp_path
+            else:
+                logger.error(f"[Rocom] 视频压缩失败 (Code {process.returncode}): {stderr.decode('utf-8', errors='ignore')}")
+                return orig_path
+        except FileNotFoundError:
+            logger.error("[Rocom] 视频压缩失败: ffmpeg 未安装或无法找到可执行文件")
+            return orig_path
+        except Exception as e:
+            logger.error(f"[Rocom] 视频压缩异常: {e}")
+            return orig_path
+
     def _build_announcement_list_render_data(self, res: Dict[str, Any] | None) -> Dict[str, Any]:
         items = (res or {}).get("list") or (res or {}).get("items") or []
         cards = []
@@ -2037,6 +2129,15 @@ class RocomPlugin(Star):
         item = item or {}
         content = item.get("content") if isinstance(item.get("content"), dict) else {}
         caption_html = content.get("text") or item.get("summary") or "该公告暂无正文。"
+
+        videos = self._extract_videos(item)
+        if videos:
+            video_html = ""
+            for v in videos:
+                if v.get("cover"):
+                    video_html += f'<div class="announcement-video-placeholder"><img src="{v["cover"]}" class="video-cover" /><div class="video-play-btn">▶</div></div>'
+            caption_html += video_html
+
         return {
             "title": item.get("title", "洛克王国公告"),
             "summary": item.get("summary") or "",
@@ -2049,6 +2150,7 @@ class RocomPlugin(Star):
             "content_html": content.get("text") or "",
             "captionHtml": caption_html,
             "images": self._announcement_images(item),
+            "videos": videos,
             "stats": [
                 {"label": "浏览", "value": item.get("viewCount", 0)},
                 {"label": "收藏", "value": item.get("collectCount", 0)},
@@ -2276,6 +2378,7 @@ class RocomPlugin(Star):
         img_url = None
         latest_title = str(latest.get("title") or "").strip()
         pushed = 0
+        users_to_push_video = []
         for key, sub in all_subs.items():
             last_id = str(sub.get("last_id") or "")
             last_ts = int(sub.get("since_ts") or 0)
@@ -2290,6 +2393,7 @@ class RocomPlugin(Star):
             if img_url is None:
                 logger.info(f"[Rocom] 公告订阅：新公告 id={latest_id} title={latest.get('title', '?')}，渲染中")
                 detail = await self.client.get_announcement_detail(latest_id) or latest
+                
                 img_url = await self.renderer.render_html(
                     "render/announcement/detail.html",
                     self._build_announcement_detail_render_data(detail),
@@ -2317,6 +2421,7 @@ class RocomPlugin(Star):
                 chain.file_image(img_url)
             elif latest.get("summary"):
                 chain.message(str(latest.get("summary")))
+                
             push_ok = False
             try:
                 await self.context.send_message(sub["umo"], chain)
@@ -2348,9 +2453,30 @@ class RocomPlugin(Star):
             sub["last_id"] = latest_id
             sub["last_title"] = latest_title
             sub["since_ts"] = latest_ts or int(time.time())
+            users_to_push_video.append((key, sub))
             sub["updated_at"] = int(time.time())
             await self.announcement_sub_mgr.upsert_subscription(key, sub)
             await asyncio.sleep(2)
+            
+        if users_to_push_video and detail:
+            videos = self._extract_videos(detail)
+            if videos:
+                video_paths = []
+                for v in videos:
+                    p = await self._download_and_compress_video(v["url"])
+                    video_paths.append(p)
+                if video_paths:
+                    for key, sub in users_to_push_video:
+                        v_chain = MessageChain()
+                        for p in video_paths:
+                            v_chain.chain.append(Video.fromFileSystem(p))
+                        try:
+                            await self.context.send_message(sub["umo"], v_chain)
+                            logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key}")
+                        except Exception as e:
+                            logger.warning(f"[Rocom] 公告订阅视频附加推送失败: {e}")
+                        await asyncio.sleep(2)
+
         if pushed:
             logger.info(f"[Rocom] 公告订阅：本轮推送 {pushed} 个订阅")
 
@@ -5126,10 +5252,16 @@ class RocomPlugin(Star):
             data,
             {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
         )
+        components = []
         if img_url:
-            yield event.image_result(img_url)
+            components.append(Image.fromFileSystem(img_url))
         else:
-            yield event.plain_result(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}")
+            components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
+        yield event.chain_result(components)
+        
+        for v in data.get("videos", []):
+            p = await self._download_and_compress_video(v["url"])
+            yield event.chain_result([Video.fromFileSystem(p)])
 
     @filter.command("洛克公告最新")
     async def rocom_announcement_latest(self, event: AstrMessageEvent):
@@ -5145,10 +5277,16 @@ class RocomPlugin(Star):
             data,
             {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
         )
+        components = []
         if img_url:
-            yield event.image_result(img_url)
+            components.append(Image.fromFileSystem(img_url))
         else:
-            yield event.plain_result(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}")
+            components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
+        yield event.chain_result(components)
+        
+        for v in data.get("videos", []):
+            p = await self._download_and_compress_video(v["url"])
+            yield event.chain_result([Video.fromFileSystem(p)])
 
     @filter.command("洛克活动日历", alias={"洛克活动", "洛克日历"})
     async def rocom_activity_calendar(self, event: AstrMessageEvent):

@@ -254,3 +254,32 @@ body {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
+
+.announcement-video-placeholder {
+    position: relative;
+    margin: 15px 0;
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.announcement-video-placeholder .video-cover {
+    width: 100%;
+    display: block;
+}
+.announcement-video-placeholder .video-play-btn {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 60px;
+    height: 60px;
+    background: rgba(0, 0, 0, 0.6);
+    color: white;
+    font-size: 30px;
+    line-height: 60px;
+    text-align: center;
+    border-radius: 50%;
+    border: 3px solid rgba(255,255,255,0.8);
+    backdrop-filter: blur(4px);
+}
