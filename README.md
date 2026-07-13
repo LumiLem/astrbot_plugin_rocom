@@ -88,6 +88,7 @@ playwright install chromium
 | `merchant_subscription_enabled` | bool | `true` | 是否启用远行商人订阅推送（在 08:01 / 12:01 / 16:01 / 20:01 前后 30 秒随机检查，空结果每 4 分钟前后 30 秒最多重试 3 次） |
 | `merchant_subscription_items` | list | `["国王球","棱镜球","炫彩精灵蛋"]` | 远行商人默认订阅商品 |
 | `merchant_private_subscription_enabled` | bool | `true` | 是否允许用户在私聊中订阅远行商人推送 |
+| `merchant_mention_reminder_template` | string | `"卖{items}了！"` | 珍稀商品二次提醒模板；`{items}` 替换为命中的珍稀商品名（默认用 `、` 连接），`{items\|分隔符}` 可自定义分隔符；群聊带 @全体，私聊不带 |
 | `home_subscription_enabled` | bool | `true` | 是否启用家园菜园和精灵灵感订阅推送 |
 | `home_subscription_interval_minutes` | int | `5` | 家园订阅检查间隔（分钟），按首个完成/全部完成两档推送 |
 | `announcement_subscription_enabled` | bool | `true` | 是否启用洛克公告订阅推送 |
@@ -185,7 +186,7 @@ astrbot_plugin_rocom/
 | `订阅家园灵感 [UID]` | 订阅指定 UID 的精灵灵感提醒，首个完成和全部完成时各推送一次 |
 | `订阅家园生蛋 [UID]` | 订阅指定 UID 的精灵生蛋提醒，首个可领取和全部可领取时各推送一次 |
 | `取消订阅家园 [菜园/灵感/生蛋/全部] [UID]` | 取消当前会话的家园订阅 |
-| `订阅远行商人 [1/0] [商品...]` | 群主/群管理员/bot管理员可订阅远行商人提醒，`1` 为命中后 `@全体`，`0` 为普通提醒；不填商品则使用 WebUI 默认订阅商品 |
+| `订阅远行商人 [1/0] [商品...]` | 群主/群管理员/bot管理员可订阅远行商人提醒，`1` 为命中珍稀商品时提醒并 `@全体`，`0` 为普通提醒；`@` 前缀指定珍稀提醒商品；不填商品则使用 WebUI 默认订阅商品 |
 | `取消订阅远行商人` | 关闭当前群远行商人订阅 |
 | `洛克好友关系 <id1,id2>` | 实验性功能：仅能拿到有限状态字段，关系说明暂不稳定（需登录） |
 | `洛克学生 [area] [account_type]` | 实验性功能：接口信息量有限，当前仅供测试查看（需登录） |

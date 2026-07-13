@@ -94,8 +94,8 @@
   },
   "merchant_subscription_mention_items": {
     "type": "list",
-    "description": "默认@全体触发商品",
-    "hint": "群管理员不加@商品名时，命中这些商品才@全体。留空表示命中任一商品都@全体，仅群聊有效",
+    "description": "默认珍稀商品提醒列表",
+    "hint": "命中这些商品时追加珍稀商品提醒（群聊带@全体，私聊不带）；群管理员可用@前缀覆盖",
     "default": [
       "国王球",
       "棱镜球",
@@ -111,6 +111,12 @@
     "description": "允许个人私聊订阅远行商人",
     "hint": "开启后允许用户在私聊中订阅远行商人推送",
     "default": true
+  },
+  "merchant_mention_reminder_template": {
+    "type": "string",
+    "description": "珍稀商品二次提醒模板",
+    "hint": "命中珍稀商品时追加发送此提醒；{items} 替换为商品名（默认用、连接），{items|分隔符} 自定义分隔符；群聊带@全体，私聊不带",
+    "default": "卖{items}了！"
   },
   "home_subscription_enabled": {
     "type": "bool",

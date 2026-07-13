@@ -117,6 +117,9 @@ class RocomPlugin(Star):
         self.merchant_private_subscription_enabled = self.config.get(
             "merchant_private_subscription_enabled", True
         )
+        self.merchant_mention_reminder_template = self.config.get(
+            "merchant_mention_reminder_template", "卖{items}了！"
+        )
         self._merchant_subscription_task = None
         self._merchant_thread = None
         self._merchant_stop = threading.Event()
@@ -2923,14 +2926,10 @@ class RocomPlugin(Star):
         pushed = 0
         for key, sub, matched in pending_pushes:
             text_chain = MessageChain()
-            if sub.get("mention_all") and not key.startswith("private_"):
-                mention_items = sub.get("mention_items")
-                if mention_items:
-                    check_set = product_names if sub.get("all_products") else set(matched)
-                    if check_set & set(mention_items):
-                        text_chain.at_all()
-                else:
-                    text_chain.at_all()
+            # 珍稀商品命中计算（用于二次提醒）
+            rare_items_list = sub.get("mention_items") or self.merchant_subscription_mention_items or []
+            check_set = product_names if sub.get("all_products") else set(matched)
+            hit_rare_items = sorted(check_set & set(rare_items_list))
             if sub.get("all_products"):
                 category_labels = {"normal": "热销商品", "round": "常规商品", "weekend": "周末限定"}
                 cat_order = ["normal", "round", "weekend"]
@@ -2975,6 +2974,25 @@ class RocomPlugin(Star):
                     await self.context.send_message(sub["umo"], image_chain)
                 except Exception as image_e:
                     logger.warning(f"[Rocom] 远行商人图片推送失败: {image_e}")
+            # 珍稀商品二次提醒
+            if hit_rare_items:
+                reminder_text = self._format_merchant_reminder(hit_rare_items)
+                reminder_chain = MessageChain()
+                has_at_all = sub.get("mention_all") and not key.startswith("private_")
+                if has_at_all:
+                    reminder_chain.at_all()
+                reminder_chain.message(reminder_text)
+                try:
+                    await self.context.send_message(sub["umo"], reminder_chain)
+                except Exception as reminder_e:
+                    logger.warning(f"[Rocom] 远行商人珍稀商品提醒发送失败: {reminder_e}")
+                    if has_at_all:
+                        # 降级：去掉 @全体 重试
+                        fallback_reminder = MessageChain().message(reminder_text)
+                        try:
+                            await self.context.send_message(sub["umo"], fallback_reminder)
+                        except Exception as fallback_e:
+                            logger.warning(f"[Rocom] 远行商人珍稀商品提醒降级发送失败: {fallback_e}")
             if push_ok:
                 pushed += 1
                 logger.info(f"[Rocom] 远行商人推送 → {key} {'全部' if sub.get('all_products') else '、'.join(matched)}")
@@ -2999,11 +3017,19 @@ class RocomPlugin(Star):
             seen.add(name)
         return items
 
+    def _format_merchant_reminder(self, items: list[str]) -> str:
+        """将珍稀商品列表填入提醒模板，支持 {items} 和 {items|分隔符} 语法"""
+        template = self.merchant_mention_reminder_template
+        def replacer(m: re.Match) -> str:
+            sep = m.group(1) if m.group(1) is not None else "、"
+            return sep.join(items)
+        return re.sub(r"\{items(?:\|([^}]*))?\}", replacer, template)
+
     def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None]:
         """解析远行商人订阅参数
-        返回：(是否@全体，自定义商品列表，是否订阅全部，@触发商品列表)
+        返回：(是否@全体，自定义商品列表，是否订阅全部，珍稀商品提醒列表)
         自定义商品列表为 None 表示使用默认配置
-        @触发商品列表为 None 时命中任一商品都 @全体，非空时仅命中其中商品才 @全体
+        珍稀商品提醒列表为 None 时使用全局默认，非空时仅命中其中商品才发送提醒
         """
         text = str(raw_text or "").strip()
         if not text:
@@ -3044,7 +3070,7 @@ class RocomPlugin(Star):
         else:
             items = f"{'、'.join(self.merchant_subscription_items)}"
         if self.merchant_subscription_mention_items:
-            at = f" | 可@商品：{'、'.join(self.merchant_subscription_mention_items)}"
+            at = f" | 珍稀提醒：{'、'.join(self.merchant_subscription_mention_items)}"
         else:
             at = ""
         return f"{items}{at}"
@@ -4111,7 +4137,7 @@ class RocomPlugin(Star):
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
                         {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
-                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部]", "desc": "订阅远行商人，1=@全体，@前缀=仅命中时@全体，全部=每轮必推"},
+                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部]", "desc": "订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群/私聊远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
@@ -6105,9 +6131,9 @@ class RocomPlugin(Star):
         if event.is_private_chat():
             at_desc = ""
         elif mention and mention_items:
-            at_desc = f" | 命中{'、'.join(mention_items)}时@全体"
+            at_desc = f" | 命中{'、'.join(mention_items)}时提醒并@全体"
         elif mention:
-            at_desc = " | 命中后@全体"
+            at_desc = " | 命中珍稀商品时提醒并@全体"
         else:
             at_desc = " | 不@全体"
         if event.is_private_chat():
@@ -6123,8 +6149,8 @@ class RocomPlugin(Star):
                 f"已订阅远行商人：{summary}{at_desc}\n"
                 f"默认配置：{self._default_config_hint()}\n"
                 f"示例：/订阅远行商人 1 国王球 棱镜球 → 仅订阅指定商品\n"
-                f"/订阅远行商人 1 @棱镜球 国王球 → 仅棱镜球命中时@全体\n"
-                f"/订阅远行商人 1 全部 @棱镜球 → 每轮必推，棱镜球@全体\n"
+                f"/订阅远行商人 1 @棱镜球 国王球 → 棱镜球命中时提醒并@全体\n"
+                f"/订阅远行商人 1 全部 @棱镜球 → 每轮必推，棱镜球提醒并@全体\n"
                 f"/取消订阅远行商人 → 关闭订阅"
             )
 
