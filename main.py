@@ -19,7 +19,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Plain, Image, Video
+from astrbot.core.message.components import Plain, Image, Video, Node, Nodes
 
 from .core.client import RocomClient
 from .core.user import (
@@ -37,7 +37,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v3.8.0-custom.1", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v3.8.0-custom.3", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
@@ -2082,6 +2082,101 @@ class RocomPlugin(Star):
             logger.error(f"[Rocom] 视频压缩异常: {e}")
             return orig_path
 
+    async def _download_announcement_image(self, url: str) -> str | None:
+        """异步下载公告原图到本地缓存目录，返回本地路径"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        temp_dir = os.path.join(os.path.dirname(self.settings_file), "rocom_images")
+        os.makedirs(temp_dir, exist_ok=True)
+        # 清理超过 3 天的旧缓存图片
+        try:
+            now = time.time()
+            for fname in os.listdir(temp_dir):
+                fpath = os.path.join(temp_dir, fname)
+                if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 3 * 86400:
+                    os.remove(fpath)
+        except Exception as e:
+            logger.warning(f"[Rocom] 清理旧图片缓存失败: {e}")
+        ext = url.rsplit(".", 1)[-1].lower() if "." in url.rsplit("/", 1)[-1] else "jpg"
+        if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+            ext = "jpg"
+        local_path = os.path.join(temp_dir, f"{url_hash}.{ext}")
+        if os.path.exists(local_path):
+            return local_path
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes():
+                            f.write(chunk)
+            return local_path
+        except Exception as e:
+            logger.warning(f"[Rocom] 公告原图下载失败 {url}: {e}")
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+            return None
+
+    def _slice_and_compress_image(self, path: str, max_height: int = 15000, max_bytes: int = 8 * 1024 * 1024) -> List[str]:
+        """处理大图：如果高度过长则切片，然后对每个切片进行压缩（转JPEG、按需降质或缩放）。返回处理后的本地路径列表。"""
+        try:
+            from PIL import Image as PILImage
+            old_max = PILImage.MAX_IMAGE_PIXELS
+            PILImage.MAX_IMAGE_PIXELS = 300_000_000
+            
+            result_paths = []
+            try:
+                img = PILImage.open(path)
+                w, h = img.size
+                
+                # 如果不需要切片，且文件本身较小且已经是 jpeg，则直接返回
+                if h <= max_height and os.path.getsize(path) <= max_bytes and path.lower().endswith((".jpg", ".jpeg")) and w * h <= 25_000_000:
+                    return [path]
+                
+                if h > max_height:
+                    slices = (h + max_height - 1) // max_height
+                    logger.info(f"[Rocom] 图片过长 ({w}x{h})，开始切片，共 {slices} 张")
+                    for i in range(slices):
+                        top = i * max_height
+                        bottom = min((i + 1) * max_height, h)
+                        box = (0, top, w, bottom)
+                        slice_img = img.crop(box)
+                        
+                        slice_path = f"{path.rsplit('.', 1)[0]}_slice_{i}.jpg"
+                        slice_w, slice_h = slice_img.size
+                        max_pixels = 25_000_000
+                        if slice_w * slice_h > max_pixels:
+                            ratio = (max_pixels / (slice_w * slice_h)) ** 0.5
+                            new_w, new_h = int(slice_w * ratio), int(slice_h * ratio)
+                            slice_img = slice_img.resize((new_w, new_h), PILImage.LANCZOS)
+                        
+                        slice_img.convert("RGB").save(slice_path, "JPEG", quality=80)
+                        if os.path.getsize(slice_path) > max_bytes:
+                            slice_img.convert("RGB").save(slice_path, "JPEG", quality=45)
+                        result_paths.append(slice_path)
+                else:
+                    max_pixels = 25_000_000
+                    if w * h > max_pixels:
+                        ratio = (max_pixels / (w * h)) ** 0.5
+                        new_w, new_h = int(w * ratio), int(h * ratio)
+                        img = img.resize((new_w, new_h), PILImage.LANCZOS)
+                        logger.info(f"[Rocom] 图片缩放: {w}x{h} → {new_w}x{new_h}")
+                    
+                    jpg_path = f"{path.rsplit('.', 1)[0]}_compressed.jpg"
+                    img.convert("RGB").save(jpg_path, "JPEG", quality=80)
+                    if os.path.getsize(jpg_path) > max_bytes:
+                        img.convert("RGB").save(jpg_path, "JPEG", quality=45)
+                    result_paths.append(jpg_path)
+                    
+                return result_paths
+            finally:
+                PILImage.MAX_IMAGE_PIXELS = old_max
+        except Exception as e:
+            logger.warning(f"[Rocom] 图片切片/压缩失败，保持原图: {e}")
+            return [path]
+
     def _build_announcement_list_render_data(self, res: Dict[str, Any] | None) -> Dict[str, Any]:
         items = (res or {}).get("list") or (res or {}).get("items") or []
         cards = []
@@ -2381,7 +2476,7 @@ class RocomPlugin(Star):
         img_url = None
         latest_title = str(latest.get("title") or "").strip()
         pushed = 0
-        users_to_push_video = []
+        users_to_push_attachments = []
         for key, sub in all_subs.items():
             last_id = str(sub.get("last_id") or "")
             last_ts = int(sub.get("since_ts") or 0)
@@ -2402,26 +2497,16 @@ class RocomPlugin(Star):
                     self._build_announcement_detail_render_data(detail),
                     {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
                 )
-                # PNG 过大时转 JPEG 压缩，避免 QQ rich media transfer failed
-                if img_url and os.path.getsize(img_url) > 10 * 1024 * 1024:
-                    try:
-                        from PIL import Image as PILImage
-                        img = PILImage.open(img_url)
-                        jpg_path = img_url.rsplit(".", 1)[0] + ".jpg"
-                        img.convert("RGB").save(jpg_path, "JPEG", quality=80)
-                        orig_size = os.path.getsize(img_url)
-                        new_size = os.path.getsize(jpg_path)
-                        logger.info(
-                            f"[Rocom] 公告图片压缩: PNG {orig_size / 1024:.0f}KB → JPEG {new_size / 1024:.0f}KB"
-                        )
-                        img_url = jpg_path
-                    except Exception as e:
-                        logger.warning(f"[Rocom] 公告图片压缩失败，保持原图: {e}")
+                # 截图后处理：放宽 Pillow 像素限制 + 等比缩放 + 自动切片 + 转 JPEG，确保 QQ 可发送
+                img_urls = []
+                if img_url:
+                    img_urls = self._slice_and_compress_image(img_url)
             chain = MessageChain().message(
                 f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n"
             )
-            if img_url:
-                chain.file_image(img_url)
+            if img_urls:
+                for u in img_urls:
+                    chain.file_image(u)
             elif latest.get("summary"):
                 chain.message(str(latest.get("summary")))
                 
@@ -2433,7 +2518,7 @@ class RocomPlugin(Star):
             except Exception as e:
                 logger.warning(f"[Rocom] 公告订阅图文推送失败: {e}")
                 # 降级为纯文本重试（如图片过大导致 rich media transfer failed）
-                if img_url:
+                if img_urls:
                     try:
                         content_text = ""
                         if isinstance(detail, dict):
@@ -2456,12 +2541,12 @@ class RocomPlugin(Star):
             sub["last_id"] = latest_id
             sub["last_title"] = latest_title
             sub["since_ts"] = latest_ts or int(time.time())
-            users_to_push_video.append((key, sub))
+            users_to_push_attachments.append((key, sub))
             sub["updated_at"] = int(time.time())
             await self.announcement_sub_mgr.upsert_subscription(key, sub)
             await asyncio.sleep(2)
             
-        if users_to_push_video and detail:
+        if users_to_push_attachments and detail:
             videos = self._extract_videos(detail)
             if videos:
                 video_paths = []
@@ -2469,7 +2554,7 @@ class RocomPlugin(Star):
                     p = await self._download_and_compress_video(v["url"])
                     video_paths.append(p)
                 if video_paths:
-                    for key, sub in users_to_push_video:
+                    for key, sub in users_to_push_attachments:
                         v_chain = MessageChain()
                         for p in video_paths:
                             v_chain.chain.append(Video.fromFileSystem(p))
@@ -2478,6 +2563,37 @@ class RocomPlugin(Star):
                             logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key}")
                         except Exception as e:
                             logger.warning(f"[Rocom] 公告订阅视频附加推送失败: {e}")
+                        await asyncio.sleep(2)
+
+            # 多图公告附加转发消息：当原图 >= 2 张时，用合并转发发送所有原图
+            original_urls = []
+            content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+            for index in content_data.get("indexes") or []:
+                if isinstance(index, dict):
+                    urls = index.get("imageUrl")
+                    if isinstance(urls, list):
+                        original_urls.extend([str(u) for u in urls if u])
+            if len(original_urls) >= 2:
+                # 下载并切片/压缩所有原图
+                image_nodes = []
+                for url in original_urls:
+                    local_path = await self._download_announcement_image(url)
+                    if local_path:
+                        sliced_paths = self._slice_and_compress_image(local_path)
+                        for p in sliced_paths:
+                            image_nodes.append(
+                                Node(uin=0, name="洛克王国公告", content=[Image.fromFileSystem(p)])
+                            )
+                if len(image_nodes) >= 2:
+                    nodes = Nodes(image_nodes)
+                    for key, sub in users_to_push_attachments:
+                        try:
+                            fwd_chain = MessageChain()
+                            fwd_chain.chain.append(nodes)
+                            await self.context.send_message(sub["umo"], fwd_chain)
+                            logger.info(f"[Rocom] 公告原图转发推送成功 → {key}")
+                        except Exception as e:
+                            logger.warning(f"[Rocom] 公告原图转发推送失败: {e}")
                         await asyncio.sleep(2)
 
         if pushed:
