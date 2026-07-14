@@ -19,7 +19,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Plain, Image, Video, Node, Nodes
+from astrbot.core.message.components import Plain, Image, Video, Node, Nodes, Poke
 
 from .core.client import RocomClient
 from .core.user import (
@@ -3097,18 +3097,29 @@ class RocomPlugin(Star):
                 has_at_all = sub.get("mention_all") and not key.startswith("private_")
                 if has_at_all:
                     reminder_chain.at_all()
+                elif key.startswith("private_"):
+                    target_id = key.split("_", 1)[1] if "_" in key else 0
+                    umo_str = str(sub.get("umo", ""))
+                    platform_id = umo_str.split(":")[0] if ":" in umo_str else ""
+                    platform_inst = self.context.get_platform_inst(platform_id)
+                    if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                        try:
+                            await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                        except Exception as e:
+                            logger.warning(f"[Rocom] 独立戳一戳发送失败: {e}")
+                    else:
+                        reminder_chain.chain.append(Poke(qq=target_id))
                 reminder_chain.message(reminder_text)
                 try:
                     await self.context.send_message(sub["umo"], reminder_chain)
                 except Exception as reminder_e:
-                    logger.warning(f"[Rocom] 远行商人珍稀商品提醒发送失败: {reminder_e}")
-                    if has_at_all:
-                        # 降级：去掉 @全体 重试
-                        fallback_reminder = MessageChain().message(reminder_text)
-                        try:
-                            await self.context.send_message(sub["umo"], fallback_reminder)
-                        except Exception as fallback_e:
-                            logger.warning(f"[Rocom] 远行商人珍稀商品提醒降级发送失败: {fallback_e}")
+                    logger.warning(f"[Rocom] 远行商人珍稀商品提醒(含特效)发送失败: {reminder_e}")
+                    # 降级：去掉 @全体 或 戳一戳，仅发送纯文本重试
+                    fallback_reminder = MessageChain().message(reminder_text)
+                    try:
+                        await self.context.send_message(sub["umo"], fallback_reminder)
+                    except Exception as fallback_e:
+                        logger.warning(f"[Rocom] 远行商人珍稀商品提醒降级发送失败: {fallback_e}")
             if push_ok:
                 pushed += 1
                 logger.info(f"[Rocom] 远行商人推送 → {key} {'全部' if sub.get('all_products') else '、'.join(matched)}")
