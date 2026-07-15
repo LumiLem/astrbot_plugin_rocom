@@ -1713,6 +1713,17 @@ class RocomPlugin(Star):
                                 is_private = isinstance(key, str) and key.startswith("private_")
                                 if is_private:
                                     send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                                    if has_at_all:
+                                        target_id = key.split("_", 1)[1] if "_" in key else 0
+                                        platform_id = umo.split(":")[0] if ":" in umo else ""
+                                        platform_inst = self.context.get_platform_inst(platform_id)
+                                        if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                                            try:
+                                                await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                                            except Exception as e:
+                                                logger.warning(f"[Rocom] 定时群发私聊戳一戳发送失败: {e}")
+                                        else:
+                                            send_chain.chain.append(Poke(qq=target_id))
                                 else:
                                     send_chain.chain = list(chain.chain)
                                 await self.context.send_message(umo, send_chain)
@@ -1723,7 +1734,7 @@ class RocomPlugin(Star):
                                     logger.warning(f"[Rocom] 定时群发推送失败 ({umo})，尝试降级纯文本: {e}")
                                     try:
                                         fallback_chain = MessageChain()
-                                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ != "AtAll"]
+                                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
                                         await self.context.send_message(umo, fallback_chain)
                                         success_count += 1
                                         await asyncio.sleep(0.5)
@@ -5636,6 +5647,17 @@ class RocomPlugin(Star):
                 is_private = isinstance(key, str) and key.startswith("private_")
                 if is_private:
                     send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                    if mention_all:
+                        target_id = key.split("_", 1)[1] if "_" in key else 0
+                        platform_id = umo.split(":")[0] if ":" in umo else ""
+                        platform_inst = self.context.get_platform_inst(platform_id)
+                        if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                            try:
+                                await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                            except Exception as e:
+                                logger.warning(f"[Rocom] 群发公告私聊戳一戳发送失败: {e}")
+                        else:
+                            send_chain.chain.append(Poke(qq=target_id))
                 else:
                     send_chain.chain = list(chain.chain)
                 await self.context.send_message(umo, send_chain)
@@ -5646,7 +5668,7 @@ class RocomPlugin(Star):
                     logger.warning(f"[Rocom] 群发公告推送失败 ({umo})，尝试降级纯文本: {e}")
                     try:
                         fallback_chain = MessageChain()
-                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ != "AtAll"]
+                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
                         await self.context.send_message(umo, fallback_chain)
                         success_count += 1
                         await asyncio.sleep(0.5)
