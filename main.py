@@ -1710,11 +1710,18 @@ class RocomPlugin(Star):
                         for umo, key in umos.items():
                             try:
                                 send_chain = MessageChain()
-                                is_private = isinstance(key, str) and key.startswith("private_")
+                                is_private = False
+                                target_id = 0
+                                if isinstance(key, str) and key.startswith("private_"):
+                                    is_private = True
+                                    target_id = key.split("_", 1)[1] if "_" in key else 0
+                                elif "FriendMessage" in umo or "PrivateMessage" in umo:
+                                    is_private = True
+                                    target_id = umo.split(":")[-1]
+
                                 if is_private:
                                     send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
                                     if has_at_all:
-                                        target_id = key.split("_", 1)[1] if "_" in key else 0
                                         platform_id = umo.split(":")[0] if ":" in umo else ""
                                         platform_inst = self.context.get_platform_inst(platform_id)
                                         if platform_inst and platform_inst.meta().name == "aiocqhttp":
@@ -5644,11 +5651,18 @@ class RocomPlugin(Star):
             try:
                 # 重新构建 MessageChain，防止被底层修改
                 send_chain = MessageChain()
-                is_private = isinstance(key, str) and key.startswith("private_")
+                is_private = False
+                target_id = 0
+                if isinstance(key, str) and key.startswith("private_"):
+                    is_private = True
+                    target_id = key.split("_", 1)[1] if "_" in key else 0
+                elif "FriendMessage" in umo or "PrivateMessage" in umo:
+                    is_private = True
+                    target_id = umo.split(":")[-1]
+
                 if is_private:
                     send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
                     if mention_all:
-                        target_id = key.split("_", 1)[1] if "_" in key else 0
                         platform_id = umo.split(":")[0] if ":" in umo else ""
                         platform_inst = self.context.get_platform_inst(platform_id)
                         if platform_inst and platform_inst.meta().name == "aiocqhttp":
