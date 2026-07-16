@@ -28,6 +28,7 @@ from .core.user import (
     HomeSubscriptionManager,
     AnnouncementSubscriptionManager,
     BroadcastTaskManager,
+    ActiveUserManager,
 )
 from .core.render import Renderer
 from .core.egg_service import EggService, SearchResult
@@ -73,6 +74,7 @@ class RocomPlugin(Star):
         self.home_sub_mgr = HomeSubscriptionManager(data_dir)
         self.announcement_sub_mgr = AnnouncementSubscriptionManager(data_dir)
         self.broadcast_task_mgr = BroadcastTaskManager(data_dir)
+        self.active_user_mgr = ActiveUserManager(data_dir)
         
         self.settings_file = os.path.join(data_dir, "rocom_settings.json")
         self.rocom_settings = self._load_settings()
@@ -1694,17 +1696,26 @@ class RocomPlugin(Star):
                             for t in specific_targets:
                                 umos[t] = t
                         else:
-                            merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
-                            for key, sub in merch_subs.items():
-                                if umo := sub.get("umo"): umos[umo] = key
-                                    
-                            ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
-                            for key, sub in ann_subs.items():
-                                if umo := sub.get("umo"): umos[umo] = key
-                                    
-                            home_subs = await self.home_sub_mgr.get_all_subscriptions()
-                            for key, sub in home_subs.items():
-                                if umo := sub.get("umo"): umos[umo] = key
+                            target_sub = task.get("target_sub", True)
+                            target_active = task.get("target_active", False)
+                            
+                            if target_sub:
+                                merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+                                for key, sub in merch_subs.items():
+                                    if umo := sub.get("umo"): umos[umo] = key
+                                        
+                                ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+                                for key, sub in ann_subs.items():
+                                    if umo := sub.get("umo"): umos[umo] = key
+                                        
+                                home_subs = await self.home_sub_mgr.get_all_subscriptions()
+                                for key, sub in home_subs.items():
+                                    if umo := sub.get("umo"): umos[umo] = key
+                            
+                            if target_active:
+                                active_users = await self.active_user_mgr.get_active_users(30)
+                                for umo in active_users:
+                                    umos[umo] = umo
                                 
                         success_count = 0
                         for umo, key in umos.items():
@@ -4780,6 +4791,7 @@ class RocomPlugin(Star):
     @filter.command("洛克档案", alias={"档案"})
     async def rocom_profile(self, event: AstrMessageEvent):
         """查看个人档案"""
+        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -5206,6 +5218,7 @@ class RocomPlugin(Star):
     @filter.command("洛克wiki", alias={"洛克百科"})
     async def rocom_wiki(self, event: AstrMessageEvent, name: str = ""):
         """查询 Wiki"""
+        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
         catalog, query, page_no = self._parse_wiki_command(event, name)
         raw_text = self._extract_command_args_text(event, ["洛克wiki", "洛克百科"]) or str(name or "").strip()
         raw_key = raw_text.strip().lower()
@@ -5535,6 +5548,9 @@ class RocomPlugin(Star):
         time_hint = ""
         specific_targets = []
         mention_all = False
+        target_sub = True
+        target_active = False
+        target_override = False
         
         for comp in event.message_obj.message:
             if isinstance(comp, Plain):
@@ -5547,6 +5563,9 @@ class RocomPlugin(Star):
                         d_match = re.match(r'^-d\s+(\d+)(?:m|分钟)?\s*', text)
                         t_match = re.match(r'^-t\s+(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}|\d{2}:\d{2})\s*', text)
                         a_match = re.match(r'^-a\s*', text)
+                        g_match = re.match(r'^-(?:g|-global)\s*', text)
+                        c_match = re.match(r'^--active\s*', text)
+                        s_match = re.match(r'^--sub\s*', text)
                         
                         if u_match:
                             targets_str = u_match.group(1)
@@ -5572,6 +5591,21 @@ class RocomPlugin(Star):
                         elif a_match:
                             mention_all = True
                             text = text[a_match.end():]
+                        elif g_match:
+                            target_sub = True
+                            target_active = True
+                            target_override = True
+                            text = text[g_match.end():]
+                        elif c_match:
+                            target_active = True
+                            if not target_override:
+                                target_sub = False
+                            target_override = True
+                            text = text[c_match.end():]
+                        elif s_match:
+                            target_sub = True
+                            target_override = True
+                            text = text[s_match.end():]
                         else:
                             break
                             
@@ -5594,7 +5628,7 @@ class RocomPlugin(Star):
             components_data.append({"type": "at_all"})
             
         if not has_content:
-            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。")
+            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。\n可用标志位：-g (全域), --active (仅活跃用户), --sub (仅订阅用户, 默认)。")
             return
             
         umos = {}
@@ -5603,26 +5637,32 @@ class RocomPlugin(Star):
             for t in specific_targets:
                 umos[t] = t
         else:
-            # 远行商人订阅
-            merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
-            for key, sub in merch_subs.items():
-                umo = sub.get("umo")
-                if umo:
-                    umos[umo] = key
-                    
-            # 洛克公告订阅
-            ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
-            for key, sub in ann_subs.items():
-                umo = sub.get("umo")
-                if umo:
-                    umos[umo] = key
-                    
-            # 家园订阅
-            home_subs = await self.home_sub_mgr.get_all_subscriptions()
-            for key, sub in home_subs.items():
-                umo = sub.get("umo")
-                if umo:
-                    umos[umo] = key
+            if target_sub:
+                # 远行商人订阅
+                merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+                for key, sub in merch_subs.items():
+                    umo = sub.get("umo")
+                    if umo:
+                        umos[umo] = key
+                        
+                # 洛克公告订阅
+                ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+                for key, sub in ann_subs.items():
+                    umo = sub.get("umo")
+                    if umo:
+                        umos[umo] = key
+                        
+                # 家园订阅
+                home_subs = await self.home_sub_mgr.get_all_subscriptions()
+                for key, sub in home_subs.items():
+                    umo = sub.get("umo")
+                    if umo:
+                        umos[umo] = key
+                        
+            if target_active:
+                active_users = await self.active_user_mgr.get_active_users(30)
+                for umo in active_users:
+                    umos[umo] = umo
                 
         if not umos:
             yield event.plain_result("当前没有任何订阅用户/群组。")
@@ -5639,7 +5679,9 @@ class RocomPlugin(Star):
                 "components": components_data,
                 "issuer_umo": str(event.unified_msg_origin),
                 "created_at": int(time.time()),
-                "specific_targets": specific_targets
+                "specific_targets": specific_targets,
+                "target_sub": target_sub,
+                "target_active": target_active
             })
             yield event.plain_result(f"✅ 已成功建立持久化定时任务！\n执行时间：{time_hint}\n预计发送至 {len(umos)} 个目标。\n重启机器人该任务也不会丢失。")
             return
@@ -5780,6 +5822,7 @@ class RocomPlugin(Star):
     @filter.command("洛克家园")
     async def rocom_home(self, event: AstrMessageEvent, uid: str = ""):
         """通过 UID 查询洛克家园菜园、守卫精灵与室内精灵"""
+        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
         uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
         if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
@@ -5945,6 +5988,7 @@ class RocomPlugin(Star):
     @filter.command("家园详情", alias={"洛克精灵数据", "精灵数据"})
     async def rocom_pet_data(self, event: AstrMessageEvent, uid: str = "", pet_gid: str = "", npc_id: str = ""):
         """查询目标家园摆放精灵的完整 ingame 数据"""
+        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
         uid = str(uid or "").strip()
         pet_gid = str(pet_gid or "").strip()
         npc_id = str(npc_id or "").strip()

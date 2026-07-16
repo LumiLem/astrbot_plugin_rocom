@@ -313,3 +313,27 @@ class BroadcastTaskManager(AsyncDataManager):
             del self.data[key]
             await self._save()
             return True
+
+
+class ActiveUserManager(AsyncDataManager):
+    """Silent tracking of active users for global broadcasts."""
+
+    def __init__(self, data_dir: str):
+        super().__init__(data_dir, "rocom_active_users.json", {})
+
+    async def record_user(self, umo: str):
+        import time
+        async with self.lock:
+            self.data[str(umo)] = {"last_active": int(time.time())}
+            await self._save()
+
+    async def get_active_users(self, days: int = 30) -> List[str]:
+        import time
+        now = int(time.time())
+        threshold = now - (days * 24 * 3600)
+        async with self.lock:
+            active_umos = []
+            for umo, info in self.data.items():
+                if info.get("last_active", 0) >= threshold:
+                    active_umos.append(umo)
+            return active_umos
