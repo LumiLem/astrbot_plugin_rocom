@@ -3263,14 +3263,21 @@ class RocomPlugin(Star):
                 # 全部命中商品模式
                 reminder_items = list(matched)
             else:
-                # 仅珍稀商品模式：过滤出珍稀商品
-                rare_items_list = sub.get("mention_items") or self.merchant_subscription_mention_items or []
-                if rare_items_list:
-                    reminder_items = [item for item in matched if item in set(rare_items_list)]
-                else:
-                    reminder_items = list(matched)  # 没有配置珍稀商品列表时回退到全部
+                # 获取结束提醒关注名单，即订阅的基础 items 列表
+                # 由于解耦后 all_products 控制开盘是否推送全部，items 用于存储自定义关注列表
+                target_items = sub.get("items")
+                # 如果未指定自定义名单，自动应用全局默认配置
+                # 兼容旧数据：排除字面量 ["全部商品"] 或是全局常规列表时触发 ! 回退
+                if not target_items or target_items == ["全部商品"] or target_items == self.merchant_subscription_items:
+                    # 根据是否配置了 ! (仅珍稀) 决定回退列表
+                    if sub.get("ending_reminder_rare_only", False):
+                        target_items = self.merchant_subscription_mention_items
+                    else:
+                        target_items = self.merchant_subscription_items
+                
+                reminder_items = [item for item in matched if item in set(target_items)]
                 if not reminder_items:
-                    continue  # 本轮没有珍稀商品命中，跳过
+                    continue  # 本轮没有关注商品命中，跳过
 
             pending.append((key, sub, reminder_items))
 
@@ -3359,17 +3366,17 @@ class RocomPlugin(Star):
         text = text.replace("{round}", str(round_info.get("current", "")))
         return text
 
-    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None, int, bool, bool]:
+    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None, int, bool, bool, bool]:
         """解析远行商人订阅参数
-        返回：(是否@全体，自定义商品列表，是否订阅全部，珍稀商品提醒列表，结束提醒分钟数，结束提醒是否强提醒，结束提醒是否全部商品)
+        返回：(是否@全体，自定义商品列表，是否订阅全部，珍稀商品提醒列表，结束提醒分钟数，结束提醒是否强提醒，结束提醒是否全部商品，结束提醒是否仅珍稀)
         自定义商品列表为 None 表示使用默认配置
-        珍稀商品提醒列表为 None 时使用全局默认，非空时仅命中其中商品才发送提醒
+        珍稀商品提醒列表为 None 时使用全局默认
         结束提醒分钟数为 0 表示关闭（默认），-1 表示未指定（不修改已有设置）
         结束提醒是否全部商品为 False 表示仅珍稀商品（默认）
         """
         text = str(raw_text or "").strip()
         if not text:
-            return False, None, False, None, -1, False, False
+            return False, None, False, None, -1, False, False, False
         tokens = text.split(maxsplit=1)
         mention = False
         items_text = text
@@ -3378,54 +3385,32 @@ class RocomPlugin(Star):
             items_text = tokens[1] if len(tokens) > 1 else ""
         items_text = str(items_text or "").strip()
         if not items_text:
-            return mention, None, False, None, -1, False, False
+            return mention, None, False, None, -1, False, False, False
 
-        # 从 items_text 中提取 -N / -*N / -@N / -@*N 结束提醒参数
+        # 从 items_text 中提取结束提醒参数，支持修饰符 @(强提醒) *(全部商品) !(仅珍稀)
         ending_minutes = -1  # -1 = 未指定
         ending_mention = False
         ending_all_items = False
+        ending_rare_only = False
         remaining_parts = []
         for part in re.split(r"[\s,，、/|；;]+", items_text):
             part = part.strip()
             if not part:
                 continue
-            # -@*N: 强提醒 + 全部商品
-            m = re.match(r"^-@\*(\d+)$", part)
+            m = re.match(r"^-([@*!]+)?(\d+)$", part)
             if m:
-                val = int(m.group(1))
+                mods = m.group(1) or ""
+                val = int(m.group(2))
                 ending_minutes = min(max(val, 0), 60) if val > 0 else 0
-                ending_mention = True if ending_minutes > 0 else False
-                ending_all_items = True
-                continue
-            # -*N: 全部商品
-            m = re.match(r"^-\*(\d+)$", part)
-            if m:
-                val = int(m.group(1))
-                ending_minutes = min(max(val, 0), 60) if val > 0 else 0
-                ending_mention = False
-                ending_all_items = True
-                continue
-            # -@N: 强提醒（仅珍稀商品）
-            m = re.match(r"^-@(\d+)$", part)
-            if m:
-                val = int(m.group(1))
-                ending_minutes = min(max(val, 0), 60) if val > 0 else 0
-                ending_mention = True if ending_minutes > 0 else False
-                ending_all_items = False
-                continue
-            # -N: 普通提醒（仅珍稀商品）
-            m = re.match(r"^-(\d+)$", part)
-            if m:
-                val = int(m.group(1))
-                ending_minutes = min(max(val, 0), 60) if val > 0 else 0
-                ending_mention = False
-                ending_all_items = False
+                ending_mention = "@" in mods if ending_minutes > 0 else False
+                ending_all_items = "*" in mods
+                ending_rare_only = "!" in mods
                 continue
             remaining_parts.append(part)
 
         items_text = " ".join(remaining_parts)
         if not items_text:
-            return mention, None, False, None, ending_minutes, ending_mention, ending_all_items
+            return mention, None, False, None, ending_minutes, ending_mention, ending_all_items, ending_rare_only
         for prefix in ("全部", "所有", "all"):
             if items_text == prefix or items_text.startswith(prefix + " "):
                 suffix = items_text[len(prefix):].strip()
@@ -3433,14 +3418,17 @@ class RocomPlugin(Star):
                     raw_mention = self._split_merchant_subscription_items(suffix)
                     mention_items = [item[1:] for item in raw_mention if item.startswith("@") and len(item) > 1]
                     mention_items = mention_items if mention_items else None
+                    items = [item[1:] if item.startswith("@") and len(item) > 1 else item for item in raw_mention]
+                    items = items if items else None
                 else:
                     mention_items = None
-                return mention, ["全部商品"], True, mention_items, ending_minutes, ending_mention, ending_all_items
+                    items = None
+                return mention, items, True, mention_items, ending_minutes, ending_mention, ending_all_items, ending_rare_only
         raw_items = self._split_merchant_subscription_items(items_text)
         mention_items = [item[1:] for item in raw_items if item.startswith("@") and len(item) > 1]
         items = [item[1:] if item.startswith("@") and len(item) > 1 else item for item in raw_items]
         mention_items = mention_items if mention_items else None
-        return mention, items if items else None, False, mention_items, ending_minutes, ending_mention, ending_all_items
+        return mention, items if items else None, False, mention_items, ending_minutes, ending_mention, ending_all_items, ending_rare_only
 
     def _default_items_hint(self) -> str:
         if self.merchant_subscription_all_products:
@@ -6517,16 +6505,16 @@ class RocomPlugin(Star):
         else:
             args_text = args.strip()
         
-        mention, custom_items, all_products, mention_items, ending_minutes, ending_mention, ending_all_items = self._parse_merchant_subscription_args(args_text)
+        mention, custom_items, all_products, mention_items, ending_minutes, ending_mention, ending_all_items, ending_rare_only = self._parse_merchant_subscription_args(args_text)
         if custom_items is not None:
             selected_items = list(custom_items)
         else:
             selected_items = list(self.merchant_subscription_items)
             if self.merchant_subscription_all_products:
                 all_products = True
-                selected_items = ["全部商品"]
-            if mention_items is None and self.merchant_subscription_mention_items:
-                mention_items = list(self.merchant_subscription_mention_items)
+            
+        if mention_items is None and self.merchant_subscription_mention_items:
+            mention_items = list(self.merchant_subscription_mention_items)
         
         if event.is_private_chat():
             subscription_key = f"private_{event.get_sender_id()}"
@@ -6539,16 +6527,19 @@ class RocomPlugin(Star):
         existing_ending_minutes = 0
         existing_ending_mention = False
         existing_ending_all_items = False
+        existing_ending_rare_only = False
         if ending_minutes == -1:
             existing_subs = await self.merchant_sub_mgr.get_all_subscriptions()
             existing_sub = existing_subs.get(subscription_key) or {}
             existing_ending_minutes = existing_sub.get("ending_reminder_minutes", 0)
             existing_ending_mention = existing_sub.get("ending_reminder_mention", False)
             existing_ending_all_items = existing_sub.get("ending_reminder_all_items", False)
+            existing_ending_rare_only = existing_sub.get("ending_reminder_rare_only", False)
         
         final_ending_minutes = existing_ending_minutes if ending_minutes == -1 else ending_minutes
         final_ending_mention = existing_ending_mention if ending_minutes == -1 else ending_mention
         final_ending_all_items = existing_ending_all_items if ending_minutes == -1 else ending_all_items
+        final_ending_rare_only = existing_ending_rare_only if ending_minutes == -1 else ending_rare_only
         
         await self.merchant_sub_mgr.upsert_subscription(
             subscription_key,
@@ -6565,6 +6556,7 @@ class RocomPlugin(Star):
                 "ending_reminder_minutes": final_ending_minutes,
                 "ending_reminder_mention": final_ending_mention,
                 "ending_reminder_all_items": final_ending_all_items,
+                "ending_reminder_rare_only": final_ending_rare_only,
                 "last_ending_reminder_round": "",
                 "updated_by": str(event.get_sender_id()),
             },
@@ -6574,7 +6566,7 @@ class RocomPlugin(Star):
             if str(existing_key) != str(subscription_key) and str(existing_sub.get("key", "")) == str(subscription_key):
                 await self.merchant_sub_mgr.delete_subscription(existing_key)
                 logger.warning(f"[Rocom] 远行商人订阅：清理重复条目 {existing_key}（与 {subscription_key} 指向同一目标）")
-        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items} ending={final_ending_minutes}m mention={final_ending_mention} all_items={final_ending_all_items}")
+        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items} ending={final_ending_minutes}m mention={final_ending_mention} all_items={final_ending_all_items} rare_only={final_ending_rare_only}")
         if all_products:
             summary = "全部商品（每轮必推）"
         elif custom_items is not None:
@@ -6591,7 +6583,14 @@ class RocomPlugin(Star):
             at_desc = " | 不@全体"
         # 结束提醒描述
         if final_ending_minutes > 0:
-            mode_label = "全部商品" if final_ending_all_items else "仅珍稀商品"
+            if final_ending_all_items:
+                mode_label = "全部商品"
+            elif custom_items is not None:
+                mode_label = f"已指定{len(custom_items)}个关注商品"
+            elif final_ending_rare_only:
+                mode_label = "默认珍稀列表"
+            else:
+                mode_label = "默认常规列表"
             ending_desc = f"\n结束提醒：结束前{final_ending_minutes}分钟{'强提醒' if final_ending_mention else '提醒'}（{mode_label}）"
         else:
             ending_desc = ""
@@ -6601,9 +6600,10 @@ class RocomPlugin(Star):
                 f"示例：/订阅远行商人 → {self._default_items_hint()}\n"
                 f"/订阅远行商人 国王球 棱镜球 → 自定义商品\n"
                 f"/订阅远行商人 全部 → 每轮必推\n"
-                f"/订阅远行商人 全部 -30 → 珍稀商品结束前30分钟提醒\n"
-                f"/订阅远行商人 全部 -*30 → 全部商品结束前30分钟提醒\n"
-                f"/订阅远行商人 全部 -@30 → 珍稀商品结束前30分钟强提醒\n"
+                f"/订阅远行商人 全部 @国王球 -30 → 开盘推全部（出国王球强提醒），结束仅提醒国王球\n"
+                f"/订阅远行商人 全部 -30 → 开盘推全部，结束提醒默认常规列表\n"
+                f"/订阅远行商人 全部 -*30 → 开盘推全部，结束提醒全部商品\n"
+                f"/订阅远行商人 全部 -@30 → 结束前30分钟强提醒\n"
                 f"/取消订阅远行商人 → 关闭订阅"
             )
         else:
@@ -6612,10 +6612,10 @@ class RocomPlugin(Star):
                 f"默认配置：{self._default_config_hint()}\n"
                 f"示例：/订阅远行商人 1 国王球 棱镜球 → 仅订阅指定商品\n"
                 f"/订阅远行商人 1 @棱镜球 国王球 → 棱镜球命中时提醒并@全体\n"
-                f"/订阅远行商人 1 全部 @棱镜球 → 每轮必推，棱镜球提醒并@全体\n"
-                f"/订阅远行商人 1 全部 -30 → 珍稀商品结束前30分钟提醒\n"
-                f"/订阅远行商人 1 全部 -*30 → 全部商品结束前30分钟提醒\n"
-                f"/订阅远行商人 1 全部 -@30 → 珍稀商品结束前30分钟强提醒(@全体)\n"
+                f"/订阅远行商人 1 全部 @国王球 -30 → 开盘推全部（出国王球@全体），结束仅提醒国王球\n"
+                f"/订阅远行商人 1 全部 -30 → 开盘推全部，结束提醒默认常规列表\n"
+                f"/订阅远行商人 1 全部 -*30 → 开盘推全部，结束提醒全部商品\n"
+                f"/订阅远行商人 1 全部 -@30 → 结束前30分钟强提醒(@全体)\n"
                 f"/取消订阅远行商人 → 关闭订阅"
             )
 
