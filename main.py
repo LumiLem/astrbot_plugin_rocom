@@ -122,6 +122,10 @@ class RocomPlugin(Star):
         self.merchant_mention_reminder_template = self.config.get(
             "merchant_mention_reminder_template", "卖{items}了！"
         )
+        self.merchant_ending_reminder_template = self.config.get(
+            "merchant_ending_reminder_template",
+            "远行商人第{round}轮还有{countdown}结束，别忘了购买：{items}"
+        )
         self._merchant_subscription_task = None
         self._merchant_thread = None
         self._merchant_stop = threading.Event()
@@ -2639,15 +2643,63 @@ class RocomPlugin(Star):
             now.replace(hour=20, minute=1, second=0, microsecond=0),
         ]
 
-    def _next_merchant_check_time(self, now: datetime | None = None) -> datetime:
+    def _ending_reminder_check_times(self, base: datetime | None = None, max_minutes: int = 30) -> List[datetime]:
+        """计算结束提醒时间点：每轮结束前 max_minutes 分钟
+        轮次结束时间：12:00, 16:00, 20:00, 24:00（次日 0:00）
+        """
+        now = base or datetime.now(self._cn_tz())
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=self._cn_tz())
+        end_times = [
+            now.replace(hour=12, minute=0, second=0, microsecond=0),
+            now.replace(hour=16, minute=0, second=0, microsecond=0),
+            now.replace(hour=20, minute=0, second=0, microsecond=0),
+            (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0),
+        ]
+        return [et - timedelta(minutes=max_minutes) for et in end_times]
+
+    def _get_max_ending_reminder_minutes(self) -> int:
+        """从所有订阅中获取最大的结束提醒分钟数，用于确定最早的提醒调度时间"""
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.merchant_sub_mgr.get_all_subscriptions(), self._main_loop
+            )
+            all_subs = future.result(timeout=10)
+        except Exception:
+            return 0
+        max_min = 0
+        for sub in all_subs.values():
+            val = sub.get("ending_reminder_minutes", 0)
+            if isinstance(val, int) and val > max_min:
+                max_min = val
+        return max_min
+
+    def _next_merchant_check_time(self, now: datetime | None = None) -> tuple[datetime, str]:
+        """返回下一个调度时间点及其类型（"open" 或 "ending"）"""
         current = now or datetime.now(self._cn_tz())
         if current.tzinfo is None:
             current = current.replace(tzinfo=self._cn_tz())
+        candidates: list[tuple[datetime, str]] = []
+        # 开盘检查时间点
         for check_time in self._merchant_check_times(current):
             if check_time > current:
-                return check_time
-        next_day = current + timedelta(days=1)
-        return self._merchant_check_times(next_day)[0]
+                candidates.append((check_time, "open"))
+        if not candidates:
+            next_day = current + timedelta(days=1)
+            candidates.append((self._merchant_check_times(next_day)[0], "open"))
+        # 结束提醒时间点
+        max_ending = self._get_max_ending_reminder_minutes()
+        if max_ending > 0:
+            for reminder_time in self._ending_reminder_check_times(current, max_ending):
+                if reminder_time > current:
+                    candidates.append((reminder_time, "ending"))
+            if not any(t == "ending" for _, t in candidates):
+                next_day = current + timedelta(days=1)
+                ending_next = self._ending_reminder_check_times(next_day, max_ending)
+                if ending_next:
+                    candidates.append((ending_next[0], "ending"))
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0]
 
     def _merchant_subscription_thread(self):
         """独立线程调度器：wall clock 绝对时间比较，抗 timer 漂移"""
@@ -2659,12 +2711,15 @@ class RocomPlugin(Star):
             iteration += 1
             try:
                 now_ts = time.time()
-                next_check = self._next_merchant_check_time(None)
+                next_check, check_type = self._next_merchant_check_time(None)
                 jitter = random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds)
+                # 结束提醒不加 jitter，保证准时
+                if check_type == "ending":
+                    jitter = 0
                 target_ts = next_check.timestamp() + jitter
                 wait_seconds = max(1, target_ts - now_ts)
                 logger.info(
-                    f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 目标 {datetime.fromtimestamp(target_ts, self._cn_tz()).strftime('%Y-%m-%d %H:%M:%S CST')} | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
+                    f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 类型={check_type} | 目标 {datetime.fromtimestamp(target_ts, self._cn_tz()).strftime('%Y-%m-%d %H:%M:%S CST')} | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
                 )
                 start_ts = now_ts
                 while True:
@@ -2684,23 +2739,26 @@ class RocomPlugin(Star):
                 if stop.is_set():
                     return
                 elapsed = time.time() - start_ts
-                logger.info(f"[Rocom] 远行商人订阅线程：等待结束（实际 {elapsed:.0f}s），注入事件循环 | instance={self._instance_id}")
-                asyncio.run_coroutine_threadsafe(self._merchant_check_with_guard(), loop)
+                logger.info(f"[Rocom] 远行商人订阅线程：等待结束（实际 {elapsed:.0f}s），类型={check_type}，注入事件循环 | instance={self._instance_id}")
+                asyncio.run_coroutine_threadsafe(self._merchant_check_with_guard(check_type), loop)
             except Exception as e:
                 logger.error(f"[Rocom] 远行商人订阅线程异常（iteration={iteration}）: {e}")
                 if stop.wait(60):
                     return
 
-    async def _merchant_check_with_guard(self):
+    async def _merchant_check_with_guard(self, check_type: str = "open"):
         """防止重入：若上一次检查仍在执行则跳过本次调度"""
         if self._merchant_check_running:
             logger.warning("[Rocom] 远行商人：上次检查仍在执行，跳过本轮调度")
             return
         self._merchant_check_running = True
         try:
-            await self._run_merchant_subscription_window()
+            if check_type == "ending":
+                await self._run_merchant_ending_reminder()
+            else:
+                await self._run_merchant_subscription_window()
         except Exception as e:
-            logger.error(f"[Rocom] 远行商人检查异常: {e}")
+            logger.error(f"[Rocom] 远行商人{check_type}检查异常: {e}")
         finally:
             self._merchant_check_running = False
 
@@ -3161,6 +3219,105 @@ class RocomPlugin(Star):
         logger.info(f"[Rocom] 远行商人 本轮推送 {pushed}/{len(pending_pushes)} 个订阅，耗时 {elapsed:.0f}s")
         return "done"
 
+    async def _run_merchant_ending_reminder(self):
+        """结束提醒推送：在每轮结束前向开启了结束提醒的订阅发送提醒"""
+        round_info = self._current_merchant_round()
+        if not round_info["is_open"]:
+            logger.debug("[Rocom] 远行商人结束提醒：当前未开市，跳过")
+            return
+
+        all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+        if not all_subs:
+            return
+
+        now = datetime.now(self._cn_tz())
+        end_time = round_info.get("end_time")
+        if not end_time:
+            return
+        remaining_seconds = (end_time - now).total_seconds()
+        remaining_minutes = remaining_seconds / 60
+
+        pending = []
+        seen_keys = set()
+        for key, sub in all_subs.items():
+            sub_key = str(sub.get("key") or key)
+            if sub_key in seen_keys:
+                continue
+            seen_keys.add(sub_key)
+
+            reminder_min = sub.get("ending_reminder_minutes", 0)
+            if not isinstance(reminder_min, int) or reminder_min <= 0:
+                continue  # 未开启结束提醒
+            if sub.get("last_ending_reminder_round") == round_info["round_id"]:
+                continue  # 本轮已提醒
+            if remaining_minutes > reminder_min:
+                continue  # 还没到该订阅的提醒时间
+
+            # 确定要提醒的商品
+            if sub.get("all_products"):
+                reminder_items = ["全部商品"]
+            else:
+                matched = sub.get("last_matched_items", [])
+                if not matched:
+                    continue  # 本轮开盘未命中，无需结束提醒
+                reminder_items = list(matched)
+
+            pending.append((key, sub, reminder_items))
+
+        if not pending:
+            logger.debug(f"[Rocom] 远行商人结束提醒：无待提醒订阅（剩余{remaining_minutes:.0f}分钟）")
+            return
+
+        logger.info(
+            f"[Rocom] 远行商人结束提醒：第{round_info['current']}轮 | 剩余{round_info['countdown']} | {len(pending)}个订阅待提醒"
+        )
+
+        pushed = 0
+        for key, sub, reminder_items in pending:
+            # 构建提醒文本
+            reminder_text = self._format_ending_reminder(reminder_items, round_info)
+            chain = MessageChain()
+
+            # 强提醒处理
+            use_mention = sub.get("ending_reminder_mention", False)
+            if use_mention and not key.startswith("private_"):
+                chain.at_all()
+            elif use_mention and key.startswith("private_"):
+                # 私聊戳一戳
+                target_id = key.split("_", 1)[1] if "_" in key else 0
+                umo_str = str(sub.get("umo", ""))
+                platform_id = umo_str.split(":")[0] if ":" in umo_str else ""
+                platform_inst = self.context.get_platform_inst(platform_id)
+                if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                    try:
+                        await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 结束提醒戳一戳发送失败: {e}")
+                else:
+                    chain.chain.append(Poke(qq=target_id))
+
+            chain.message(reminder_text)
+
+            try:
+                await self.context.send_message(sub["umo"], chain)
+                pushed += 1
+                logger.info(f"[Rocom] 远行商人结束提醒推送 → {key} {'、'.join(reminder_items)}")
+            except Exception as e:
+                logger.warning(f"[Rocom] 远行商人结束提醒推送失败: {e}")
+                # 降级：去掉强提醒特效，仅发送纯文本
+                fallback_chain = MessageChain().message(reminder_text)
+                try:
+                    await self.context.send_message(sub["umo"], fallback_chain)
+                    pushed += 1
+                except Exception as fallback_e:
+                    logger.warning(f"[Rocom] 远行商人结束提醒降级推送失败: {fallback_e}")
+
+            sub["last_ending_reminder_round"] = round_info["round_id"]
+            await self.merchant_sub_mgr.upsert_subscription(key, sub)
+            await asyncio.sleep(3)
+
+        logger.info(f"[Rocom] 远行商人结束提醒完成：{pushed}/{len(pending)} 个订阅已推送")
+
     def _split_merchant_subscription_items(self, raw_text: str) -> List[str]:
         parts = re.split(r"[\s,，、/|；;]+", raw_text.strip())
         items = []
@@ -3181,15 +3338,27 @@ class RocomPlugin(Star):
             return sep.join(items)
         return re.sub(r"\{items(?:\|([^}]*))?\}", replacer, template)
 
-    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None]:
+    def _format_ending_reminder(self, items: list[str], round_info: dict) -> str:
+        """将商品列表填入结束提醒模板，支持 {items}、{items|分隔符}、{countdown}、{round} 占位符"""
+        template = self.merchant_ending_reminder_template
+        def items_replacer(m: re.Match) -> str:
+            sep = m.group(1) if m.group(1) is not None else "、"
+            return sep.join(items)
+        text = re.sub(r"\{items(?:\|([^}]*))?\}", items_replacer, template)
+        text = text.replace("{countdown}", str(round_info.get("countdown", "")))
+        text = text.replace("{round}", str(round_info.get("current", "")))
+        return text
+
+    def _parse_merchant_subscription_args(self, raw_text: str) -> tuple[bool, List[str] | None, bool, List[str] | None, int, bool]:
         """解析远行商人订阅参数
-        返回：(是否@全体，自定义商品列表，是否订阅全部，珍稀商品提醒列表)
+        返回：(是否@全体，自定义商品列表，是否订阅全部，珍稀商品提醒列表，结束提醒分钟数，结束提醒是否强提醒)
         自定义商品列表为 None 表示使用默认配置
         珍稀商品提醒列表为 None 时使用全局默认，非空时仅命中其中商品才发送提醒
+        结束提醒分钟数为 0 表示关闭（默认），-1 表示未指定（不修改已有设置）
         """
         text = str(raw_text or "").strip()
         if not text:
-            return False, None, False, None
+            return False, None, False, None, -1, False
         tokens = text.split(maxsplit=1)
         mention = False
         items_text = text
@@ -3198,7 +3367,33 @@ class RocomPlugin(Star):
             items_text = tokens[1] if len(tokens) > 1 else ""
         items_text = str(items_text or "").strip()
         if not items_text:
-            return mention, None, False, None
+            return mention, None, False, None, -1, False
+
+        # 从 items_text 中提取 -N / -@N 结束提醒参数
+        ending_minutes = -1  # -1 = 未指定
+        ending_mention = False
+        remaining_parts = []
+        for part in re.split(r"[\s,，、/|；;]+", items_text):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^-@(\d+)$", part)
+            if m:
+                val = int(m.group(1))
+                ending_minutes = min(max(val, 0), 60) if val > 0 else 0
+                ending_mention = True if ending_minutes > 0 else False
+                continue
+            m = re.match(r"^-(\d+)$", part)
+            if m:
+                val = int(m.group(1))
+                ending_minutes = min(max(val, 0), 60) if val > 0 else 0
+                ending_mention = False
+                continue
+            remaining_parts.append(part)
+
+        items_text = " ".join(remaining_parts)
+        if not items_text:
+            return mention, None, False, None, ending_minutes, ending_mention
         for prefix in ("全部", "所有", "all"):
             if items_text == prefix or items_text.startswith(prefix + " "):
                 suffix = items_text[len(prefix):].strip()
@@ -3208,12 +3403,12 @@ class RocomPlugin(Star):
                     mention_items = mention_items if mention_items else None
                 else:
                     mention_items = None
-                return mention, ["全部商品"], True, mention_items
+                return mention, ["全部商品"], True, mention_items, ending_minutes, ending_mention
         raw_items = self._split_merchant_subscription_items(items_text)
         mention_items = [item[1:] for item in raw_items if item.startswith("@") and len(item) > 1]
         items = [item[1:] if item.startswith("@") and len(item) > 1 else item for item in raw_items]
         mention_items = mention_items if mention_items else None
-        return mention, items if items else None, False, mention_items
+        return mention, items if items else None, False, mention_items, ending_minutes, ending_mention
 
     def _default_items_hint(self) -> str:
         if self.merchant_subscription_all_products:
@@ -4293,7 +4488,7 @@ class RocomPlugin(Star):
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
                         {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
-                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部]", "desc": "订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推"},
+                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部] [-N/-@N]", "desc": "订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推，-N=结束前N分钟提醒，-@N=结束前强提醒"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群/私聊远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
@@ -6290,7 +6485,7 @@ class RocomPlugin(Star):
         else:
             args_text = args.strip()
         
-        mention, custom_items, all_products, mention_items = self._parse_merchant_subscription_args(args_text)
+        mention, custom_items, all_products, mention_items, ending_minutes, ending_mention = self._parse_merchant_subscription_args(args_text)
         if custom_items is not None:
             selected_items = list(custom_items)
         else:
@@ -6308,6 +6503,18 @@ class RocomPlugin(Star):
             subscription_key = str(event.get_group_id())
             subscription_type = "群订阅"
         
+        # 如果 ending_minutes == -1（未指定），保留已有订阅中的结束提醒设置
+        existing_ending_minutes = 0
+        existing_ending_mention = False
+        if ending_minutes == -1:
+            existing_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+            existing_sub = existing_subs.get(subscription_key) or {}
+            existing_ending_minutes = existing_sub.get("ending_reminder_minutes", 0)
+            existing_ending_mention = existing_sub.get("ending_reminder_mention", False)
+        
+        final_ending_minutes = existing_ending_minutes if ending_minutes == -1 else ending_minutes
+        final_ending_mention = existing_ending_mention if ending_minutes == -1 else ending_mention
+        
         await self.merchant_sub_mgr.upsert_subscription(
             subscription_key,
             {
@@ -6320,6 +6527,9 @@ class RocomPlugin(Star):
                 "all_products": all_products,
                 "last_push_round": "",
                 "last_matched_items": [],
+                "ending_reminder_minutes": final_ending_minutes,
+                "ending_reminder_mention": final_ending_mention,
+                "last_ending_reminder_round": "",
                 "updated_by": str(event.get_sender_id()),
             },
         )
@@ -6328,7 +6538,7 @@ class RocomPlugin(Star):
             if str(existing_key) != str(subscription_key) and str(existing_sub.get("key", "")) == str(subscription_key):
                 await self.merchant_sub_mgr.delete_subscription(existing_key)
                 logger.warning(f"[Rocom] 远行商人订阅：清理重复条目 {existing_key}（与 {subscription_key} 指向同一目标）")
-        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items}")
+        logger.info(f"[Rocom] 远行商人订阅：{subscription_type}已创建/更新 key={subscription_key} items={selected_items} all_products={all_products} mention_all={mention} mention_items={mention_items} ending={final_ending_minutes}m mention={final_ending_mention}")
         if all_products:
             summary = "全部商品（每轮必推）"
         elif custom_items is not None:
@@ -6343,21 +6553,30 @@ class RocomPlugin(Star):
             at_desc = " | 命中珍稀商品时提醒并@全体"
         else:
             at_desc = " | 不@全体"
+        # 结束提醒描述
+        if final_ending_minutes > 0:
+            ending_desc = f"\n结束提醒：结束前{final_ending_minutes}分钟{'强提醒' if final_ending_mention else '提醒'}"
+        else:
+            ending_desc = ""
         if event.is_private_chat():
             yield event.plain_result(
-                f"已订阅远行商人：{summary}\n"
+                f"已订阅远行商人：{summary}{ending_desc}\n"
                 f"示例：/订阅远行商人 → {self._default_items_hint()}\n"
                 f"/订阅远行商人 国王球 棱镜球 → 自定义商品\n"
                 f"/订阅远行商人 全部 → 每轮必推\n"
+                f"/订阅远行商人 全部 -30 → 结束前30分钟提醒\n"
+                f"/订阅远行商人 全部 -@30 → 结束前30分钟强提醒\n"
                 f"/取消订阅远行商人 → 关闭订阅"
             )
         else:
             yield event.plain_result(
-                f"已订阅远行商人：{summary}{at_desc}\n"
+                f"已订阅远行商人：{summary}{at_desc}{ending_desc}\n"
                 f"默认配置：{self._default_config_hint()}\n"
                 f"示例：/订阅远行商人 1 国王球 棱镜球 → 仅订阅指定商品\n"
                 f"/订阅远行商人 1 @棱镜球 国王球 → 棱镜球命中时提醒并@全体\n"
                 f"/订阅远行商人 1 全部 @棱镜球 → 每轮必推，棱镜球提醒并@全体\n"
+                f"/订阅远行商人 1 全部 -30 → 结束前30分钟提醒\n"
+                f"/订阅远行商人 1 全部 -@30 → 结束前30分钟强提醒(@全体)\n"
                 f"/取消订阅远行商人 → 关闭订阅"
             )
 

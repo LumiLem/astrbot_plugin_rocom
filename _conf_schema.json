@@ -118,6 +118,12 @@
     "hint": "命中珍稀商品时追加发送此提醒；{items} 替换为商品名（默认用、连接），{items|分隔符} 自定义分隔符；群聊带@全体，私聊不带",
     "default": "卖{items}了！"
   },
+  "merchant_ending_reminder_template": {
+    "type": "string",
+    "description": "远行商人快结束提醒模板",
+    "hint": "结束前提醒文案；{items} 替换为商品名（默认用、连接），{items|分隔符} 自定义分隔符，{countdown} 替换为剩余时间，{round} 替换为当前轮次",
+    "default": "远行商人第{round}轮还有{countdown}结束，别忘了购买：{items}"
+  },
   "home_subscription_enabled": {
     "type": "bool",
     "description": "启用家园菜园和灵感订阅推送",
