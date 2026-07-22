@@ -542,16 +542,16 @@ body {
                             <div class="product-time">北京时间 {{product.time_label}}</div>
                         </div>
                         <div class="product-side">
-                            {% if product.price is not none %}
+                            {% if product.price is not none and product.price > 0 %}
                             <div class="price-pill">
                                 <img class="coin-icon" src="{{_res_path}}img/coin.png" alt="金币">
                                 <span>{{product.price}}</span>
                             </div>
                             {% endif %}
-                            {% if product.buy_limit_num is not none %}
+                            {% if product.buy_limit_num is not none and product.buy_limit_num > 0 %}
                             <div class="limit-pill">限购 {{product.buy_limit_num}}</div>
                             {% endif %}
-                            {% if product.price is none and product.buy_limit_num is none %}
+                            {% if (product.price is none or product.price <= 0) and (product.buy_limit_num is none or product.buy_limit_num <= 0) %}
                             <div class="product-side-empty"></div>
                             {% endif %}
                         </div>

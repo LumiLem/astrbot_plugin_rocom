@@ -2906,6 +2906,31 @@ class RocomPlugin(Star):
             status_label = "未开始"
         elif end_ms is not None and now_ms >= end_ms:
             status_label = "已结束"
+
+        raw_price = item.get("price") if item.get("price") not in (None, "") else goods_meta.get("price")
+        parsed_price = None
+        if raw_price not in (None, ""):
+            try:
+                val = int(raw_price)
+                if val > 0:
+                    parsed_price = val
+            except (TypeError, ValueError):
+                pass
+
+        raw_limit = (
+            item.get("buy_limit_num")
+            if item.get("buy_limit_num") not in (None, "")
+            else goods_meta.get("buy_limit_num")
+        )
+        parsed_limit = None
+        if raw_limit not in (None, ""):
+            try:
+                val = int(raw_limit)
+                if val > 0:
+                    parsed_limit = val
+            except (TypeError, ValueError):
+                pass
+
         return {
             "name": item.get("name", "未知商品"),
             "image": item.get("icon_url") or item.get("iconUrl") or fallback_icon,
@@ -2916,12 +2941,8 @@ class RocomPlugin(Star):
             "status_label": status_label,
             "category": category,
             "product_category": self._classify_merchant_item(start_ms, end_ms),
-            "price": item.get("price") if item.get("price") not in (None, "") else goods_meta.get("price"),
-            "buy_limit_num": (
-                item.get("buy_limit_num")
-                if item.get("buy_limit_num") not in (None, "")
-                else goods_meta.get("buy_limit_num")
-            ),
+            "price": parsed_price,
+            "buy_limit_num": parsed_limit,
         }
 
     def _merchant_history_groups(
