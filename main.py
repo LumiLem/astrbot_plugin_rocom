@@ -2830,11 +2830,11 @@ class RocomPlugin(Star):
         start_time = item.get("start_time")
         end_time = item.get("end_time")
         if start_time is None or end_time is None:
-            return "褰撳墠杞"
+            return "当前轮次"
         start_label = self._format_merchant_time(start_time)
         end_label = self._format_merchant_time(end_time)
         if start_label == "--" or end_label == "--":
-            return "褰撳墠杞"
+            return "当前轮次"
         if start_label[:5] == end_label[:5]:
             return f"{start_label} - {end_label[6:]}"
         return f"{start_label} - {end_label}"
