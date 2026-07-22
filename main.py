@@ -2788,7 +2788,7 @@ class RocomPlugin(Star):
         round_start = None
         round_end = None
         if start <= now < start + timedelta(hours=16):
-            delta_seconds = int((now - start).total_seconds())
+            delta_seconds = round((now - start).total_seconds())
             round_index = delta_seconds // int(timedelta(hours=4).total_seconds()) + 1
             round_start = start + timedelta(hours=4 * (round_index - 1))
             round_end = round_start + timedelta(hours=4)
@@ -2806,7 +2806,7 @@ class RocomPlugin(Star):
     def _format_countdown(self, delta: timedelta | None):
         if not delta:
             return "--"
-        total = max(0, int(delta.total_seconds()))
+        total = max(0, round(delta.total_seconds()))
         hours, remainder = divmod(total, 3600)
         minutes, _ = divmod(remainder, 60)
         if hours > 0 and minutes > 0:
