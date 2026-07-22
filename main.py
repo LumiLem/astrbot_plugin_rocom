@@ -2674,9 +2674,11 @@ class RocomPlugin(Star):
                 max_min = val
         return max_min
 
-    def _next_merchant_check_time(self, now: datetime | None = None) -> tuple[datetime, str]:
+    def _next_merchant_check_time(self, last_scheduled: datetime | None = None) -> tuple[datetime, str]:
         """返回下一个调度时间点及其类型（"open" 或 "ending"）"""
-        current = now or datetime.now(self._cn_tz())
+        current = datetime.now(self._cn_tz())
+        if last_scheduled and last_scheduled > current:
+            current = last_scheduled
         if current.tzinfo is None:
             current = current.replace(tzinfo=self._cn_tz())
         candidates: list[tuple[datetime, str]] = []
@@ -2707,11 +2709,13 @@ class RocomPlugin(Star):
         stop = self._merchant_stop
         iteration = 0
         logger.info(f"[Rocom] 远行商人订阅调度线程已启动（instance={self._instance_id}）")
+        last_scheduled_check = None
         while not stop.is_set():
             iteration += 1
             try:
                 now_ts = time.time()
-                next_check, check_type = self._next_merchant_check_time(None)
+                next_check, check_type = self._next_merchant_check_time(last_scheduled_check)
+                last_scheduled_check = next_check
                 jitter = random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds)
                 # 结束提醒不加 jitter，保证准时
                 if check_type == "ending":
