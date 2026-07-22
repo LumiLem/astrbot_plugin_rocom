@@ -94,6 +94,7 @@ class RocomPlugin(Star):
         self.card_icon_name_map: Dict[str, str] = {}   # id -> icon_resource_name（用于展示名称）
         self.card_skin_map: Dict[str, str] = {}        # id -> skin_resource_path（用于图片 URL）
         self.card_skin_name_map: Dict[str, str] = {}   # id -> skin_resource_name（用于展示名称）
+        self.random_goods_conf_map: Dict[str, Dict[str, Any]] = {}  # 远行商人随机商品 CDN 配置（用于补全价格/限购）
         
         # 自动刷新配置
         self.auto_refresh_enabled = self.config.get("auto_refresh_enabled", False)
@@ -865,14 +866,30 @@ class RocomPlugin(Star):
             return {}
 
     async def _load_card_data(self):
-        """启动后异步加载名片标签、头像与皮肤映射"""
+        """启动后异步加载名片标签、头像、皮肤与远行商人商品 CDN 配置"""
         self.card_label_map = await self._build_card_label_map()
         self.card_icon_map = await self._build_card_icon_map()
         self.card_skin_map = await self._build_card_skin_map()
+        self.random_goods_conf_map = await self._build_random_goods_conf_map()
         logger.info(
-            f"[Rocom] 名片配置加载完成：标签 {len(self.card_label_map)} 条，"
-            f"头像 {len(self.card_icon_map)} 条，皮肤 {len(self.card_skin_map)} 条"
+            f"[Rocom] CDN 配置加载完成：标签 {len(self.card_label_map)} 条，"
+            f"头像 {len(self.card_icon_map)} 条，皮肤 {len(self.card_skin_map)} 条，"
+            f"商人商品 {len(self.random_goods_conf_map)} 条"
         )
+
+    async def _build_random_goods_conf_map(self) -> Dict[str, Dict[str, Any]]:
+        rows = await self._fetch_bindata_rows("RANDOM_GOODS_CONF.json")
+        result: Dict[str, Dict[str, Any]] = {}
+        for key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("goods_name") or row.get("name") or "").strip()
+            if name:
+                result[name] = row
+            item_id = str(row.get("item_id") or row.get("id") or "").strip()
+            if item_id:
+                result[item_id] = row
+        return result
 
     async def _build_card_label_map(self) -> Dict[str, str]:
         rows = await self._fetch_bindata_rows("CARD_LABEL_CONF.json")
@@ -2907,7 +2924,16 @@ class RocomPlugin(Star):
         elif end_ms is not None and now_ms >= end_ms:
             status_label = "已结束"
 
-        raw_price = item.get("price") if item.get("price") not in (None, "") else goods_meta.get("price")
+        cdn_meta = (
+            self.random_goods_conf_map.get(str(item.get("name", "") or "").strip())
+            or self.random_goods_conf_map.get(str(item.get("id", "") or "").strip())
+            or {}
+        )
+
+        raw_price = item.get("price") if item.get("price") not in (None, "", 0, "0") else goods_meta.get("price")
+        if raw_price in (None, "", 0, "0"):
+            raw_price = cdn_meta.get("price")
+
         parsed_price = None
         if raw_price not in (None, ""):
             try:
@@ -2919,9 +2945,12 @@ class RocomPlugin(Star):
 
         raw_limit = (
             item.get("buy_limit_num")
-            if item.get("buy_limit_num") not in (None, "")
+            if item.get("buy_limit_num") not in (None, "", 0, "0")
             else goods_meta.get("buy_limit_num")
         )
+        if raw_limit in (None, "", 0, "0"):
+            raw_limit = cdn_meta.get("buy_limit_num")
+
         parsed_limit = None
         if raw_limit not in (None, ""):
             try:
