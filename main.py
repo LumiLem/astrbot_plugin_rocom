@@ -14,6 +14,7 @@ import zipfile
 from difflib import SequenceMatcher
 import httpx
 from typing import Dict, Any, List, Callable, Awaitable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -33,12 +34,18 @@ from .core.user import (
 from .core.render import Renderer
 from .core.egg_service import EggService, SearchResult
 from .core.font_assets import FontAssetManager
+from .core.ranking_service import build_ranking_render_data, build_ranking_text
+from .core.share_code_service import (
+    build_share_code_render_data,
+    build_share_code_text,
+    extract_share_code,
+)
 from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_ALIAS,
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v3.8.0-custom.3", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.1", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
@@ -52,6 +59,13 @@ class RocomPlugin(Star):
         self._instance_id = f"{id(self):x}"
         self.config = config or {}
         self.copyright = self.config.get("copyright", "AstrBot & WeGame Locke Kingdom Plugin")
+        self.merchant_group_admin_enabled = bool(
+            self.config.get("merchant_group_admin_enabled", True)
+        )
+        self.merchant_bot_admin_enabled = bool(
+            self.config.get("merchant_bot_admin_enabled", True)
+        )
+        self._install_qq_official_role_compat()
         base_url = self.config.get("api_base_url", "https://wegame.shallow.ink")
         wegame_api_key = self.config.get("wegame_api_key", "")
         rkpp_proxy_url = self.config.get("rkpp_proxy_url", "http://localhost:8800")
@@ -127,6 +141,13 @@ class RocomPlugin(Star):
             "merchant_ending_reminder_template",
             "远行商人第{round}轮还有{countdown}结束，别忘了购买：{items}"
         )
+        self.merchant_timezone_name = str(
+            self.config.get("merchant_timezone", "Asia/Shanghai") or "Asia/Shanghai"
+        ).strip()
+        (
+            self._merchant_timezone,
+            self.merchant_timezone_label,
+        ) = self._resolve_merchant_timezone(self.merchant_timezone_name)
         self._merchant_subscription_task = None
         self._merchant_thread = None
         self._merchant_stop = threading.Event()
@@ -473,12 +494,9 @@ class RocomPlugin(Star):
     async def rocom_refresh_all(self, event: AstrMessageEvent):
         """刷新所有用户的凭证（需要 bot 管理员权限，同时非必要不要使用）"""
         # 检查 bot 管理员权限
-        if not event.is_admin():
-            uid = str(event.get_sender_id())
-            allowed = [u.strip() for u in self.config.get("allowed_users", "").split(",") if u.strip()]
-            if uid not in allowed:
-                yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
-                return
+        if not self._is_bot_admin(event):
+            yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
+            return
 
         yield event.plain_result("⚠️ 非必要不要手动刷新凭证，服务端会自动刷新。本指令仅用于调试或强制兜底。\n\n正在刷新所有用户的凭证...")
 
@@ -2649,10 +2667,39 @@ class RocomPlugin(Star):
         if pushed:
             logger.info(f"[Rocom] 公告订阅：本轮推送 {pushed} 个订阅")
 
+    def _resolve_merchant_timezone(self, configured_name: str):
+        """Resolve the merchant timezone without letting a missing tzdata alter the default."""
+        timezone_name = str(configured_name or "").strip() or "Asia/Shanghai"
+        try:
+            return ZoneInfo(timezone_name), (
+                "北京时间" if timezone_name == "Asia/Shanghai" else timezone_name
+            )
+        except (ZoneInfoNotFoundError, ValueError):
+            if timezone_name == "Asia/Shanghai":
+                logger.warning(
+                    "[Rocom] 系统缺少时区数据，远行商人时区使用 UTC+8 固定兜底"
+                )
+                return timezone(timedelta(hours=8), name="Asia/Shanghai"), "北京时间"
+
+            system_timezone = datetime.now().astimezone().tzinfo or timezone.utc
+            system_timezone_name = getattr(system_timezone, "key", None) or str(system_timezone)
+            logger.warning(
+                f"[Rocom] 远行商人时区配置无效：{timezone_name}，回退系统时区 {system_timezone_name}"
+            )
+            return system_timezone, f"系统时区（{system_timezone_name}）"
+
+    def _merchant_tz(self):
+        return self._merchant_timezone
+
+    def _merchant_datetime(self, value: datetime | None = None) -> datetime:
+        if value is None:
+            return datetime.now(self._merchant_tz())
+        if value.tzinfo is None:
+            return value.replace(tzinfo=self._merchant_tz())
+        return value.astimezone(self._merchant_tz())
+
     def _merchant_check_times(self, base: datetime | None = None) -> List[datetime]:
-        now = base or datetime.now(self._cn_tz())
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=self._cn_tz())
+        now = self._merchant_datetime(base)
         return [
             now.replace(hour=8, minute=1, second=0, microsecond=0),
             now.replace(hour=12, minute=1, second=0, microsecond=0),
@@ -2664,9 +2711,7 @@ class RocomPlugin(Star):
         """计算结束提醒时间点：每轮结束前 max_minutes 分钟
         轮次结束时间：12:00, 16:00, 20:00, 24:00（次日 0:00）
         """
-        now = base or datetime.now(self._cn_tz())
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=self._cn_tz())
+        now = self._merchant_datetime(base)
         end_times = [
             now.replace(hour=12, minute=0, second=0, microsecond=0),
             now.replace(hour=16, minute=0, second=0, microsecond=0),
@@ -2693,11 +2738,9 @@ class RocomPlugin(Star):
 
     def _next_merchant_check_time(self, last_scheduled: datetime | None = None) -> tuple[datetime, str]:
         """返回下一个调度时间点及其类型（"open" 或 "ending"）"""
-        current = datetime.now(self._cn_tz())
+        current = self._merchant_datetime()
         if last_scheduled and last_scheduled > current:
             current = last_scheduled
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=self._cn_tz())
         candidates: list[tuple[datetime, str]] = []
         # 开盘检查时间点
         for check_time in self._merchant_check_times(current):
@@ -2740,7 +2783,7 @@ class RocomPlugin(Star):
                 target_ts = next_check.timestamp() + jitter
                 wait_seconds = max(1, target_ts - now_ts)
                 logger.info(
-                    f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 类型={check_type} | 目标 {datetime.fromtimestamp(target_ts, self._cn_tz()).strftime('%Y-%m-%d %H:%M:%S CST')} | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
+                    f"[Rocom] 远行商人订阅线程：迭代 #{iteration} | 类型={check_type} | 目标 {datetime.fromtimestamp(target_ts, self._merchant_tz()).strftime('%Y-%m-%d %H:%M:%S')} {self.merchant_timezone_label}（基准 {next_check.strftime('%H:%M:%S')}，偏移 {jitter:.1f}s） | 等待 {wait_seconds:.0f}s | instance={self._instance_id}"
                 )
                 start_ts = now_ts
                 while True:
@@ -2801,9 +2844,7 @@ class RocomPlugin(Star):
         return "round"
 
     def _current_merchant_round(self, now: datetime | None = None):
-        now = now or datetime.now(self._cn_tz())
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=self._cn_tz())
+        now = self._merchant_datetime(now)
         start = now.replace(hour=8, minute=0, second=0, microsecond=0)
         round_index = None
         round_start = None
@@ -2838,7 +2879,7 @@ class RocomPlugin(Star):
 
     def _format_merchant_time(self, timestamp_ms: Any) -> str:
         try:
-            dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=self._cn_tz())
+            dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=self._merchant_tz())
             return dt.strftime("%m-%d %H:%M")
         except (TypeError, ValueError, OSError):
             return "--"
@@ -2856,11 +2897,95 @@ class RocomPlugin(Star):
             return f"{start_label} - {end_label[6:]}"
         return f"{start_label} - {end_label}"
 
+    @staticmethod
+    def _as_id_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    def _get_bot_admin_ids(self) -> set[str]:
+        admin_ids: set[str] = set()
+        try:
+            admin_ids.update(self._as_id_list(self.context.get_config().get("admins_id", [])))
+        except Exception:
+            pass
+        admin_ids.update(self._as_id_list(self.config.get("allowed_users", "")))
+        return admin_ids
+
+    def _is_bot_admin(self, event: AstrMessageEvent) -> bool:
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        sender_id = str(event.get_sender_id() or "").strip()
+        return bool(sender_id and sender_id in self._get_bot_admin_ids())
+
+    @staticmethod
+    def _install_qq_official_role_compat() -> None:
+        """保留旧 qq-botpy 丢弃的官方群消息 author.member_role 字段。"""
+        try:
+            import botpy.message
+
+            user_type = botpy.message.GroupMessage._User
+            original_init = user_type.__init__
+            if getattr(original_init, "_rocom_role_compat", False):
+                return
+
+            def init_with_role(user, data):
+                original_init(user, data)
+                if isinstance(data, dict):
+                    role = data.get("member_role") or data.get("role")
+                    if role:
+                        try:
+                            user.member_role = role
+                        except Exception:
+                            pass
+
+            init_with_role._rocom_role_compat = True
+            user_type.__init__ = init_with_role
+        except Exception:
+            # 未安装官方适配器依赖时不影响其他平台加载插件。
+            return
+
+    @staticmethod
+    def _read_field(value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(key)
+        return getattr(value, key, None)
+
+    def _qq_official_member_role(self, event: AstrMessageEvent) -> str:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        raw_sources = [
+            raw,
+            getattr(raw, "raw_data", None),
+            getattr(raw, "data", None),
+        ]
+        candidates = [event.get_extra("member_role", None)]
+        for source in raw_sources:
+            if source is None:
+                continue
+            candidates.extend(
+                [
+                    self._read_field(source, "member_role"),
+                    self._read_field(source, "role"),
+                    self._read_field(self._read_field(source, "author"), "member_role"),
+                    self._read_field(self._read_field(source, "author"), "role"),
+                    self._read_field(self._read_field(source, "member"), "member_role"),
+                    self._read_field(self._read_field(source, "member"), "role"),
+                ]
+            )
+        for role in candidates:
+            if isinstance(role, str) and role.strip():
+                return role.strip().lower()
+        return ""
+
     async def _is_group_admin(self, event: AstrMessageEvent) -> bool:
         if event.is_private_chat():
             return False
         sender_id = str(event.get_sender_id())
-        role = str(getattr(event, "role", "") or "").lower()
         try:
             group = await event.get_group()
             if group:
@@ -2875,13 +3000,22 @@ class RocomPlugin(Star):
                 admins = [str(x) for x in getattr(group, "group_admins", [])]
                 if sender_id in admins:
                     return True
-
-                # 允许 bot 管理员通过；群信息优先，事件角色作为补充
-                if role in {"admin", "owner"}:
-                    return True
         except Exception:
-            if role in {"admin", "owner"}:
-                return True
+            pass
+
+        if str(event.get_platform_name() or "").lower() in {
+            "qq_official",
+            "qq_official_webhook",
+        }:
+            return self._qq_official_member_role(event) in {"admin", "owner"}
+        return False
+
+    async def _has_subscription_admin_permission(self, event: AstrMessageEvent) -> bool:
+        """根据独立开关判断群管理员与 Bot 管理员的订阅配置权限。"""
+        if self.merchant_bot_admin_enabled and self._is_bot_admin(event):
+            return True
+        if self.merchant_group_admin_enabled and await self._is_group_admin(event):
+            return True
         return False
 
 
@@ -2979,7 +3113,7 @@ class RocomPlugin(Star):
         products: List[Dict[str, Any]],
         now_ms: int,
     ) -> List[Dict[str, Any]]:
-        today = datetime.fromtimestamp(now_ms / 1000, tz=self._cn_tz()).strftime("%Y-%m-%d")
+        today = datetime.fromtimestamp(now_ms / 1000, tz=self._merchant_tz()).strftime("%Y-%m-%d")
         grouped: Dict[str, Dict[str, Any]] = {}
         for product in products:
             if product.get("is_active"):
@@ -2987,7 +3121,7 @@ class RocomPlugin(Star):
             start_ms = self._merchant_timestamp_ms(product.get("start_ms"))
             if start_ms is None:
                 continue
-            start_dt = datetime.fromtimestamp(start_ms / 1000, tz=self._cn_tz())
+            start_dt = datetime.fromtimestamp(start_ms / 1000, tz=self._merchant_tz())
             if start_dt.strftime("%Y-%m-%d") != today:
                 continue
             key = f"{start_ms}-{product.get('end_ms') or ''}"
@@ -3024,7 +3158,7 @@ class RocomPlugin(Star):
         products = []
         all_products = []
         fallback_icon = "{{_res_path}}img/logo.cVSpb3sL.png"
-        now_ms = int(datetime.now(self._cn_tz()).timestamp() * 1000)
+        now_ms = int(self._merchant_datetime().timestamp() * 1000)
         random_goods = payload.get("random_goods") if isinstance(payload.get("random_goods"), list) else []
         goods_meta_by_name = {
             str(item.get("goods_name", "") or item.get("name", "")).strip(): item
@@ -3079,7 +3213,8 @@ class RocomPlugin(Star):
             "titleIcon": True,
             "title": (activity or {}).get("name", "远行商人"),
             "subtitle": (activity or {}).get("start_date", "每日 08:00 / 12:00 / 16:00 / 20:00 刷新"),
-            "product_count": len(products),
+            "product_count": len(products or []),
+            "timezone_label": self.merchant_timezone_label,
             "round_info": round_info or self._current_merchant_round(),
             "products": products,
             "categories": categories,
@@ -4545,14 +4680,18 @@ class RocomPlugin(Star):
                         {"cmd": "洛克档案", "desc": "生成个人数据名片"},
                         {"cmd": "洛克战绩 <页码>", "desc": "查询并展示近期的对战场次记录"},
                         {"cmd": "洛克背包 <筛选> <页码>", "desc": "查看精灵收集 (筛选:全部/异色/了不起/炫彩，参数可交换)"},
+                        {"cmd": "异色排行榜 [UID] [数量]", "desc": "查看异色精灵收集排行榜，可附带指定玩家名次"},
+                        {"cmd": "炫彩排行榜 [UID] [数量]", "desc": "查看炫彩精灵收集排行榜，可附带指定玩家名次"},
                         {"cmd": "洛克阵容 <分类> <页码>", "desc": "查看阵容助手推荐阵容 (参数可交换)"},
+                        {"cmd": "阵容码 解析 <分享码/链接>", "desc": "解析阵容分享码并可视化精灵、血脉、性格、天赋和技能"},
+                        {"cmd": "阵容码 查询 <分享码>", "desc": "查询后端已记录的阵容分享码及解析次数"},
                         {"cmd": "洛克交换大厅 <页码>", "desc": "查看交换大厅海报 (支持别名：洛克大厅/交换大厅)"},
                         {"cmd": "远行商人", "desc": "查看当前轮次远行商人商品及剩余时间"},
                         {"cmd": "洛克公告 [页码]", "desc": "查询洛克王国公告列表"},
                         {"cmd": "洛克公告详情 <公告ID>", "desc": "查看指定公告详情"},
                         {"cmd": "洛克公告最新", "desc": "查看最新一条公告"},
                         {"cmd": "洛克活动日历", "desc": "查询 activities/info 活动日历"},
-                        {"cmd": "订阅洛克公告", "desc": "订阅新公告推送（群聊需群主/群管/bot管理员）"},
+                        {"cmd": "订阅洛克公告", "desc": "订阅新公告推送（群聊需已开启的群管理员或 Bot 管理员权限）"},
                         {"cmd": "取消订阅洛克公告", "desc": "关闭当前会话的新公告推送"},
                         {"cmd": "洛克商店 <shop_id>", "desc": "实验性：查询商店信息，接口返回暂不稳定"},
                         {"cmd": "洛克玩家 [UID]", "desc": "通过 ingame 队列接口查询玩家基础信息"},
@@ -4562,7 +4701,7 @@ class RocomPlugin(Star):
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
                         {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
-                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部] [-N/-*N/-@N/-@*N]", "desc": "订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推，-N=珍稀商品结束提醒，-*N=全部商品结束提醒，-@N=结束强提醒"},
+                        {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部] [-N/-*N/-@N/-@*N]", "desc": "已开启权限的群管理员或 Bot 管理员可订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推，-N=结束提醒"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群/私聊远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
@@ -4993,12 +5132,9 @@ class RocomPlugin(Star):
     async def rocom_cleanup_bindings(self, event: AstrMessageEvent):
         """删除所有人的无效绑定（需要 bot 管理员权限）"""
         # 检查 bot 管理员权限
-        if not event.is_admin():
-            uid = str(event.get_sender_id())
-            allowed = [u.strip() for u in self.config.get("allowed_users", "").split(",") if u.strip()]
-            if uid not in allowed:
-                yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
-                return
+        if not self._is_bot_admin(event):
+            yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
+            return
 
         yield event.plain_result("正在检查所有用户的绑定有效性...")
 
@@ -5766,8 +5902,8 @@ class RocomPlugin(Star):
     @filter.command("订阅洛克公告")
     async def subscribe_announcement(self, event: AstrMessageEvent):
         """订阅洛克王国新公告提醒"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以配置洛克公告订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以配置洛克公告订阅。")
             return
         key = str(event.unified_msg_origin)
         latest = await self.client.get_announcement_latest()
@@ -5791,8 +5927,8 @@ class RocomPlugin(Star):
     @filter.command("取消订阅洛克公告")
     async def unsubscribe_announcement(self, event: AstrMessageEvent):
         """取消洛克王国新公告提醒"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以取消洛克公告订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以取消洛克公告订阅。")
             return
         key = str(event.unified_msg_origin)
         deleted = await self.announcement_sub_mgr.delete_subscription(key)
@@ -6347,8 +6483,8 @@ class RocomPlugin(Star):
     @filter.command("订阅家园菜园")
     async def subscribe_home_garden(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园菜园成熟提醒"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以配置家园菜园订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园菜园订阅。")
             return
         uid = await self._resolve_home_uid(event, uid)
         if not uid:
@@ -6373,8 +6509,8 @@ class RocomPlugin(Star):
     @filter.command("订阅家园灵感")
     async def subscribe_home_inspiration(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园精灵灵感完成提醒"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以配置家园灵感订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园灵感订阅。")
             return
         uid = await self._resolve_home_uid(event, uid)
         if not uid:
@@ -6399,8 +6535,8 @@ class RocomPlugin(Star):
     @filter.command("订阅家园生蛋")
     async def subscribe_home_egg(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园精灵生蛋提醒"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以配置家园生蛋订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园生蛋订阅。")
             return
         uid = await self._resolve_home_uid(event, uid)
         if not uid:
@@ -6425,8 +6561,8 @@ class RocomPlugin(Star):
     @filter.command("取消订阅家园")
     async def unsubscribe_home(self, event: AstrMessageEvent, kind: str = "全部", uid: str = ""):
         """取消家园菜园、灵感或生蛋订阅"""
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以取消家园订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以取消家园订阅。")
             return
         kind_map = {
             "菜园": "garden",
@@ -6548,8 +6684,8 @@ class RocomPlugin(Star):
             return
         
         # 检查权限：群聊需要管理员，私聊无权限限制
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以配置远行商人订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以配置远行商人订阅。")
             return
         
         # 从 event.message_str 中提取完整参数，避免 AstrBot 按空格拆分
@@ -6681,8 +6817,8 @@ class RocomPlugin(Star):
             yield event.plain_result("个人私聊订阅功能已被禁用，但仍可取消已有订阅。")
         
         # 检查权限：群聊需要管理员，私聊无权限限制
-        if not event.is_private_chat() and not await self._is_group_admin(event):
-            yield event.plain_result("仅当前群管理员可以取消远行商人订阅。")
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            yield event.plain_result("仅群管理员或 Bot 管理员可以取消远行商人订阅。")
             return
         
         # 确定订阅键
@@ -6848,6 +6984,261 @@ class RocomPlugin(Star):
             yield event.image_result(img_url)
         else:
             yield event.plain_result("阵容详情渲染失败。")
+
+    async def _resolve_ranking_args(
+        self,
+        event: AstrMessageEvent,
+        command_names: List[str],
+        arg1: str | None,
+        arg2: str | None,
+    ) -> tuple[str, int]:
+        raw_text = self._extract_command_args_text(event, command_names)
+        tokens = raw_text.split() if raw_text else [
+            str(item).strip() for item in (arg1, arg2) if item is not None and str(item).strip()
+        ]
+        if len(tokens) > 2:
+            raise ValueError("参数过多，用法：/<排行榜> [UID] [数量]")
+
+        uid = ""
+        limit = 10
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token.isdigit() and 1 <= int(token) <= 50:
+                limit = int(token)
+            else:
+                uid = token
+        elif len(tokens) == 2:
+            uid, raw_limit = tokens
+            if not raw_limit.isdigit():
+                raise ValueError("数量必须是 1-50 的整数")
+            limit = int(raw_limit)
+
+        if uid and not uid.isdigit():
+            raise ValueError("UID 只能包含数字")
+        if not 1 <= limit <= 50:
+            raise ValueError("数量仅支持 1-50")
+        if not uid:
+            uid = await self._resolve_home_uid(event)
+        return uid, limit
+
+    async def _render_pet_collection_ranking(
+        self,
+        event: AstrMessageEvent,
+        rank_type: str,
+        command_names: List[str],
+        arg1: str | None,
+        arg2: str | None,
+    ):
+        try:
+            uid, limit = await self._resolve_ranking_args(
+                event, command_names, arg1, arg2
+            )
+        except ValueError as exc:
+            return event.plain_result(str(exc))
+
+        payload = await self.client.get_pet_collection_ranking(
+            rank_type,
+            limit=limit,
+            uid=uid,
+            resolve_names=True,
+        )
+        label = "异色" if rank_type == "shining" else "炫彩"
+        if payload is None:
+            return event.plain_result(
+                f"{label}排行榜查询失败：{self.client.get_last_error()}"
+            )
+
+        data = build_ranking_render_data(
+            payload,
+            rank_type,
+            self.client.base_url,
+            requested_uid=uid,
+        )
+        if not data.get("items"):
+            return event.plain_result(f"{label}排行榜当前暂无数据。")
+
+        image_path = await self.renderer.render_html(
+            "render/pet-ranking/index.html",
+            data,
+            options={
+                "image_format": "jpeg",
+                "image_quality": 88,
+                "device_scale_factor": 1.0,
+                "viewport_width": 1080,
+                "image_wait_timeout": 8000,
+                "screenshot_scale": "css",
+            },
+        )
+        if image_path:
+            return event.image_result(image_path)
+        return event.plain_result(build_ranking_text(data))
+
+    @filter.command("异色排行榜", alias={"异色榜", "洛克异色排行榜"})
+    async def rocom_shining_ranking(
+        self,
+        event: AstrMessageEvent,
+        arg1: str = None,
+        arg2: str = None,
+    ):
+        """查看异色精灵收集排行榜。"""
+        yield await self._render_pet_collection_ranking(
+            event,
+            "shining",
+            ["洛克异色排行榜", "异色排行榜", "异色榜"],
+            arg1,
+            arg2,
+        )
+
+    @filter.command("炫彩排行榜", alias={"炫彩榜", "洛克炫彩排行榜"})
+    async def rocom_glass_ranking(
+        self,
+        event: AstrMessageEvent,
+        arg1: str = None,
+        arg2: str = None,
+    ):
+        """查看炫彩精灵收集排行榜。"""
+        yield await self._render_pet_collection_ranking(
+            event,
+            "glass",
+            ["洛克炫彩排行榜", "炫彩排行榜", "炫彩榜"],
+            arg1,
+            arg2,
+        )
+
+    @filter.command_group("阵容码")
+    def rocom_share_code(self):
+        """阵容分享码解析与查询。"""
+        pass
+
+    def _share_code_arg(
+        self,
+        event: AstrMessageEvent,
+        command_names: List[str],
+        fallback: str | None,
+    ) -> str:
+        raw_text = self._extract_command_args_text(event, command_names)
+        return extract_share_code(raw_text or fallback or "")
+
+    async def _render_share_code_result(
+        self,
+        event: AstrMessageEvent,
+        payload: Dict[str, Any] | None,
+        source: str,
+        record: Dict[str, Any] | None = None,
+    ):
+        data = build_share_code_render_data(
+            payload,
+            source,
+            record=record,
+            base_url=self.client.base_url,
+        )
+        if not data.get("teams"):
+            return event.plain_result("阵容码中没有可展示的精灵数据。")
+
+        image_path = await self.renderer.render_html(
+            "render/share-code-team/index.html",
+            data,
+            options={
+                "image_format": "jpeg",
+                "image_quality": 88,
+                "device_scale_factor": 1.0,
+                "viewport_width": 1240,
+                "image_wait_timeout": 10000,
+                "screenshot_scale": "css",
+            },
+        )
+        if image_path:
+            return event.image_result(image_path)
+        return event.plain_result(build_share_code_text(data))
+
+    @rocom_share_code.command("解析")
+    async def rocom_share_code_parse(
+        self,
+        event: AstrMessageEvent,
+        share_code: str = None,
+    ):
+        """解析阵容分享码。"""
+        code = self._share_code_arg(
+            event,
+            ["阵容码 解析", "阵容码解析"],
+            share_code,
+        )
+        if not code:
+            yield event.plain_result(
+                "请提供阵容分享码或含 shareData 的链接。\n"
+                "用法：/阵容码 解析 <分享码或链接>"
+            )
+            return
+
+        payload = await self.client.parse_share_code(
+            code,
+            user_identifier=self._get_user_identifier(event),
+        )
+        if payload is None:
+            yield event.plain_result(
+                f"阵容码解析失败：{self.client.get_last_error()}"
+            )
+            return
+        yield await self._render_share_code_result(event, payload, "parse")
+
+    @rocom_share_code.command("查询")
+    async def rocom_share_code_query(
+        self,
+        event: AstrMessageEvent,
+        share_code: str = None,
+    ):
+        """查询后端记录的阵容分享码。"""
+        code = self._share_code_arg(
+            event,
+            ["阵容码 查询", "阵容码查询"],
+            share_code,
+        )
+        if not code:
+            yield event.plain_result(
+                "请提供要查询的阵容分享码。\n"
+                "用法：/阵容码 查询 <分享码>"
+            )
+            return
+
+        records = await self.client.get_share_code_records(
+            share_code=code,
+            page_no=1,
+            page_size=1,
+            user_identifier=self._get_user_identifier(event),
+        )
+        if records is None:
+            yield event.plain_result(
+                f"阵容码查询失败：{self.client.get_last_error()}"
+            )
+            return
+
+        items = records.get("items") or []
+        if not items:
+            yield event.plain_result(
+                "后端尚未记录该阵容码。可先使用 /阵容码 解析 <分享码>。"
+            )
+            return
+
+        record = items[0] if isinstance(items[0], dict) else {}
+        record_payload = record.get("share_code")
+        payload = record_payload if isinstance(record_payload, dict) else None
+        if not payload or not payload.get("teams"):
+            payload = await self.client.parse_share_code(
+                code,
+                user_identifier=self._get_user_identifier(event),
+            )
+        if payload is None:
+            yield event.plain_result(
+                "已找到该阵容码记录，但当前无法还原阵容详情："
+                f"{self.client.get_last_error()}"
+            )
+            return
+        yield await self._render_share_code_result(
+            event,
+            payload,
+            "record",
+            record=record,
+        )
 
     @filter.command("洛克阵容", alias={"阵容"})
     async def rocom_lineup(self, event: AstrMessageEvent, arg1: str = None, arg2: str = None):
