@@ -45,7 +45,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.1", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.2", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
@@ -2187,58 +2187,69 @@ class RocomPlugin(Star):
                     pass
             return None
 
-    def _slice_and_compress_image(self, path: str, max_height: int = 15000, max_bytes: int = 8 * 1024 * 1024) -> List[str]:
+    def _slice_and_compress_image(self, path: str, max_height: int = 20000, max_bytes: int = 9 * 1024 * 1024) -> List[str]:
         """处理大图：如果高度过长则切片，然后对每个切片进行压缩（转JPEG、按需降质或缩放）。返回处理后的本地路径列表。"""
         try:
             from PIL import Image as PILImage
             old_max = PILImage.MAX_IMAGE_PIXELS
             PILImage.MAX_IMAGE_PIXELS = 300_000_000
-            
+
+            def _to_rgb(image: PILImage.Image) -> PILImage.Image:
+                if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+                    rgba = image.convert("RGBA")
+                    bg = PILImage.new("RGB", rgba.size, (255, 255, 255))
+                    bg.paste(rgba, mask=rgba.split()[3])
+                    return bg
+                return image.convert("RGB")
+
             result_paths = []
             try:
-                img = PILImage.open(path)
-                w, h = img.size
-                
-                # 如果不需要切片，且文件本身较小且已经是 jpeg，则直接返回
-                if h <= max_height and os.path.getsize(path) <= max_bytes and path.lower().endswith((".jpg", ".jpeg")) and w * h <= 25_000_000:
-                    return [path]
-                
-                if h > max_height:
-                    slices = (h + max_height - 1) // max_height
-                    logger.info(f"[Rocom] 图片过长 ({w}x{h})，开始切片，共 {slices} 张")
-                    for i in range(slices):
-                        top = i * max_height
-                        bottom = min((i + 1) * max_height, h)
-                        box = (0, top, w, bottom)
-                        slice_img = img.crop(box)
-                        
-                        slice_path = f"{path.rsplit('.', 1)[0]}_slice_{i}.jpg"
-                        slice_w, slice_h = slice_img.size
-                        max_pixels = 25_000_000
-                        if slice_w * slice_h > max_pixels:
-                            ratio = (max_pixels / (slice_w * slice_h)) ** 0.5
-                            new_w, new_h = int(slice_w * ratio), int(slice_h * ratio)
-                            slice_img = slice_img.resize((new_w, new_h), PILImage.LANCZOS)
-                        
-                        slice_img.convert("RGB").save(slice_path, "JPEG", quality=80)
-                        if os.path.getsize(slice_path) > max_bytes:
-                            slice_img.convert("RGB").save(slice_path, "JPEG", quality=45)
-                        result_paths.append(slice_path)
-                else:
-                    max_pixels = 25_000_000
-                    if w * h > max_pixels:
-                        ratio = (max_pixels / (w * h)) ** 0.5
-                        new_w, new_h = int(w * ratio), int(h * ratio)
-                        img = img.resize((new_w, new_h), PILImage.LANCZOS)
-                        logger.info(f"[Rocom] 图片缩放: {w}x{h} → {new_w}x{new_h}")
+                with PILImage.open(path) as img:
+                    w, h = img.size
                     
-                    jpg_path = f"{path.rsplit('.', 1)[0]}_compressed.jpg"
-                    img.convert("RGB").save(jpg_path, "JPEG", quality=80)
-                    if os.path.getsize(jpg_path) > max_bytes:
-                        img.convert("RGB").save(jpg_path, "JPEG", quality=45)
-                    result_paths.append(jpg_path)
+                    # 如果不需要切片，且文件本身较小且已经是 jpeg，则直接返回
+                    if h <= max_height and os.path.getsize(path) <= max_bytes and path.lower().endswith((".jpg", ".jpeg")) and w * h <= 35_000_000:
+                        return [path]
                     
-                return result_paths
+                    if h > max_height:
+                        slices = (h + max_height - 1) // max_height
+                        logger.info(f"[Rocom] 图片过长 ({w}x{h})，开始切片，共 {slices} 张")
+                        for i in range(slices):
+                            top = i * max_height
+                            bottom = min((i + 1) * max_height, h)
+                            box = (0, top, w, bottom)
+                            slice_img = img.crop(box)
+                            
+                            slice_path = f"{path.rsplit('.', 1)[0]}_slice_{i}.jpg"
+                            slice_w, slice_h = slice_img.size
+                            max_pixels = 35_000_000
+                            if slice_w * slice_h > max_pixels:
+                                ratio = (max_pixels / (slice_w * slice_h)) ** 0.5
+                                new_w, new_h = int(slice_w * ratio), int(slice_h * ratio)
+                                slice_img = slice_img.resize((new_w, new_h), PILImage.LANCZOS)
+                            
+                            rgb_slice = _to_rgb(slice_img)
+                            rgb_slice.save(slice_path, "JPEG", quality=80)
+                            if os.path.getsize(slice_path) > max_bytes:
+                                rgb_slice.save(slice_path, "JPEG", quality=45)
+                            result_paths.append(slice_path)
+                    else:
+                        max_pixels = 35_000_000
+                        target_img = img
+                        if w * h > max_pixels:
+                            ratio = (max_pixels / (w * h)) ** 0.5
+                            new_w, new_h = int(w * ratio), int(h * ratio)
+                            target_img = target_img.resize((new_w, new_h), PILImage.LANCZOS)
+                            logger.info(f"[Rocom] 图片缩放: {w}x{h} → {new_w}x{new_h}")
+                        
+                        jpg_path = f"{path.rsplit('.', 1)[0]}_compressed.jpg"
+                        rgb_img = _to_rgb(target_img)
+                        rgb_img.save(jpg_path, "JPEG", quality=80)
+                        if os.path.getsize(jpg_path) > max_bytes:
+                            rgb_img.save(jpg_path, "JPEG", quality=45)
+                        result_paths.append(jpg_path)
+                        
+                    return result_paths
             finally:
                 PILImage.MAX_IMAGE_PIXELS = old_max
         except Exception as e:
@@ -5843,7 +5854,9 @@ class RocomPlugin(Star):
         )
         components = []
         if img_url:
-            components.append(Image.fromFileSystem(img_url))
+            img_urls = self._slice_and_compress_image(img_url)
+            for u in img_urls:
+                components.append(Image.fromFileSystem(u))
         else:
             components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
         yield event.chain_result(components)
@@ -5868,7 +5881,9 @@ class RocomPlugin(Star):
         )
         components = []
         if img_url:
-            components.append(Image.fromFileSystem(img_url))
+            img_urls = self._slice_and_compress_image(img_url)
+            for u in img_urls:
+                components.append(Image.fromFileSystem(u))
         else:
             components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
         yield event.chain_result(components)
