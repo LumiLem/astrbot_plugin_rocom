@@ -308,6 +308,14 @@ class RocomPlugin(Star):
         await self.client.close()
         await self.renderer.close()
 
+    async def _record_active_user(self, event: AstrMessageEvent):
+        """静默记录用户的活跃会话源"""
+        try:
+            if event and hasattr(event, "unified_msg_origin") and event.unified_msg_origin:
+                await self.active_user_mgr.record_user(str(event.unified_msg_origin))
+        except Exception as e:
+            logger.debug(f"[Rocom] 记录活跃用户失败: {e}")
+
     async def _send_and_get_msg_id(self, event: AstrMessageEvent, obmsg: list):
         """发送消息并获取 ID 以支持撤回"""
         try:
@@ -493,6 +501,7 @@ class RocomPlugin(Star):
     @filter.command("洛克刷新所有凭证")
     async def rocom_refresh_all(self, event: AstrMessageEvent):
         """刷新所有用户的凭证（需要 bot 管理员权限，同时非必要不要使用）"""
+        await self._record_active_user(event)
         # 检查 bot 管理员权限
         if not self._is_bot_admin(event):
             yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
@@ -1752,7 +1761,8 @@ class RocomPlugin(Star):
                                     if umo := sub.get("umo"): umos[umo] = key
                             
                             if target_active:
-                                active_users = await self.active_user_mgr.get_active_users(30)
+                                active_days = int(task.get("active_days", 0) or 0)
+                                active_users = await self.active_user_mgr.get_active_users(active_days)
                                 for umo in active_users:
                                     umos[umo] = umo
                                 
@@ -4670,6 +4680,7 @@ class RocomPlugin(Star):
     @filter.command("洛克")
     async def rocom_help(self, event: AstrMessageEvent):
         """洛克王国帮助菜单"""
+        await self._record_active_user(event)
         menu_groups = [
                 {
                     "groupTitle": "账号管理与登录",
@@ -4837,6 +4848,7 @@ class RocomPlugin(Star):
     @filter.command("洛克QQ登录", alias={"洛克qq登录"})
     async def rocom_qq_login(self, event: AstrMessageEvent):
         """QQ 扫码登录"""
+        await self._record_active_user(event)
         user_id = event.get_sender_id()
         qr_data = await self.client.qq_qr_login(user_id)
         if not qr_data or "qr_image" not in qr_data:
@@ -4904,6 +4916,7 @@ class RocomPlugin(Star):
     @filter.command("洛克微信登录")
     async def rocom_wechat_login(self, event: AstrMessageEvent):
         """微信扫码登录"""
+        await self._record_active_user(event)
         user_id = event.get_sender_id()
         qr_data = await self.client.wechat_qr_login(user_id)
         if not qr_data or "qr_image" not in qr_data:
@@ -4962,6 +4975,7 @@ class RocomPlugin(Star):
     @filter.command("洛克导入")
     async def rocom_import(self, event: AstrMessageEvent, tgp_id: str, tgp_ticket: str):
         """导入 WeGame 凭证"""
+        await self._record_active_user(event)
         user_id = event.get_sender_id()
         res = await self.client.import_token(tgp_id, tgp_ticket, user_id)
         if not res or not res.get("frameworkToken"):
@@ -4975,6 +4989,7 @@ class RocomPlugin(Star):
     @filter.command("洛克绑定UID", alias={"绑定UID", "洛克绑定uid", "绑定uid"})
     async def rocom_bind_uid(self, event: AstrMessageEvent, uid: str = ""):
         """直接绑定洛克角色 UID（无需登录），用于玩家/家园等公开查询"""
+        await self._record_active_user(event)
         uid = str(uid or "").strip()
         if not uid:
             yield event.plain_result("格式：/洛克绑定UID <UID>\nUID 即角色资料中的 ID（role.id）。")
@@ -5048,6 +5063,7 @@ class RocomPlugin(Star):
     @filter.command("洛克绑定列表", alias={"绑定列表"})
     async def rocom_bind_list(self, event: AstrMessageEvent):
         """查看已绑定账号列表"""
+        await self._record_active_user(event)
         bindings = await self.user_mgr.get_user_bindings(event.get_sender_id())
         if not bindings:
             yield event.plain_result("暂无绑定账号。")
@@ -5092,6 +5108,7 @@ class RocomPlugin(Star):
     @filter.command("洛克切换")
     async def rocom_switch(self, event: AstrMessageEvent, index: int):
         """切换活跃主账号"""
+        await self._record_active_user(event)
         ok = await self.user_mgr.switch_primary(event.get_sender_id(), index)
         if ok:
             yield event.plain_result(f"成功切换到序号 {index} 账号。")
@@ -5101,6 +5118,7 @@ class RocomPlugin(Star):
     @filter.command("洛克解绑")
     async def rocom_unbind(self, event: AstrMessageEvent, index: int):
         """解绑并在本地移除账号"""
+        await self._record_active_user(event)
         removed = await self.user_mgr.delete_user_binding(event.get_sender_id(), index)
         if removed:
             await self.client.delete_binding(removed.get("binding_id", ""), event.get_sender_id())
@@ -5111,6 +5129,7 @@ class RocomPlugin(Star):
     @filter.command("洛克刷新")
     async def rocom_refresh(self, event: AstrMessageEvent):
         """刷新当前主账号凭证（非必要不要使用）"""
+        await self._record_active_user(event)
         user_id = event.get_sender_id()
         binding = await self.user_mgr.get_primary_binding(user_id)
         if not binding:
@@ -5142,6 +5161,7 @@ class RocomPlugin(Star):
     @filter.command("洛克删除无效绑定")
     async def rocom_cleanup_bindings(self, event: AstrMessageEvent):
         """删除所有人的无效绑定（需要 bot 管理员权限）"""
+        await self._record_active_user(event)
         # 检查 bot 管理员权限
         if not self._is_bot_admin(event):
             yield event.plain_result("⚠️ 此指令仅限 bot 管理员使用。")
@@ -5207,7 +5227,7 @@ class RocomPlugin(Star):
     @filter.command("洛克档案", alias={"档案"})
     async def rocom_profile(self, event: AstrMessageEvent):
         """查看个人档案"""
-        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
+        await self._record_active_user(event)
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -5432,6 +5452,7 @@ class RocomPlugin(Star):
     @filter.command("洛克战绩")
     async def rocom_battle_record(self, event: AstrMessageEvent, page: str = "1"):
         """查看对战战绩"""
+        await self._record_active_user(event)
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -5519,6 +5540,7 @@ class RocomPlugin(Star):
     @filter.command("洛克背包", alias={"背包"})
     async def rocom_package(self, event: AstrMessageEvent, arg1: str = None, arg2: str = None):
         """查看个人洛克王国精灵背包"""
+        await self._record_active_user(event)
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -5634,7 +5656,7 @@ class RocomPlugin(Star):
     @filter.command("洛克wiki", alias={"洛克百科"})
     async def rocom_wiki(self, event: AstrMessageEvent, name: str = ""):
         """查询 Wiki"""
-        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
+        await self._record_active_user(event)
         catalog, query, page_no = self._parse_wiki_command(event, name)
         raw_text = self._extract_command_args_text(event, ["洛克wiki", "洛克百科"]) or str(name or "").strip()
         raw_key = raw_text.strip().lower()
@@ -5804,6 +5826,7 @@ class RocomPlugin(Star):
     @filter.command("洛克技能", alias={"技能 wiki"})
     async def rocom_skill(self, event: AstrMessageEvent, name: str = "圣光斩"):
         """查询技能 wiki"""
+        await self._record_active_user(event)
         yield event.plain_result(
             f"技能 wiki 接口当前已在新版后端文档中暂时关闭，插件侧已暂停调用。\n"
             f"你查询的是：{name}\n"
@@ -5813,6 +5836,7 @@ class RocomPlugin(Star):
     @filter.command("洛克公告")
     async def rocom_announcement_list(self, event: AstrMessageEvent, page: int = 1):
         """查询洛克王国公告列表"""
+        await self._record_active_user(event)
         try:
             page = max(int(page or 1), 1)
         except (TypeError, ValueError):
@@ -5836,6 +5860,7 @@ class RocomPlugin(Star):
     @filter.command("洛克公告详情")
     async def rocom_announcement_detail(self, event: AstrMessageEvent, thread_id: str = ""):
         """查询洛克王国公告详情"""
+        await self._record_active_user(event)
         thread_id = str(thread_id or "").strip()
         if not thread_id:
             yield event.plain_result("请提供公告 ID。用法：/洛克公告详情 <公告ID>")
@@ -5868,6 +5893,7 @@ class RocomPlugin(Star):
     @filter.command("洛克公告最新")
     async def rocom_announcement_latest(self, event: AstrMessageEvent):
         """查询最新洛克王国公告"""
+        await self._record_active_user(event)
         res = await self.client.get_announcement_latest()
         if not res:
             yield event.plain_result(f"获取最新公告失败：{self.client.get_last_error()}")
@@ -5895,6 +5921,7 @@ class RocomPlugin(Star):
     @filter.command("洛克活动日历", alias={"洛克活动", "洛克日历"})
     async def rocom_activity_calendar(self, event: AstrMessageEvent):
         """查询洛克王国活动日历"""
+        await self._record_active_user(event)
         res = await self.client.get_activities_info()
         if not res:
             yield event.plain_result(f"获取活动日历失败：{self.client.get_last_error()}")
@@ -5917,6 +5944,7 @@ class RocomPlugin(Star):
     @filter.command("订阅洛克公告")
     async def subscribe_announcement(self, event: AstrMessageEvent):
         """订阅洛克王国新公告提醒"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以配置洛克公告订阅。")
             return
@@ -5942,6 +5970,7 @@ class RocomPlugin(Star):
     @filter.command("取消订阅洛克公告")
     async def unsubscribe_announcement(self, event: AstrMessageEvent):
         """取消洛克王国新公告提醒"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以取消洛克公告订阅。")
             return
@@ -5955,6 +5984,7 @@ class RocomPlugin(Star):
     @filter.command("洛克群发公告")
     async def rocom_broadcast(self, event: AstrMessageEvent):
         """管理员向所有订阅用户群发图文公告"""
+        await self._record_active_user(event)
         if not event.is_admin():
             yield event.plain_result("该指令仅供机器人管理员使用。")
             return
@@ -5971,6 +6001,7 @@ class RocomPlugin(Star):
         target_sub = True
         target_active = False
         target_override = False
+        active_days = 0
         
         for comp in event.message_obj.message:
             if isinstance(comp, Plain):
@@ -5982,9 +6013,11 @@ class RocomPlugin(Star):
                         u_match = re.match(r'^-u\s+([\w,-]+)\s*', text)
                         d_match = re.match(r'^-d\s+(\d+)(?:m|分钟)?\s*', text)
                         t_match = re.match(r'^-t\s+(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}|\d{2}:\d{2})\s*', text)
+                        ag_match = re.match(r'^-(?:ag|ga)(?:\s+(\d+|all))?\s*', text, re.IGNORECASE)
                         a_match = re.match(r'^-a\s*', text)
-                        g_match = re.match(r'^-(?:g|-global)\s*', text)
-                        c_match = re.match(r'^--active\s*', text)
+                        g_match = re.match(r'^-(?:g|-global)(?:\s+(\d+|all))?\s*', text, re.IGNORECASE)
+                        c_match = re.match(r'^--(?:active|c)(?:\s+(\d+|all))?\s*', text, re.IGNORECASE)
+                        days_match = re.match(r'^--days\s+(\d+|all)\s*', text, re.IGNORECASE)
                         s_match = re.match(r'^--sub\s*', text)
                         
                         if u_match:
@@ -6008,6 +6041,17 @@ class RocomPlugin(Star):
                             except ValueError:
                                 yield event.plain_result(f"时间格式错误，请使用 YYYY-MM-DD HH:MM 或 HH:MM 格式，例如：-t {time.strftime('%H:%M')}")
                                 return
+                        elif ag_match:
+                            mention_all = True
+                            target_sub = True
+                            target_active = True
+                            target_override = True
+                            day_val = ag_match.group(1)
+                            if day_val:
+                                active_days = 0 if day_val.lower() in ("all", "0") else max(0, int(day_val))
+                            else:
+                                active_days = 0
+                            text = text[ag_match.end():]
                         elif a_match:
                             mention_all = True
                             text = text[a_match.end():]
@@ -6015,13 +6059,27 @@ class RocomPlugin(Star):
                             target_sub = True
                             target_active = True
                             target_override = True
+                            day_val = g_match.group(1)
+                            if day_val:
+                                active_days = 0 if day_val.lower() in ("all", "0") else max(0, int(day_val))
+                            else:
+                                active_days = 0
                             text = text[g_match.end():]
                         elif c_match:
                             target_active = True
                             if not target_override:
                                 target_sub = False
                             target_override = True
+                            day_val = c_match.group(1)
+                            if day_val:
+                                active_days = 0 if day_val.lower() in ("all", "0") else max(0, int(day_val))
+                            else:
+                                active_days = 0
                             text = text[c_match.end():]
+                        elif days_match:
+                            day_val = days_match.group(1)
+                            active_days = 0 if day_val.lower() in ("all", "0") else max(0, int(day_val))
+                            text = text[days_match.end():]
                         elif s_match:
                             target_sub = True
                             target_override = True
@@ -6048,7 +6106,7 @@ class RocomPlugin(Star):
             components_data.append({"type": "at_all"})
             
         if not has_content:
-            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。\n可用标志位：-g (全域), --active (仅活跃用户), --sub (仅订阅用户, 默认)。")
+            yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。\n可用标志位：-g [天数|all] (全域，默认all), --active [天数|all] (仅活跃用户), --sub (仅订阅用户, 默认)。")
             return
             
         umos = {}
@@ -6080,12 +6138,12 @@ class RocomPlugin(Star):
                         umos[umo] = key
                         
             if target_active:
-                active_users = await self.active_user_mgr.get_active_users(30)
+                active_users = await self.active_user_mgr.get_active_users(active_days)
                 for umo in active_users:
                     umos[umo] = umo
                 
         if not umos:
-            yield event.plain_result("当前没有任何订阅用户/群组。")
+            yield event.plain_result("当前没有任何目标用户/群组。")
             return
             
         if target_ts > 0:
@@ -6101,12 +6159,13 @@ class RocomPlugin(Star):
                 "created_at": int(time.time()),
                 "specific_targets": specific_targets,
                 "target_sub": target_sub,
-                "target_active": target_active
+                "target_active": target_active,
+                "active_days": active_days
             })
             yield event.plain_result(f"✅ 已成功建立持久化定时任务！\n执行时间：{time_hint}\n预计发送至 {len(umos)} 个目标。\n重启机器人该任务也不会丢失。")
             return
             
-        yield event.plain_result(f"正在准备向 {len(umos)} 个订阅目标发送公告，请稍候...")
+        yield event.plain_result(f"正在准备向 {len(umos)} 个目标发送公告，请稍候...")
         
         success_count = 0
         for umo, key in umos.items():
@@ -6153,11 +6212,12 @@ class RocomPlugin(Star):
                 else:
                     logger.warning(f"[Rocom] 群发公告推送失败 ({umo}): {e}")
                 
-        yield event.plain_result(f"群发完成！成功发送给 {success_count} 个订阅目标。")
+        yield event.plain_result(f"群发完成！成功发送给 {success_count} 个目标。")
 
     @filter.command("远行商人", alias={"yxsr"})
     async def rocom_merchant(self, event: AstrMessageEvent):
         """查询远行商人"""
+        await self._record_active_user(event)
         img_url, _, products, round_info = await self._render_merchant_image()
         if img_url:
             yield event.image_result(img_url)
@@ -6192,6 +6252,7 @@ class RocomPlugin(Star):
     @filter.command("洛克玩家")
     async def rocom_player_search(self, event: AstrMessageEvent, uid: str = ""):
         """通过 ingame 接口搜索玩家，未传 UID 时查询当前绑定账号"""
+        await self._record_active_user(event)
         uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
         if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克玩家。")
@@ -6221,6 +6282,7 @@ class RocomPlugin(Star):
     async def toggle_data_source(self, event: AstrMessageEvent, source: int, feature: str = "家园"):
         """管理员指令：切换查询数据源 (0: WeGame API, 1: RKPP 代理)
         示例：/切换数据源 0 家园"""
+        await self._record_active_user(event)
         if not event.is_admin() and not await self._is_group_admin(event):
             yield event.plain_result("抱歉，只有管理员才能使用此命令。")
             return
@@ -6242,7 +6304,7 @@ class RocomPlugin(Star):
     @filter.command("洛克家园")
     async def rocom_home(self, event: AstrMessageEvent, uid: str = ""):
         """通过 UID 查询洛克家园菜园、守卫精灵与室内精灵"""
-        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
+        await self._record_active_user(event)
         uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
         if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
@@ -6408,7 +6470,7 @@ class RocomPlugin(Star):
     @filter.command("家园详情", alias={"洛克精灵数据", "精灵数据"})
     async def rocom_pet_data(self, event: AstrMessageEvent, uid: str = "", pet_gid: str = "", npc_id: str = ""):
         """查询目标家园摆放精灵的完整 ingame 数据"""
-        await self.active_user_mgr.record_user(str(event.unified_msg_origin))
+        await self._record_active_user(event)
         uid = str(uid or "").strip()
         pet_gid = str(pet_gid or "").strip()
         npc_id = str(npc_id or "").strip()
@@ -6498,6 +6560,7 @@ class RocomPlugin(Star):
     @filter.command("订阅家园菜园")
     async def subscribe_home_garden(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园菜园成熟提醒"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园菜园订阅。")
             return
@@ -6524,6 +6587,7 @@ class RocomPlugin(Star):
     @filter.command("订阅家园灵感")
     async def subscribe_home_inspiration(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园精灵灵感完成提醒"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园灵感订阅。")
             return
@@ -6550,6 +6614,7 @@ class RocomPlugin(Star):
     @filter.command("订阅家园生蛋")
     async def subscribe_home_egg(self, event: AstrMessageEvent, uid: str = ""):
         """订阅家园精灵生蛋提醒"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以配置家园生蛋订阅。")
             return
@@ -6576,6 +6641,7 @@ class RocomPlugin(Star):
     @filter.command("取消订阅家园")
     async def unsubscribe_home(self, event: AstrMessageEvent, kind: str = "全部", uid: str = ""):
         """取消家园菜园、灵感或生蛋订阅"""
+        await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以取消家园订阅。")
             return
@@ -6603,6 +6669,7 @@ class RocomPlugin(Star):
     @filter.command("洛克商店")
     async def rocom_ingame_shop(self, event: AstrMessageEvent, shop_id: str = "3019"):
         """通过 ingame 接口查询商店信息"""
+        await self._record_active_user(event)
         shop_id = str(shop_id or "").strip()
         if not shop_id:
             yield event.plain_result("请提供商店 ID。用法：/洛克商店 <shop_id>")
@@ -6621,6 +6688,7 @@ class RocomPlugin(Star):
     @filter.command("洛克好友关系")
     async def rocom_friendship(self, event: AstrMessageEvent, user_ids: str = ""):
         """查询好友关系"""
+        await self._record_active_user(event)
         user_ids = str(user_ids or "").strip()
         if not user_ids:
             yield event.plain_result("请提供要查询的用户 ID 列表。用法：/洛克好友关系 <id1,id2>")
@@ -6646,6 +6714,7 @@ class RocomPlugin(Star):
     @filter.command("洛克学生")
     async def rocom_student(self, event: AstrMessageEvent, arg1: str = "101", arg2: str = "0"):
         """查询学生认证状态与学生活动福利"""
+        await self._record_active_user(event)
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -6693,6 +6762,7 @@ class RocomPlugin(Star):
     @filter.command("订阅远行商人")
     async def subscribe_merchant(self, event: AstrMessageEvent, args: str = ""):
         """订阅远行商人商品提醒"""
+        await self._record_active_user(event)
         # 检查私聊订阅是否启用
         if event.is_private_chat() and not self.merchant_private_subscription_enabled:
             yield event.plain_result("个人私聊订阅功能已被禁用，请联系机器人管理员。")
@@ -6827,6 +6897,7 @@ class RocomPlugin(Star):
     @filter.command("取消订阅远行商人")
     async def unsubscribe_merchant(self, event: AstrMessageEvent):
         """取消远行商人商品提醒"""
+        await self._record_active_user(event)
         # 检查私聊订阅是否启用（即使禁用，也应该允许取消已有的订阅）
         if event.is_private_chat() and not self.merchant_private_subscription_enabled:
             yield event.plain_result("个人私聊订阅功能已被禁用，但仍可取消已有订阅。")
@@ -6854,6 +6925,7 @@ class RocomPlugin(Star):
     @filter.command("洛克交换大厅", alias={"洛克大厅", "交换大厅"})
     async def rocom_exchange_hall(self, event: AstrMessageEvent, page: str = "1"):
         """查看交换大厅"""
+        await self._record_active_user(event)
         logger.info(f"收到交换大厅请求: page={page}")
         fw_token = await self._get_primary_token(event)
         if not fw_token:
@@ -6914,6 +6986,7 @@ class RocomPlugin(Star):
     @filter.command("查看阵容", alias={"阵容详情"})
     async def rocom_lineup_detail(self, event: AstrMessageEvent, lineup_id: str = None):
         """查看阵容详情"""
+        await self._record_active_user(event)
         if not lineup_id:
             yield event.plain_result("请提供阵容码。用法：/查看阵容 <阵容码>")
             return
@@ -7096,6 +7169,7 @@ class RocomPlugin(Star):
         arg2: str = None,
     ):
         """查看异色精灵收集排行榜。"""
+        await self._record_active_user(event)
         yield await self._render_pet_collection_ranking(
             event,
             "shining",
@@ -7112,6 +7186,7 @@ class RocomPlugin(Star):
         arg2: str = None,
     ):
         """查看炫彩精灵收集排行榜。"""
+        await self._record_active_user(event)
         yield await self._render_pet_collection_ranking(
             event,
             "glass",
@@ -7173,6 +7248,7 @@ class RocomPlugin(Star):
         share_code: str = None,
     ):
         """解析阵容分享码。"""
+        await self._record_active_user(event)
         code = self._share_code_arg(
             event,
             ["阵容码 解析", "阵容码解析"],
@@ -7203,6 +7279,7 @@ class RocomPlugin(Star):
         share_code: str = None,
     ):
         """查询后端记录的阵容分享码。"""
+        await self._record_active_user(event)
         code = self._share_code_arg(
             event,
             ["阵容码 查询", "阵容码查询"],
@@ -7258,6 +7335,7 @@ class RocomPlugin(Star):
     @filter.command("洛克阵容", alias={"阵容"})
     async def rocom_lineup(self, event: AstrMessageEvent, arg1: str = None, arg2: str = None):
         """查看阵容推荐"""
+        await self._record_active_user(event)
         fw_token = await self._get_primary_token(event)
         if not fw_token:
             async for res in self._not_logged_in_hint(event):
@@ -7335,6 +7413,7 @@ class RocomPlugin(Star):
     @filter.command("洛克查蛋", alias={"查蛋"})
     async def rocom_search_eggs(self, event: AstrMessageEvent, arg1: str = None, arg2: str = None):
         """查询精灵蛋组（支持名称/身高/体重反查）"""
+        await self._record_active_user(event)
         if not arg1:
             yield event.plain_result(
                 "🥚 查蛋用法：\n"
@@ -7578,6 +7657,7 @@ class RocomPlugin(Star):
     @filter.command("洛克配种", alias={"配种"})
     async def rocom_breeding_check(self, event: AstrMessageEvent, name_a: str = None, name_b: str = None):
         """配种查询：双参数判断兼容性，单参数查询如何孵出目标精灵"""
+        await self._record_active_user(event)
         if not name_a:
             yield event.plain_result(
                 "🥚 配种用法：\n"
@@ -9660,6 +9740,7 @@ class RocomPlugin(Star):
     @filter.command("图鉴下载")
     async def rocom_atlas_download(self, event: AstrMessageEvent):
         """下载 Rocom-Atlas 本地图鉴图片"""
+        await self._record_active_user(event)
         try:
             sent_thresholds = set()
 
@@ -9688,6 +9769,7 @@ class RocomPlugin(Star):
     @filter.command("精灵图鉴")
     async def rocom_atlas(self, event: AstrMessageEvent, name: str = ""):
         """查询本地 Atlas 精灵图鉴图片"""
+        await self._record_active_user(event)
         name = str(name or "").strip()
         if not name:
             yield event.plain_result("请输入精灵名称。用法：/精灵图鉴 <精灵名>")

@@ -327,13 +327,13 @@ class ActiveUserManager(AsyncDataManager):
             self.data[str(umo)] = {"last_active": int(time.time())}
             await self._save()
 
-    async def get_active_users(self, days: int = 30) -> List[str]:
+    async def get_active_users(self, days: int = 0) -> List[str]:
         import time
         now = int(time.time())
-        threshold = now - (days * 24 * 3600)
+        threshold = (now - (days * 24 * 3600)) if days > 0 else 0
         async with self.lock:
             active_umos = []
             for umo, info in self.data.items():
-                if info.get("last_active", 0) >= threshold:
+                if days <= 0 or info.get("last_active", 0) >= threshold:
                     active_umos.append(umo)
             return active_umos
