@@ -2552,109 +2552,62 @@ class RocomPlugin(Star):
         all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
-        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，查询最新公告")
-        latest = await self.client.get_announcement_latest()
-        if not latest:
+        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，查询最新公告列表")
+
+        # 1. 优先获取公告列表第一页（包含置顶与普通公告）
+        list_res = await self.client.get_announcement_list(category_id=99, page=1, limit=10, order="ttDesc")
+        raw_items = (list_res.get("list") or list_res.get("items") or []) if isinstance(list_res, dict) else []
+        if not raw_items:
+            latest = await self.client.get_announcement_latest()
+            if latest:
+                raw_items = [latest]
+
+        if not raw_items:
             return
-        latest_id = self._announcement_id(latest)
-        latest_ts = self._announcement_ts(latest)
-        if not latest_id:
+
+        # 去重并按发布时间从旧到新正序排列（保证多条公告时按发布顺序推送）
+        unique_items = {}
+        for it in raw_items:
+            tid = self._announcement_id(it)
+            if tid and tid not in unique_items:
+                unique_items[tid] = it
+
+        sorted_items = sorted(
+            unique_items.values(),
+            key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+        )
+        if not sorted_items:
             return
-        logger.debug(f"[Rocom] 公告检查：最新 id={latest_id} title={latest.get('title', '?')}")
-        detail = None
-        img_url = None
-        latest_title = str(latest.get("title") or "").strip()
-        pushed = 0
-        users_to_push_attachments = []
-        for key, sub in all_subs.items():
-            last_id = str(sub.get("last_id") or "")
-            last_ts = int(sub.get("since_ts") or 0)
-            last_title = str(sub.get("last_title") or "").strip()
-            if latest_id == last_id:
-                continue
-            if latest_ts and last_ts and latest_ts <= last_ts:
-                continue
-            if latest_title and last_title and latest_title == last_title:
-                logger.info(f"[Rocom] 公告订阅：标题匹配跳过 {key} title={latest_title}")
-                continue
-            if img_url is None:
-                logger.info(f"[Rocom] 公告订阅：新公告 id={latest_id} title={latest.get('title', '?')}，渲染中")
-                detail = await self.client.get_announcement_detail(latest_id) or latest
-                
-                img_url = await self.renderer.render_html(
-                    "render/announcement/detail.html",
-                    self._build_announcement_detail_render_data(detail),
-                    {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
-                )
-                # 截图后处理：放宽 Pillow 像素限制 + 等比缩放 + 自动切片 + 转 JPEG，确保 QQ 可发送
-                img_urls = []
-                if img_url:
-                    img_urls = self._slice_and_compress_image(img_url)
-            chain = MessageChain().message(
-                f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n"
+
+        rendered_cache: Dict[str, Dict[str, Any]] = {}
+
+        async def get_rendered_data(item: Dict[str, Any]) -> Dict[str, Any]:
+            target_id = self._announcement_id(item)
+            if target_id in rendered_cache:
+                return rendered_cache[target_id]
+
+            logger.info(f"[Rocom] 公告订阅：新公告 id={target_id} title={item.get('title', '?')}，准备渲染")
+            detail = await self.client.get_announcement_detail(target_id) or item
+            img_url = await self.renderer.render_html(
+                "render/announcement/detail.html",
+                self._build_announcement_detail_render_data(detail),
+                {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
             )
-            if img_urls:
-                for u in img_urls:
-                    chain.file_image(u)
-            elif latest.get("summary"):
-                chain.message(str(latest.get("summary")))
-                
-            push_ok = False
-            try:
-                await self.context.send_message(sub["umo"], chain)
-                logger.info(f"[Rocom] 公告订阅推送成功 → {key}")
-                push_ok = True
-            except Exception as e:
-                logger.warning(f"[Rocom] 公告订阅图文推送失败: {e}")
-                # 降级为纯文本重试（如图片过大导致 rich media transfer failed）
-                if img_urls:
-                    try:
-                        content_text = ""
-                        if isinstance(detail, dict):
-                            content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
-                            html_text = content.get("text") or detail.get("summary") or ""
-                            content_text = re.sub(r'<[^>]+>', '', html_text).strip()
-                            if len(content_text) > 500:
-                                content_text = content_text[:500] + "…"
-                        text_only = MessageChain().message(
-                            f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n\n{content_text}"
-                        )
-                        await self.context.send_message(sub["umo"], text_only)
-                        logger.info(f"[Rocom] 公告订阅降级纯文本推送成功 → {key}")
-                        push_ok = True
-                    except Exception as text_e:
-                        logger.warning(f"[Rocom] 公告订阅降级纯文本也失败: {text_e}")
-            if not push_ok:
-                continue
-            pushed += 1
-            sub["last_id"] = latest_id
-            sub["last_title"] = latest_title
-            sub["since_ts"] = latest_ts or int(time.time())
-            users_to_push_attachments.append((key, sub))
-            sub["updated_at"] = int(time.time())
-            await self.announcement_sub_mgr.upsert_subscription(key, sub)
-            await asyncio.sleep(2)
-            
-        if users_to_push_attachments and detail:
+            img_urls = []
+            if img_url:
+                img_urls = self._slice_and_compress_image(img_url)
+
+            # 视频附件处理
+            video_paths = []
             videos = self._extract_videos(detail)
             if videos:
-                video_paths = []
                 for v in videos:
                     p = await self._download_and_compress_video(v["url"])
-                    video_paths.append(p)
-                if video_paths:
-                    for key, sub in users_to_push_attachments:
-                        v_chain = MessageChain()
-                        for p in video_paths:
-                            v_chain.chain.append(Video.fromFileSystem(p))
-                        try:
-                            await self.context.send_message(sub["umo"], v_chain)
-                            logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key}")
-                        except Exception as e:
-                            logger.warning(f"[Rocom] 公告订阅视频附加推送失败: {e}")
-                        await asyncio.sleep(2)
+                    if p:
+                        video_paths.append(p)
 
-            # 多图公告附加转发消息：当原图 >= 2 张时，用合并转发发送所有原图
+            # 多图原图转发处理（>= 2 张时）
+            image_nodes = []
             original_urls = []
             content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
             for index in content_data.get("indexes") or []:
@@ -2663,8 +2616,6 @@ class RocomPlugin(Star):
                     if isinstance(urls, list):
                         original_urls.extend([str(u) for u in urls if u])
             if len(original_urls) >= 2:
-                # 下载并切片/压缩所有原图
-                image_nodes = []
                 for url in original_urls:
                     local_path = await self._download_announcement_image(url)
                     if local_path:
@@ -2673,20 +2624,144 @@ class RocomPlugin(Star):
                             image_nodes.append(
                                 Node(uin=0, name="洛克王国公告", content=[Image.fromFileSystem(p)])
                             )
-                if len(image_nodes) >= 2:
-                    nodes = Nodes(image_nodes)
-                    for key, sub in users_to_push_attachments:
-                        try:
-                            fwd_chain = MessageChain()
-                            fwd_chain.chain.append(nodes)
-                            await self.context.send_message(sub["umo"], fwd_chain)
-                            logger.info(f"[Rocom] 公告原图转发推送成功 → {key}")
-                        except Exception as e:
-                            logger.warning(f"[Rocom] 公告原图转发推送失败: {e}")
-                        await asyncio.sleep(2)
 
-        if pushed:
-            logger.info(f"[Rocom] 公告订阅：本轮推送 {pushed} 个订阅")
+            entry = {
+                "detail": detail,
+                "img_urls": img_urls,
+                "video_paths": video_paths,
+                "image_nodes": image_nodes,
+            }
+            rendered_cache[target_id] = entry
+            return entry
+
+        pushed_count = 0
+        for key, sub in all_subs.items():
+            last_id = str(sub.get("last_id") or "")
+            last_ts = int(sub.get("since_ts") or 0)
+            last_title = str(sub.get("last_title") or "").strip()
+
+            # 全新订阅未初始化时，基线对齐到当前最新一条，避免初始时刷屏推送历史所有条目
+            if last_ts == 0 and not last_id:
+                latest_one = sorted_items[-1]
+                sub["last_id"] = self._announcement_id(latest_one)
+                sub["last_title"] = str(latest_one.get("title") or "").strip()
+                sub["since_ts"] = self._announcement_ts(latest_one) or int(time.time())
+                sub["updated_at"] = int(time.time())
+                await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                continue
+
+            # 筛选该订阅未推送的新公告
+            to_push = []
+            for item in sorted_items:
+                item_id = self._announcement_id(item)
+                item_ts = self._announcement_ts(item)
+                item_title = str(item.get("title") or "").strip()
+
+                if item_id == last_id:
+                    continue
+                if item_ts and last_ts and item_ts < last_ts:
+                    continue
+                if item_ts and last_ts and item_ts == last_ts:
+                    try:
+                        if int(item_id) <= int(last_id):
+                            continue
+                    except (ValueError, TypeError):
+                        if item_title and last_title and item_title == last_title:
+                            continue
+                if item_title and last_title and item_title == last_title:
+                    continue
+                to_push.append(item)
+
+            if not to_push:
+                continue
+
+            # 按时间正序逐条推送新公告
+            for new_item in to_push:
+                item_id = self._announcement_id(new_item)
+                item_ts = self._announcement_ts(new_item)
+                item_title = str(new_item.get("title") or "").strip()
+
+                rendered = await get_rendered_data(new_item)
+                detail = rendered["detail"]
+                img_urls = rendered["img_urls"]
+                video_paths = rendered["video_paths"]
+                image_nodes = rendered["image_nodes"]
+
+                chain = MessageChain().message(
+                    f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n"
+                )
+                if img_urls:
+                    for u in img_urls:
+                        chain.file_image(u)
+                elif new_item.get("summary"):
+                    chain.message(str(new_item.get("summary")))
+
+                push_ok = False
+                try:
+                    await self.context.send_message(sub["umo"], chain)
+                    logger.info(f"[Rocom] 公告订阅推送成功 → {key} (id={item_id} title={item_title})")
+                    push_ok = True
+                except Exception as e:
+                    logger.warning(f"[Rocom] 公告订阅图文推送失败 ({key}, id={item_id}): {e}")
+                    # 降级纯文本重试
+                    if img_urls:
+                        try:
+                            content_text = ""
+                            if isinstance(detail, dict):
+                                content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+                                html_text = content.get("text") or detail.get("summary") or ""
+                                content_text = re.sub(r'<[^>]+>', '', html_text).strip()
+                                if len(content_text) > 500:
+                                    content_text = content_text[:500] + "…"
+                            text_only = MessageChain().message(
+                                f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n\n{content_text}"
+                            )
+                            await self.context.send_message(sub["umo"], text_only)
+                            logger.info(f"[Rocom] 公告订阅降级纯文本推送成功 → {key} (id={item_id})")
+                            push_ok = True
+                        except Exception as text_e:
+                            logger.warning(f"[Rocom] 公告订阅降级纯文本也失败 ({key}): {text_e}")
+
+                if not push_ok:
+                    continue
+
+                pushed_count += 1
+                sub["last_id"] = item_id
+                sub["last_title"] = item_title
+                sub["since_ts"] = max(last_ts, item_ts or int(time.time()))
+                last_ts = sub["since_ts"]
+                last_id = item_id
+                last_title = item_title
+                sub["updated_at"] = int(time.time())
+                await self.announcement_sub_mgr.upsert_subscription(key, sub)
+
+                # 附加推送：视频
+                if video_paths:
+                    v_chain = MessageChain()
+                    for p in video_paths:
+                        v_chain.chain.append(Video.fromFileSystem(p))
+                    try:
+                        await self.context.send_message(sub["umo"], v_chain)
+                        logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key} (id={item_id})")
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 公告订阅视频附加推送失败 ({key}, id={item_id}): {e}")
+                    await asyncio.sleep(2)
+
+                # 附加推送：多图合并转发（>= 2 张）
+                if len(image_nodes) >= 2:
+                    try:
+                        fwd_chain = MessageChain()
+                        fwd_chain.chain.append(Nodes(image_nodes))
+                        await self.context.send_message(sub["umo"], fwd_chain)
+                        logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (id={item_id})")
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, id={item_id}): {e}")
+                    await asyncio.sleep(2)
+
+                await asyncio.sleep(2)
+
+        if pushed_count:
+            logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新公告")
 
     def _resolve_merchant_timezone(self, configured_name: str):
         """Resolve the merchant timezone without letting a missing tzdata alter the default."""

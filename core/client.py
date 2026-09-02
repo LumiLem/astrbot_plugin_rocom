@@ -8,6 +8,7 @@ WeGame + Rocom HTTP API 客户端
 """
 
 import asyncio
+from datetime import datetime
 import httpx
 from typing import Optional, Dict, Any, List
 from astrbot.api import logger
@@ -973,9 +974,44 @@ class RocomClient:
             params=params,
         )
 
+    def _extract_announcement_ts(self, item: Dict[str, Any] | None) -> int:
+        """从公告对象中提取发布时间戳（秒）"""
+        item = item or {}
+        for key in ("published_at_ts", "publish_at_ts", "created_at_ts"):
+            try:
+                val = int(item.get(key) or 0)
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+        for key in ("publishAt", "published_at", "createdAt"):
+            text = str(item.get(key) or "").strip()
+            if not text:
+                continue
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    return int(datetime.strptime(text, fmt).timestamp())
+                except ValueError:
+                    continue
+        return 0
+
     async def get_announcement_latest(
         self, category_id: int = 99, order: str = "ttDesc"
     ) -> Optional[Dict]:
+        """获取最新公告（优先从 list 前列按发布时间选出最新一条，兼容置顶公告）"""
+        list_res = await self.get_announcement_list(
+            category_id=category_id, page=1, limit=10, order=order
+        )
+        if isinstance(list_res, dict):
+            items = list_res.get("list") or list_res.get("items") or []
+            if items:
+                return max(
+                    items,
+                    key=lambda x: (
+                        self._extract_announcement_ts(x),
+                        int(x.get("id") or x.get("thread_id") or 0),
+                    ),
+                )
         return await self._get(
             "/api/v1/games/rocom/announcement/latest",
             self._wegame_headers(),
