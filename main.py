@@ -2817,14 +2817,30 @@ class RocomPlugin(Star):
         if not sorted_items:
             return
 
+        # 全新订阅未初始化时，基线对齐到当前最新一条，避免初始时刷屏推送历史所有条目
+        for key, sub in all_subs.items():
+            last_id = str(sub.get("last_id") or "")
+            last_ts = int(sub.get("since_ts") or 0)
+            if last_ts == 0 and not last_id:
+                latest_one = sorted_items[-1]
+                sub["last_id"] = self._announcement_id(latest_one)
+                sub["last_title"] = str(latest_one.get("title") or "").strip()
+                sub["since_ts"] = self._announcement_ts(latest_one) or int(time.time())
+                sub["updated_at"] = int(time.time())
+                await self.announcement_sub_mgr.upsert_subscription(key, sub)
+
         rendered_cache: Dict[str, Dict[str, Any]] = {}
 
-        async def get_rendered_data(item: Dict[str, Any]) -> Dict[str, Any]:
+        async def get_rendered_content(item: Dict[str, Any]) -> Dict[str, Any]:
+            """获取公告详情和图文渲染结果（仅执行 HTML 渲染与切片，秒级完成，不阻塞视频下载）"""
             target_id = self._announcement_id(item)
             if target_id in rendered_cache:
-                return rendered_cache[target_id]
+                entry = rendered_cache[target_id]
+                # 校验图片文件是否仍然存在，若被清理则自动重新渲染
+                if not entry.get("img_urls") or all(os.path.isfile(p) for p in entry["img_urls"]):
+                    return entry
 
-            logger.info(f"[Rocom] 公告订阅：新公告 id={target_id} title={item.get('title', '?')}，准备渲染")
+            logger.info(f"[Rocom] 公告订阅：新公告 id={target_id} title={item.get('title', '?')}，准备渲染图文")
             detail = await self.client.get_announcement_detail(target_id) or item
             img_url = await self.renderer.render_html(
                 "render/announcement/detail.html",
@@ -2835,66 +2851,29 @@ class RocomPlugin(Star):
             if img_url:
                 img_urls = self._slice_and_compress_image(img_url)
 
-            # 视频附件处理
-            video_paths = []
             videos = self._extract_videos(detail)
-            if videos:
-                for v in videos:
-                    p = await self._download_and_compress_video(v["url"])
-                    if p and os.path.isfile(p):
-                        video_paths.append(p)
-
-            # 多图原图转发处理（>= 2 张时）
-            image_nodes = []
-            original_urls = []
-            content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
-            for index in content_data.get("indexes") or []:
-                if isinstance(index, dict):
-                    urls = index.get("imageUrl")
-                    if isinstance(urls, list):
-                        original_urls.extend([str(u) for u in urls if u])
-            if len(original_urls) >= 2:
-                for url in original_urls:
-                    local_path = await self._download_announcement_image(url)
-                    if local_path:
-                        sliced_paths = self._slice_and_compress_image(local_path)
-                        for p in sliced_paths:
-                            image_nodes.append(
-                                Node(uin=0, name="洛克王国公告", content=[Image.fromFileSystem(p)])
-                            )
 
             entry = {
                 "detail": detail,
                 "img_urls": img_urls,
                 "videos": videos,
-                "video_paths": video_paths,
-                "image_nodes": image_nodes,
             }
             rendered_cache[target_id] = entry
             return entry
 
         pushed_count = 0
-        for key, sub in all_subs.items():
-            last_id = str(sub.get("last_id") or "")
-            last_ts = int(sub.get("since_ts") or 0)
-            last_title = str(sub.get("last_title") or "").strip()
+        # 按时间正序遍历新公告（保证多条公告时按发布顺序推送）
+        for new_item in sorted_items:
+            item_id = self._announcement_id(new_item)
+            item_ts = self._announcement_ts(new_item)
+            item_title = str(new_item.get("title") or "").strip()
 
-            # 全新订阅未初始化时，基线对齐到当前最新一条，避免初始时刷屏推送历史所有条目
-            if last_ts == 0 and not last_id:
-                latest_one = sorted_items[-1]
-                sub["last_id"] = self._announcement_id(latest_one)
-                sub["last_title"] = str(latest_one.get("title") or "").strip()
-                sub["since_ts"] = self._announcement_ts(latest_one) or int(time.time())
-                sub["updated_at"] = int(time.time())
-                await self.announcement_sub_mgr.upsert_subscription(key, sub)
-                continue
-
-            # 筛选该订阅未推送的新公告
-            to_push = []
-            for item in sorted_items:
-                item_id = self._announcement_id(item)
-                item_ts = self._announcement_ts(item)
-                item_title = str(item.get("title") or "").strip()
+            # 筛选需要接收该公告的目标订阅者
+            target_subs = []
+            for key, sub in all_subs.items():
+                last_id = str(sub.get("last_id") or "")
+                last_ts = int(sub.get("since_ts") or 0)
+                last_title = str(sub.get("last_title") or "").strip()
 
                 if item_id == last_id:
                     continue
@@ -2909,24 +2888,20 @@ class RocomPlugin(Star):
                             continue
                 if item_title and last_title and item_title == last_title:
                     continue
-                to_push.append(item)
+                target_subs.append((key, sub))
 
-            if not to_push:
+            if not target_subs:
                 continue
 
-            # 按时间正序逐条推送新公告
-            for new_item in to_push:
-                item_id = self._announcement_id(new_item)
-                item_ts = self._announcement_ts(new_item)
-                item_title = str(new_item.get("title") or "").strip()
+            # 1. 快速渲染图文（毫秒/秒级，不阻塞视频下载）
+            rendered = await get_rendered_content(new_item)
+            detail = rendered["detail"]
+            img_urls = rendered["img_urls"]
+            videos = rendered.get("videos") or []
 
-                rendered = await get_rendered_data(new_item)
-                detail = rendered["detail"]
-                img_urls = rendered["img_urls"]
-                videos = rendered.get("videos") or []
-                video_paths = rendered["video_paths"]
-                image_nodes = rendered["image_nodes"]
-
+            # 2. 优先即时推送图文公告给所有目标订阅者
+            pushed_subs = []
+            for key, sub in target_subs:
                 chain = MessageChain().message(
                     f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n"
                 )
@@ -2962,55 +2937,80 @@ class RocomPlugin(Star):
                         except Exception as text_e:
                             logger.warning(f"[Rocom] 公告订阅降级纯文本也失败 ({key}): {text_e}")
 
-                if not push_ok:
-                    continue
-
-                pushed_count += 1
-                sub["last_id"] = item_id
-                sub["last_title"] = item_title
-                sub["since_ts"] = max(last_ts, item_ts or int(time.time()))
-                last_ts = sub["since_ts"]
-                last_id = item_id
-                last_title = item_title
-                sub["updated_at"] = int(time.time())
-                await self.announcement_sub_mgr.upsert_subscription(key, sub)
-
-                # 附加推送：视频
-                valid_video_paths = [p for p in video_paths if p and os.path.isfile(p)]
-                if valid_video_paths:
-                    v_chain = MessageChain()
-                    for p in valid_video_paths:
-                        v_chain.chain.append(Video.fromFileSystem(p))
-                    try:
-                        await self.context.send_message(sub["umo"], v_chain)
-                        logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key} (id={item_id})")
-                    except Exception as e:
-                        logger.warning(f"[Rocom] 公告订阅视频附加推送失败 ({key}, id={item_id}): {e}")
-                    await asyncio.sleep(2)
-                elif videos:
-                    # 视频下载失败或无法直接发送时，降级推送视频直链
-                    try:
-                        video_urls_text = "\n".join(v["url"] for v in videos if v.get("url"))
-                        if video_urls_text:
-                            v_chain = MessageChain().message(f"📹 该公告包含视频内容，可前往查看：\n{video_urls_text}")
-                            await self.context.send_message(sub["umo"], v_chain)
-                            logger.info(f"[Rocom] 公告订阅降级视频直链推送成功 → {key} (id={item_id})")
-                    except Exception as e:
-                        logger.warning(f"[Rocom] 公告订阅降级视频直链推送失败 ({key}, id={item_id}): {e}")
-                    await asyncio.sleep(2)
-
-                # 附加推送：多图合并转发（>= 2 张）
-                if len(image_nodes) >= 2:
-                    try:
-                        fwd_chain = MessageChain()
-                        fwd_chain.chain.append(Nodes(image_nodes))
-                        await self.context.send_message(sub["umo"], fwd_chain)
-                        logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (id={item_id})")
-                    except Exception as e:
-                        logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, id={item_id}): {e}")
-                    await asyncio.sleep(2)
+                if push_ok:
+                    pushed_count += 1
+                    sub["last_id"] = item_id
+                    sub["last_title"] = item_title
+                    sub["since_ts"] = max(int(sub.get("since_ts") or 0), item_ts or int(time.time()))
+                    sub["updated_at"] = int(time.time())
+                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                    pushed_subs.append((key, sub))
 
                 await asyncio.sleep(2)
+
+            # 3. 图文推送完毕后，再进行附加推送（视频 / 多图原图），避免大视频下载压缩阻塞图文发送
+            if pushed_subs:
+                # 3.1 附加推送：视频
+                if videos:
+                    video_paths = []
+                    for v in videos:
+                        p = await self._download_and_compress_video(v["url"])
+                        if p and os.path.isfile(p):
+                            video_paths.append(p)
+
+                    valid_video_paths = [p for p in video_paths if p and os.path.isfile(p)]
+                    if valid_video_paths:
+                        for key, sub in pushed_subs:
+                            v_chain = MessageChain()
+                            for p in valid_video_paths:
+                                v_chain.chain.append(Video.fromFileSystem(p))
+                            try:
+                                await self.context.send_message(sub["umo"], v_chain)
+                                logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key} (id={item_id})")
+                            except Exception as e:
+                                logger.warning(f"[Rocom] 公告订阅视频附加推送失败 ({key}, id={item_id}): {e}")
+                            await asyncio.sleep(2)
+                    else:
+                        # 视频下载失败或无法直接发送时，降级推送视频直链
+                        video_urls_text = "\n".join(v["url"] for v in videos if v.get("url"))
+                        if video_urls_text:
+                            for key, sub in pushed_subs:
+                                v_chain = MessageChain().message(f"📹 该公告包含视频内容，可前往查看：\n{video_urls_text}")
+                                try:
+                                    await self.context.send_message(sub["umo"], v_chain)
+                                    logger.info(f"[Rocom] 公告订阅降级视频直链推送成功 → {key} (id={item_id})")
+                                except Exception as e:
+                                    logger.warning(f"[Rocom] 公告订阅降级视频直链推送失败 ({key}, id={item_id}): {e}")
+                                await asyncio.sleep(2)
+
+                # 3.2 附加推送：多图合并转发（>= 2 张时）
+                image_nodes = []
+                original_urls = []
+                content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+                for index in content_data.get("indexes") or []:
+                    if isinstance(index, dict):
+                        urls = index.get("imageUrl")
+                        if isinstance(urls, list):
+                            original_urls.extend([str(u) for u in urls if u])
+                if len(original_urls) >= 2:
+                    for url in original_urls:
+                        local_path = await self._download_announcement_image(url)
+                        if local_path:
+                            sliced_paths = self._slice_and_compress_image(local_path)
+                            for p in sliced_paths:
+                                image_nodes.append(
+                                    Node(uin=0, name="洛克王国公告", content=[Image.fromFileSystem(p)])
+                                )
+                    if len(image_nodes) >= 2:
+                        for key, sub in pushed_subs:
+                            fwd_chain = MessageChain()
+                            fwd_chain.chain.append(Nodes(image_nodes))
+                            try:
+                                await self.context.send_message(sub["umo"], fwd_chain)
+                                logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (id={item_id})")
+                            except Exception as e:
+                                logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, id={item_id}): {e}")
+                            await asyncio.sleep(2)
 
         if pushed_count:
             logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新公告")

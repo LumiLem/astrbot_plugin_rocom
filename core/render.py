@@ -56,7 +56,7 @@ class Renderer:
             )
 
     async def _cache_cleanup_loop(self):
-        """后台清理超过 5 分钟的渲染缓存"""
+        """后台清理超过 30 分钟的渲染缓存"""
         while True:
             try:
                 await asyncio.sleep(60)
@@ -67,7 +67,7 @@ class Renderer:
                         continue
                     fp = os.path.join(self._output_dir, f)
                     try:
-                        if now - os.path.getmtime(fp) > 300:
+                        if now - os.path.getmtime(fp) > 1800:
                             os.remove(fp)
                     except Exception:
                         pass
