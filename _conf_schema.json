@@ -169,8 +169,14 @@
   "announcement_poll_interval_minutes": {
     "type": "int",
     "description": "洛克公告订阅检查间隔",
-    "hint": "单位：分钟。用于新公告订阅轮询",
+    "hint": "单位：分钟。用于新公告订阅轮询基础间隔",
     "default": 10
+  },
+  "announcement_adaptive_poll_enabled": {
+    "type": "bool",
+    "description": "启用公告自适应智能变速轮询",
+    "hint": "开启后根据官方发帖高峰智能调整轮询间隔：周三晚/周四早晚/每日10点档 2分钟，日常 10分钟，深夜及午休 30分钟；关闭则固定使用常规间隔",
+    "default": true
   },
   "copyright": {
     "type": "string",

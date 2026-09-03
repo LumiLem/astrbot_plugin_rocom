@@ -99,7 +99,8 @@ playwright install chromium
 | `home_subscription_enabled` | bool | `true` | 是否启用家园菜园和精灵灵感订阅推送 |
 | `home_subscription_interval_minutes` | int | `5` | 家园订阅检查间隔（分钟），按首个完成/全部完成两档推送 |
 | `announcement_subscription_enabled` | bool | `true` | 是否启用洛克公告订阅推送 |
-| `announcement_poll_interval_minutes` | int | `10` | 洛克公告订阅检查间隔（分钟） |
+| `announcement_poll_interval_minutes` | int | `10` | 洛克公告订阅检查基础间隔（分钟） |
+| `announcement_adaptive_poll_enabled` | bool | `true` | 是否启用公告智能自适应变速轮询：根据官方发帖高峰自动调频（周三晚、周四早/晚、每日10点档 2分钟，日常 10分钟，深夜与午休 30分钟） |
 
 ### 安全免责声明
 

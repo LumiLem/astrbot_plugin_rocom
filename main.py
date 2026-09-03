@@ -180,6 +180,10 @@ class RocomPlugin(Star):
             )
         except (TypeError, ValueError):
             self.announcement_poll_interval_minutes = 10
+        self.announcement_adaptive_poll_enabled = bool(
+            self.config.get("announcement_adaptive_poll_enabled", True)
+        )
+        self._announcement_last_known_fingerprint: tuple[str, int, str] | None = None
         self._announcement_subscription_task = None
         self._subscription_poll_task = None
         
@@ -1827,17 +1831,67 @@ class RocomPlugin(Star):
                 
             await asyncio.sleep(15)
 
+    def _get_current_announcement_interval_seconds(self) -> int:
+        """根据当前时间段计算洛克公告订阅轮询间隔（秒）
+        基于线上真实 280 篇历史公告统计规律：
+        1. 高频突发期（2 分钟 / 120 秒）：
+           - 周三 18:00 ~ 21:30（版本大更新预告发帖核心区，单时段发帖 50 篇）
+           - 周四 09:30 ~ 12:30（更新日实机内容集中爆料区）
+           - 周四 18:30 ~ 20:30（更新日晚间活动补充区）
+           - 每日 09:50 ~ 11:30（全周每日 10:00 档期定点爆料窗口）
+        2. 低谷休眠期（30 分钟 / 1800 秒）：
+           - 每日 23:00 ~ 次日 08:30（历史发帖率 < 1%，01:00~08:00 为绝对零发帖静默期）
+           - 每日 13:00 ~ 14:00（午休静默期，历史发帖率为 0%）
+        3. 常规活跃期：
+           - 其余白天时段使用配置的基础间隔（默认 10 分钟 / 600 秒）
+        若未开启自适应变速（announcement_adaptive_poll_enabled=False），则固定使用配置值
+        """
+        base_seconds = max(1, int(self.announcement_poll_interval_minutes or 10)) * 60
+        if not getattr(self, "announcement_adaptive_poll_enabled", True):
+            return base_seconds
+
+        now = datetime.now(self._cn_tz())
+        weekday = now.weekday()  # 0=周一 ... 2=周三, 3=周四, 4=周五, 6=周日
+        hour = now.hour
+        minute = now.minute
+        time_decimal = hour + minute / 60.0
+
+        # 1. 高频突发期（2 分钟）
+        # 周三 18:00 ~ 21:30（版本大更新预告）
+        is_wed_peak = (weekday == 2 and 18.0 <= time_decimal < 21.5)
+        # 周四 09:30 ~ 12:30（更新日当天爆料）与 18:30 ~ 20:30（更新日晚间预告）
+        is_thu_peak = (weekday == 3 and ((9.5 <= time_decimal < 12.5) or (18.5 <= time_decimal < 20.5)))
+        # 每日 09:50 ~ 11:30（10:00 档期常规爆料）
+        is_daily_morning_peak = (9.833 <= time_decimal < 11.5)
+
+        if is_wed_peak or is_thu_peak or is_daily_morning_peak:
+            peak_seconds = 120
+            return min(base_seconds, peak_seconds)
+
+        # 2. 低谷休眠期（30 分钟）
+        # 每日 23:00 ~ 次日 08:30
+        is_night_idle = (time_decimal >= 23.0 or time_decimal < 8.5)
+        # 每日 13:00 ~ 14:00（午休静默）
+        is_noon_idle = (13.0 <= time_decimal < 14.0)
+
+        if is_night_idle or is_noon_idle:
+            idle_seconds = 1800
+            return max(base_seconds, idle_seconds)
+
+        # 3. 常规活跃期
+        return base_seconds
+
     async def _subscription_poll_loop(self):
         """统一轮询：家园 + 公告订阅，60s 步长，wall clock 绝对时间"""
         home_interval = max(1, int(self.home_subscription_interval_minutes or 5)) * 60
-        announce_interval = max(1, int(self.announcement_poll_interval_minutes or 10)) * 60
         home_enabled = self.home_subscription_enabled
         announce_enabled = self.announcement_subscription_enabled
+        initial_announce_interval = self._get_current_announcement_interval_seconds()
         logger.info(
-            f"[Rocom] 订阅轮询任务已启动 home_interval={home_interval}s announce_interval={announce_interval}s instance={self._instance_id}"
+            f"[Rocom] 订阅轮询任务已启动 home_interval={home_interval}s announce_interval={initial_announce_interval}s (adaptive={self.announcement_adaptive_poll_enabled}) instance={self._instance_id}"
         )
         next_home = time.time() + home_interval if home_enabled else float("inf")
-        next_announce = time.time() + announce_interval if announce_enabled else float("inf")
+        next_announce = time.time() + initial_announce_interval if announce_enabled else float("inf")
         iteration = 0
         while True:
             iteration += 1
@@ -1850,7 +1904,8 @@ class RocomPlugin(Star):
                     except Exception as e:
                         logger.error(f"[Rocom] 家园订阅检查异常（iteration={iteration}）: {e}")
                 if announce_enabled and now >= next_announce:
-                    next_announce = time.time() + announce_interval
+                    current_interval = self._get_current_announcement_interval_seconds()
+                    next_announce = time.time() + current_interval
                     try:
                         await self._check_announcement_subscriptions()
                     except Exception as e:
@@ -1864,7 +1919,7 @@ class RocomPlugin(Star):
             except Exception as e:
                 logger.error(f"[Rocom] 订阅轮询异常（iteration={iteration}）: {e}")
                 next_home = time.time() + home_interval
-                next_announce = time.time() + announce_interval
+                next_announce = time.time() + self._get_current_announcement_interval_seconds()
                 await asyncio.sleep(60)
 
     def _home_subscription_state(
@@ -2582,15 +2637,47 @@ class RocomPlugin(Star):
         all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
-        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，查询最新公告列表")
+        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，执行 Head 探活")
 
-        # 1. 优先获取公告列表第一页（包含置顶与普通公告）
+        # 1. 轻量级 Head 探活：先获取前 5 条公告（包含置顶与前 3 条最新普通公告，仅约 3.6KB）
+        head_res = await self.client.get_announcement_list(category_id=99, page=1, limit=5, order="ttDesc")
+        raw_head_items = (head_res.get("list") or head_res.get("items") or []) if isinstance(head_res, dict) else []
+        if not raw_head_items:
+            latest = await self.client.get_announcement_latest()
+            if latest:
+                raw_head_items = [latest]
+
+        if not raw_head_items:
+            return
+
+        # 提取探活列表中的最新公告指纹
+        head_latest = max(
+            raw_head_items,
+            key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+        )
+        head_latest_id = self._announcement_id(head_latest)
+        head_latest_ts = self._announcement_ts(head_latest)
+        head_latest_title = str(head_latest.get("title") or "").strip()
+        head_fingerprint = (head_latest_id, head_latest_ts, head_latest_title)
+
+        # 检查是否有未初始化的全新订阅（last_ts == 0 且 not last_id）
+        has_uninitialized = any(
+            not sub.get("last_id") and not sub.get("since_ts")
+            for sub in all_subs.values()
+        )
+
+        # 指纹未变且无未初始化新订阅时，直接短路跳过（Fast Path）
+        if not has_uninitialized and self._announcement_last_known_fingerprint == head_fingerprint:
+            logger.debug(f"[Rocom] 公告探活：最新条目未发生变动 (id={head_latest_id} title={head_latest_title})，快速短路跳过")
+            return
+
+        logger.info(f"[Rocom] 公告检查：检测到新公告或订阅初始化 (fingerprint={head_fingerprint})，拉取完整列表")
+
+        # 2. 完整拉取与推送（Slow Path）：获取第一页完整列表（包含置顶与普通公告）
         list_res = await self.client.get_announcement_list(category_id=99, page=1, limit=10, order="ttDesc")
         raw_items = (list_res.get("list") or list_res.get("items") or []) if isinstance(list_res, dict) else []
         if not raw_items:
-            latest = await self.client.get_announcement_latest()
-            if latest:
-                raw_items = [latest]
+            raw_items = raw_head_items
 
         if not raw_items:
             return
@@ -2806,6 +2893,15 @@ class RocomPlugin(Star):
 
         if pushed_count:
             logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新公告")
+
+        # 3. 记录全局最新指纹，供下次快速探活比对
+        if sorted_items:
+            newest_item = sorted_items[-1]
+            self._announcement_last_known_fingerprint = (
+                self._announcement_id(newest_item),
+                self._announcement_ts(newest_item),
+                str(newest_item.get("title") or "").strip(),
+            )
 
     def _resolve_merchant_timezone(self, configured_name: str):
         """Resolve the merchant timezone without letting a missing tzdata alter the default."""
@@ -6110,6 +6206,7 @@ class RocomPlugin(Star):
                 "updated_at": int(time.time()),
             },
         )
+        self._announcement_last_known_fingerprint = None
         yield event.plain_result("已订阅洛克公告，新公告发布后会推送到当前会话。")
 
     @filter.command("取消订阅洛克公告")
@@ -6122,6 +6219,7 @@ class RocomPlugin(Star):
         key = str(event.unified_msg_origin)
         deleted = await self.announcement_sub_mgr.delete_subscription(key)
         if deleted:
+            self._announcement_last_known_fingerprint = None
             yield event.plain_result("已取消当前会话的洛克公告订阅。")
         else:
             yield event.plain_result("当前会话没有洛克公告订阅。")
