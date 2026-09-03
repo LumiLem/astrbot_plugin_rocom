@@ -305,6 +305,20 @@ class BroadcastTaskManager(AsyncDataManager):
         async with self.lock:
             return copy.deepcopy(self.data)
 
+    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        async with self.lock:
+            task = self.data.get(str(task_id))
+            return copy.deepcopy(task) if task else None
+
+    async def update_task(self, task_id: str, updates: Dict[str, Any]) -> bool:
+        async with self.lock:
+            key = str(task_id)
+            if key not in self.data:
+                return False
+            self.data[key].update(copy.deepcopy(updates))
+            await self._save()
+            return True
+
     async def delete_task(self, task_id: str) -> bool:
         async with self.lock:
             key = str(task_id)

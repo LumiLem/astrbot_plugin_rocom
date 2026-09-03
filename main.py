@@ -184,6 +184,8 @@ class RocomPlugin(Star):
             self.config.get("announcement_adaptive_poll_enabled", True)
         )
         self._announcement_last_known_fingerprint: tuple[str, int, str] | None = None
+        self._pending_broadcasts: Dict[str, Dict[str, Any]] = {}
+        self._running_broadcast_cancels: Dict[str, asyncio.Event] = {}
         self._announcement_subscription_task = None
         self._subscription_poll_task = None
         
@@ -1721,6 +1723,214 @@ class RocomPlugin(Star):
                 logger.error(f"[Rocom] 家园订阅循环异常: {e}")
                 await asyncio.sleep(60)
 
+    async def _find_broadcast_task(self, query_id: str) -> tuple[str | None, Dict[str, Any] | None]:
+        """按完整 ID 或前缀（不区分大小写）查找群发任务"""
+        query_id = str(query_id or "").strip().lower()
+        if not query_id:
+            return None, None
+        tasks = await self.broadcast_task_mgr.get_all_tasks()
+        # 1. 精确匹配
+        for tid, task in tasks.items():
+            if tid.lower() == query_id:
+                return tid, task
+        # 2. 前缀匹配
+        for tid, task in tasks.items():
+            if tid.lower().startswith(query_id):
+                return tid, task
+        return None, None
+
+    async def _execute_broadcast_task(
+        self,
+        task_id: str,
+        task: Dict[str, Any],
+        cancel_event: asyncio.Event | None = None,
+    ):
+        """统一群发任务执行器：支持取消信号监听、实时进度、连续失败风控熔断及回执通知"""
+        now = time.time()
+        task_short_id = str(task_id)[:8]
+        if cancel_event is None:
+            cancel_event = self._running_broadcast_cancels.get(str(task_id))
+            if cancel_event is None:
+                cancel_event = asyncio.Event()
+                self._running_broadcast_cancels[str(task_id)] = cancel_event
+
+        await self.broadcast_task_mgr.update_task(task_id, {"status": "running"})
+        logger.info(f"[Rocom] 开始执行群发任务: {task_short_id}")
+
+        chain = MessageChain()
+        has_at_all = False
+        for comp in task.get("components", []):
+            if comp["type"] == "plain":
+                chain.message(comp["text"])
+            elif comp["type"] == "image":
+                file_url = comp["file"]
+                chain.file_image(file_url)
+            elif comp["type"] == "at_all":
+                chain.at_all()
+                has_at_all = True
+
+        # 解析发送目标
+        umos = {}
+        specific_targets = task.get("specific_targets", [])
+        if specific_targets:
+            for t in specific_targets:
+                umos[t] = t
+        else:
+            target_sub = task.get("target_sub", True)
+            target_active = task.get("target_active", False)
+
+            if target_sub:
+                merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+                for key, sub in merch_subs.items():
+                    if umo := sub.get("umo"):
+                        umos[umo] = key
+
+                ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+                for key, sub in ann_subs.items():
+                    if umo := sub.get("umo"):
+                        umos[umo] = key
+
+                home_subs = await self.home_sub_mgr.get_all_subscriptions()
+                for key, sub in home_subs.items():
+                    if umo := sub.get("umo"):
+                        umos[umo] = key
+
+            if target_active:
+                active_days = int(task.get("active_days", 0) or 0)
+                active_users = await self.active_user_mgr.get_active_users(active_days)
+                for umo in active_users:
+                    umos[umo] = umo
+
+        total_count = len(umos)
+        success_count = 0
+        failed_count = 0
+        consecutive_failures = 0
+        cancelled = False
+        circuit_broken = False
+
+        try:
+            for umo, key in umos.items():
+                if cancel_event.is_set():
+                    logger.info(f"[Rocom] 群发任务 {task_short_id} 收到取消信号，中止执行")
+                    cancelled = True
+                    break
+
+                try:
+                    send_chain = MessageChain()
+                    is_private = False
+                    target_id = 0
+                    if isinstance(key, str) and key.startswith("private_"):
+                        is_private = True
+                        target_id = key.split("_", 1)[1] if "_" in key else 0
+                    elif "FriendMessage" in umo or "PrivateMessage" in umo:
+                        is_private = True
+                        target_id = umo.split(":")[-1]
+
+                    if is_private:
+                        send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                        if has_at_all:
+                            platform_id = umo.split(":")[0] if ":" in umo else ""
+                            platform_inst = self.context.get_platform_inst(platform_id)
+                            if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                                try:
+                                    await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                                except Exception as e:
+                                    logger.warning(f"[Rocom] 群发私聊戳一戳发送失败: {e}")
+                            else:
+                                send_chain.chain.append(Poke(qq=target_id))
+                    else:
+                        send_chain.chain = list(chain.chain)
+
+                    await self.context.send_message(umo, send_chain)
+                    success_count += 1
+                    consecutive_failures = 0
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    failed_count += 1
+                    consecutive_failures += 1
+                    if has_at_all:
+                        logger.warning(f"[Rocom] 群发推送失败 ({umo})，尝试降级纯文本: {e}")
+                        try:
+                            fallback_chain = MessageChain()
+                            fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
+                            await self.context.send_message(umo, fallback_chain)
+                            success_count += 1
+                            consecutive_failures = 0
+                            failed_count -= 1
+                            await asyncio.sleep(0.5)
+                        except Exception as fallback_e:
+                            logger.warning(f"[Rocom] 群发降级推送失败 ({umo}): {fallback_e}")
+                    else:
+                        logger.warning(f"[Rocom] 群发推送失败 ({umo}): {e}")
+
+                    # 连续失败 5 次触发风控熔断保护
+                    if consecutive_failures >= 5:
+                        logger.error(f"[Rocom] 群发任务 {task_short_id} 连续失败 5 次，触发风控熔断！")
+                        circuit_broken = True
+                        break
+
+                await self.broadcast_task_mgr.update_task(
+                    task_id,
+                    {
+                        "progress": {
+                            "total": total_count,
+                            "sent": success_count,
+                            "failed": failed_count,
+                        }
+                    },
+                )
+        finally:
+            self._running_broadcast_cancels.pop(str(task_id), None)
+            issuer_umo = task.get("issuer_umo")
+            created_at = task.get("created_at", now)
+            issue_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))
+
+            if circuit_broken:
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "circuit_breaker"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"⚠️【风控熔断警报】群发任务 [{task_short_id}] 连续 5 次发送失败，已自动熔断终止！\n"
+                                f"• 任务创建时间：{issue_time_str}\n"
+                                f"• 当前进度：已成功送达 {success_count}/{total_count}，失败 {failed_count} 次。\n"
+                                f"建议检查 Bot 发送频率或是否触发平台临时频控。"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            elif cancelled:
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "cancelled"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"⏹️ 群发任务 [{task_short_id}] 已被管理员紧急终止！\n"
+                                f"• 执行进度：已成功发送 {success_count}/{total_count} 个目标。"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            else:
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "completed"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"✅ 群发任务 [{task_short_id}] 已执行完成！\n"
+                                f"• 计划时间：{issue_time_str}\n"
+                                f"• 发送结果：成功送达 {success_count}/{total_count} 个目标"
+                                + (f"，失败 {failed_count} 个。" if failed_count else "。")
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+            await self.broadcast_task_mgr.delete_task(task_id)
+
     async def _broadcast_poll_loop(self):
         """持久化定时广播轮询"""
         while True:
@@ -1728,107 +1938,18 @@ class RocomPlugin(Star):
                 now = time.time()
                 tasks = await self.broadcast_task_mgr.get_all_tasks()
                 for task_id, task in tasks.items():
+                    status = task.get("status", "pending")
+                    if status in ("paused", "running", "cancelled"):
+                        continue
                     target_ts = task.get("target_ts", 0)
                     if now >= target_ts:
-                        logger.info(f"[Rocom] 开始执行持久化定时群发任务: {task_id}")
-                        chain = MessageChain()
-                        has_at_all = False
-                        for comp in task.get("components", []):
-                            if comp["type"] == "plain":
-                                chain.message(comp["text"])
-                            elif comp["type"] == "image":
-                                file_url = comp["file"]
-                                chain.file_image(file_url)
-                            elif comp["type"] == "at_all":
-                                chain.at_all()
-                                has_at_all = True
-                        
-                        umos = {}
-                        specific_targets = task.get("specific_targets", [])
-                        if specific_targets:
-                            for t in specific_targets:
-                                umos[t] = t
-                        else:
-                            target_sub = task.get("target_sub", True)
-                            target_active = task.get("target_active", False)
-                            
-                            if target_sub:
-                                merch_subs = await self.merchant_sub_mgr.get_all_subscriptions()
-                                for key, sub in merch_subs.items():
-                                    if umo := sub.get("umo"): umos[umo] = key
-                                        
-                                ann_subs = await self.announcement_sub_mgr.get_all_subscriptions()
-                                for key, sub in ann_subs.items():
-                                    if umo := sub.get("umo"): umos[umo] = key
-                                        
-                                home_subs = await self.home_sub_mgr.get_all_subscriptions()
-                                for key, sub in home_subs.items():
-                                    if umo := sub.get("umo"): umos[umo] = key
-                            
-                            if target_active:
-                                active_days = int(task.get("active_days", 0) or 0)
-                                active_users = await self.active_user_mgr.get_active_users(active_days)
-                                for umo in active_users:
-                                    umos[umo] = umo
-                                
-                        success_count = 0
-                        for umo, key in umos.items():
-                            try:
-                                send_chain = MessageChain()
-                                is_private = False
-                                target_id = 0
-                                if isinstance(key, str) and key.startswith("private_"):
-                                    is_private = True
-                                    target_id = key.split("_", 1)[1] if "_" in key else 0
-                                elif "FriendMessage" in umo or "PrivateMessage" in umo:
-                                    is_private = True
-                                    target_id = umo.split(":")[-1]
-
-                                if is_private:
-                                    send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
-                                    if has_at_all:
-                                        platform_id = umo.split(":")[0] if ":" in umo else ""
-                                        platform_inst = self.context.get_platform_inst(platform_id)
-                                        if platform_inst and platform_inst.meta().name == "aiocqhttp":
-                                            try:
-                                                await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
-                                            except Exception as e:
-                                                logger.warning(f"[Rocom] 定时群发私聊戳一戳发送失败: {e}")
-                                        else:
-                                            send_chain.chain.append(Poke(qq=target_id))
-                                else:
-                                    send_chain.chain = list(chain.chain)
-                                await self.context.send_message(umo, send_chain)
-                                success_count += 1
-                                await asyncio.sleep(0.5)
-                            except Exception as e:
-                                if has_at_all:
-                                    logger.warning(f"[Rocom] 定时群发推送失败 ({umo})，尝试降级纯文本: {e}")
-                                    try:
-                                        fallback_chain = MessageChain()
-                                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
-                                        await self.context.send_message(umo, fallback_chain)
-                                        success_count += 1
-                                        await asyncio.sleep(0.5)
-                                    except Exception as fallback_e:
-                                        logger.warning(f"[Rocom] 定时群发降级推送失败 ({umo}): {fallback_e}")
-                                else:
-                                    logger.warning(f"[Rocom] 定时群发推送失败 ({umo}): {e}")
-                                
-                        try:
-                            if issuer_umo := task.get("issuer_umo"):
-                                issue_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(task.get('created_at', now)))
-                                await self.context.send_message(
-                                    issuer_umo, 
-                                    MessageChain().message(f"✅ 您于 {issue_time_str} 安排的定时群发任务已执行完成，成功送达 {success_count} 个目标。")
-                                )
-                        except Exception:
-                            pass
-                            
-                        await self.broadcast_task_mgr.delete_task(task_id)
+                        logger.info(f"[Rocom] 触发持久化定时群发任务: {str(task_id)[:8]}")
+                        cancel_event = asyncio.Event()
+                        self._running_broadcast_cancels[str(task_id)] = cancel_event
+                        asyncio.create_task(self._execute_broadcast_task(task_id, task, cancel_event))
             except Exception as e:
                 logger.error(f"[Rocom] 持久化广播轮询异常: {e}")
-                
+
             await asyncio.sleep(15)
 
     def _get_current_announcement_interval_seconds(self) -> int:
@@ -6245,6 +6366,7 @@ class RocomPlugin(Star):
         target_active = False
         target_override = False
         active_days = 0
+        force_send = False
         
         for comp in event.message_obj.message:
             if isinstance(comp, Plain):
@@ -6262,6 +6384,7 @@ class RocomPlugin(Star):
                         c_match = re.match(r'^--(?:active|c)(?:\s+(\d+|all))?\s*', text, re.IGNORECASE)
                         days_match = re.match(r'^--days\s+(\d+|all)\s*', text, re.IGNORECASE)
                         s_match = re.match(r'^--sub\s*', text)
+                        force_match = re.match(r'^(?:--force|-y)\s*', text, re.IGNORECASE)
                         
                         if u_match:
                             targets_str = u_match.group(1)
@@ -6327,6 +6450,9 @@ class RocomPlugin(Star):
                             target_sub = True
                             target_override = True
                             text = text[s_match.end():]
+                        elif force_match:
+                            force_send = True
+                            text = text[force_match.end():]
                         else:
                             break
                             
@@ -6389,13 +6515,39 @@ class RocomPlugin(Star):
             yield event.plain_result("当前没有任何目标用户/群组。")
             return
             
-        if target_ts > 0:
-            if target_ts <= time.time():
-                yield event.plain_result("设定的时间已经过去，请设置未来的时间。")
-                return
-                
+        plain_texts = [c["text"] for c in components_data if c.get("type") == "plain"]
+        text_summary = "".join(plain_texts).strip()
+        if not text_summary:
+            text_summary = "（富媒体/纯图公告）"
+
+        if target_ts > 0 and target_ts <= time.time():
+            yield event.plain_result("设定的时间已经过去，请设置未来的时间。")
+            return
+
+        if specific_targets:
+            target_desc = f"指定目标（{len(specific_targets)} 个）"
+        elif target_sub and target_active:
+            target_desc = f"全域（订阅会话 + {active_days}天内活跃用户）"
+        elif target_active:
+            target_desc = f"活跃用户（{active_days}天内活跃用户）"
+        else:
+            target_desc = "仅订阅用户（远行商人/公告/家园）"
+
+        mode_desc = time_hint if target_ts > 0 else "即时群发（确认后立即开始）"
+
+        # 若未指定强制发送，默认进入沙盒预览与两步确认流程
+        if not force_send:
+            # 1. 优先向当前管理员会话发送沙盒预览消息
+            preview_chain = MessageChain()
+            preview_chain.message("🔍【群发沙盒预览 · 实际效果如下】\n")
+            preview_chain.chain.extend(chain.chain)
+            await self.context.send_message(event.unified_msg_origin, preview_chain)
+
+            # 2. 构造 4 位简短确认码并暂存草稿 60 秒
+            token = uuid.uuid4().hex[:4].upper()
             task_id = str(uuid.uuid4())
-            await self.broadcast_task_mgr.add_task(task_id, {
+            task_data = {
+                "task_id": task_id,
                 "target_ts": target_ts,
                 "components": components_data,
                 "issuer_umo": str(event.unified_msg_origin),
@@ -6403,59 +6555,300 @@ class RocomPlugin(Star):
                 "specific_targets": specific_targets,
                 "target_sub": target_sub,
                 "target_active": target_active,
-                "active_days": active_days
-            })
-            yield event.plain_result(f"✅ 已成功建立持久化定时任务！\n执行时间：{time_hint}\n预计发送至 {len(umos)} 个目标。\n重启机器人该任务也不会丢失。")
-            return
-            
-        yield event.plain_result(f"正在准备向 {len(umos)} 个目标发送公告，请稍候...")
-        
-        success_count = 0
-        for umo, key in umos.items():
-            try:
-                # 重新构建 MessageChain，防止被底层修改
-                send_chain = MessageChain()
-                is_private = False
-                target_id = 0
-                if isinstance(key, str) and key.startswith("private_"):
-                    is_private = True
-                    target_id = key.split("_", 1)[1] if "_" in key else 0
-                elif "FriendMessage" in umo or "PrivateMessage" in umo:
-                    is_private = True
-                    target_id = umo.split(":")[-1]
+                "active_days": active_days,
+                "mention_all": mention_all,
+                "summary": text_summary,
+                "status": "pending" if target_ts > 0 else "ready",
+                "progress": {"total": len(umos), "sent": 0, "failed": 0},
+            }
 
-                if is_private:
-                    send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
-                    if mention_all:
-                        platform_id = umo.split(":")[0] if ":" in umo else ""
-                        platform_inst = self.context.get_platform_inst(platform_id)
-                        if platform_inst and platform_inst.meta().name == "aiocqhttp":
-                            try:
-                                await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
-                            except Exception as e:
-                                logger.warning(f"[Rocom] 群发公告私聊戳一戳发送失败: {e}")
-                        else:
-                            send_chain.chain.append(Poke(qq=target_id))
-                else:
-                    send_chain.chain = list(chain.chain)
-                await self.context.send_message(umo, send_chain)
-                success_count += 1
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                if mention_all:
-                    logger.warning(f"[Rocom] 群发公告推送失败 ({umo})，尝试降级纯文本: {e}")
-                    try:
-                        fallback_chain = MessageChain()
-                        fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
-                        await self.context.send_message(umo, fallback_chain)
-                        success_count += 1
-                        await asyncio.sleep(0.5)
-                    except Exception as fallback_e:
-                        logger.warning(f"[Rocom] 群发降级推送失败 ({umo}): {fallback_e}")
-                else:
-                    logger.warning(f"[Rocom] 群发公告推送失败 ({umo}): {e}")
-                
-        yield event.plain_result(f"群发完成！成功发送给 {success_count} 个目标。")
+            issuer_key = str(event.get_sender_id())
+            self._pending_broadcasts[issuer_key] = {
+                "token": token,
+                "expires_at": time.time() + 60,
+                "task_id": task_id,
+                "task_data": task_data,
+                "target_count": len(umos),
+                "time_hint": time_hint or "即时群发",
+                "mention_all": mention_all,
+            }
+
+            confirm_text = (
+                f"📋【洛克群发公告 · 沙盒预览已生成】\n"
+                f"拟发送内容已原样呈现于上方，请核对排版与附件。\n\n"
+                f"📊 任务参数：\n"
+                f"• 目标受众：{target_desc}（共 {len(umos)} 个目标群/私聊）\n"
+                f"• 发送模式：{mode_desc}\n"
+                f"• @全体成员：{'是（群聊@全体，私聊戳一戳）' if mention_all else '否'}\n\n"
+                f"⚠️ 请在 60 秒内核对预览并确认操作：\n"
+                f"▶️ 确认发送：回复「/确认洛克群发」或「/确认洛克群发 {token}」\n"
+                f"⏹️ 取消发送：回复「/取消洛克群发」或等待 60 秒自动失效\n"
+                f"💡 提示：如需脚本化直接发送，可附带 --force 或 -y 跳过确认"
+            )
+            yield event.plain_result(confirm_text)
+            return
+
+        # 强制发送模式（--force 或 -y）
+        task_id = str(uuid.uuid4())
+        task_data = {
+            "task_id": task_id,
+            "target_ts": target_ts,
+            "components": components_data,
+            "issuer_umo": str(event.unified_msg_origin),
+            "created_at": int(time.time()),
+            "specific_targets": specific_targets,
+            "target_sub": target_sub,
+            "target_active": target_active,
+            "active_days": active_days,
+            "mention_all": mention_all,
+            "summary": text_summary,
+            "status": "pending" if target_ts > 0 else "running",
+            "progress": {"total": len(umos), "sent": 0, "failed": 0},
+        }
+
+        short_id = task_id[:8]
+        if target_ts > 0:
+            await self.broadcast_task_mgr.add_task(task_id, task_data)
+            yield event.plain_result(
+                f"✅ 已成功建立持久化定时群发任务！\n"
+                f"• 任务ID: {short_id}\n"
+                f"• 执行时间：{time_hint}\n"
+                f"• 预计发送至 {len(umos)} 个目标。\n"
+                f"💡 可输入「/洛克群发任务列表」查看任务，或「/取消洛克群发 {short_id}」取消定时任务。"
+            )
+            return
+
+        await self.broadcast_task_mgr.add_task(task_id, task_data)
+        cancel_event = asyncio.Event()
+        self._running_broadcast_cancels[str(task_id)] = cancel_event
+        asyncio.create_task(self._execute_broadcast_task(task_id, task_data, cancel_event))
+        yield event.plain_result(
+            f"✅ 群发任务 [{short_id}] 已在后台启动！\n"
+            f"• 正在向 {len(umos)} 个目标推送中...\n"
+            f"💡 可输入「/洛克群发任务列表」查看进度，或「/取消洛克群发 {short_id}」紧急终止。"
+        )
+
+    @filter.command("确认洛克群发")
+    async def confirm_broadcast(self, event: AstrMessageEvent):
+        """确认执行处于待确认状态的群发公告草稿"""
+        await self._record_active_user(event)
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+
+        issuer_key = str(event.get_sender_id())
+        pending = self._pending_broadcasts.get(issuer_key)
+        if not pending or time.time() > pending.get("expires_at", 0):
+            self._pending_broadcasts.pop(issuer_key, None)
+            yield event.plain_result("当前没有等待确认的群发公告草稿，或已超时失效（有效期 60 秒）。")
+            return
+
+        # 提取传入的 token（如果有）
+        raw_text = event.message_str.strip()
+        args = re.sub(r'^[/.#]*确认洛克群发\s*', '', raw_text).strip()
+        if args and args.upper() != pending["token"].upper():
+            yield event.plain_result(f"确认码不匹配！请输入「/确认洛克群发 {pending['token']}」或直接回复「/确认洛克群发」。")
+            return
+
+        self._pending_broadcasts.pop(issuer_key, None)
+        task_id = pending["task_id"]
+        task_data = pending["task_data"]
+        target_ts = task_data.get("target_ts", 0)
+        target_count = pending["target_count"]
+        time_hint = pending["time_hint"]
+        short_id = task_id[:8]
+
+        if target_ts > 0:
+            task_data["status"] = "pending"
+            await self.broadcast_task_mgr.add_task(task_id, task_data)
+            yield event.plain_result(
+                f"✅ 已确认！定时群发任务已建立。\n"
+                f"• 任务ID: {short_id}\n"
+                f"• 执行时间：{time_hint}\n"
+                f"• 目标受众：预计覆盖 {target_count} 个群/私聊。\n"
+                f"💡 可输入「/洛克群发任务列表」查看任务，或「/取消洛克群发 {short_id}」取消定时任务。"
+            )
+        else:
+            task_data["status"] = "running"
+            await self.broadcast_task_mgr.add_task(task_id, task_data)
+            cancel_event = asyncio.Event()
+            self._running_broadcast_cancels[str(task_id)] = cancel_event
+            asyncio.create_task(self._execute_broadcast_task(task_id, task_data, cancel_event))
+            yield event.plain_result(
+                f"✅ 已确认！群发任务 [{short_id}] 已在后台启动。\n"
+                f"• 正在向 {target_count} 个目标推送中...\n"
+                f"💡 可输入「/洛克群发任务列表」查看发送进度，或「/取消洛克群发 {short_id}」紧急终止。"
+            )
+
+    @filter.command("取消洛克群发", alias={"终止洛克群发"})
+    async def cancel_broadcast(self, event: AstrMessageEvent):
+        """取消待确认群发草稿、中止正在执行的群发或删除定时群发"""
+        await self._record_active_user(event)
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+
+        issuer_key = str(event.get_sender_id())
+        raw_text = event.message_str.strip()
+        query_id = re.sub(r'^[/.#]*(?:取消洛克群发|终止洛克群发)\s*', '', raw_text).strip()
+
+        # 1. 若未提供任务 ID 且存在待确认草稿，优先取消草稿
+        if not query_id:
+            if issuer_key in self._pending_broadcasts:
+                del self._pending_broadcasts[issuer_key]
+                yield event.plain_result("已取消当前会话待确认的群发公告草稿。")
+                return
+            yield event.plain_result("请指定要取消或终止的任务 ID，例如：「/取消洛克群发 a1b2c3d4」，可发送「/洛克群发任务列表」查看当前任务。")
+            return
+
+        # 2. 若传入的是确认码，且匹配草稿
+        pending = self._pending_broadcasts.get(issuer_key)
+        if pending and query_id.upper() == pending.get("token", "").upper():
+            del self._pending_broadcasts[issuer_key]
+            yield event.plain_result(f"已取消待确认草稿（确认码: {query_id.upper()}）。")
+            return
+
+        # 3. 按 ID / 前缀检索持久化或运行中的任务
+        matched_id, task = await self._find_broadcast_task(query_id)
+        if not matched_id:
+            yield event.plain_result(f"未找到匹配的群发任务 [{query_id}]。可输入「/洛克群发任务列表」查看所有任务。")
+            return
+
+        short_id = matched_id[:8]
+        # 若正在执行，发送取消信号
+        if matched_id in self._running_broadcast_cancels:
+            self._running_broadcast_cancels[matched_id].set()
+            yield event.plain_result(f"⏹️ 已向群发任务 [{short_id}] 发送紧急终止信号，正在中断发送...")
+            return
+
+        # 若处于 pending 或 paused 状态，直接删除
+        await self.broadcast_task_mgr.delete_task(matched_id)
+        yield event.plain_result(f"🗑️ 已成功取消定时群发任务 [{short_id}]。")
+
+    @filter.command("洛克群发任务列表", alias={"洛克群发状态", "群发任务"})
+    async def list_broadcast_tasks(self, event: AstrMessageEvent):
+        """查看当前正在执行和定时挂起的群发任务列表与状态"""
+        await self._record_active_user(event)
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+
+        issuer_key = str(event.get_sender_id())
+        tasks = await self.broadcast_task_mgr.get_all_tasks()
+        pending_draft = self._pending_broadcasts.get(issuer_key)
+
+        lines = ["📋【洛克群发任务监控中心】"]
+
+        # 待确认草稿
+        if pending_draft:
+            remaining = int(max(0, pending_draft["expires_at"] - time.time()))
+            if remaining > 0:
+                lines.append(f"\n⏳ 待确认草稿：")
+                lines.append(f"• 确认码：{pending_draft['token']} (剩余 {remaining} 秒)")
+                lines.append(f"• 目标受众：共 {pending_draft['target_count']} 个目标 | 模式：{pending_draft['time_hint']}")
+                lines.append(f"• 发送「/确认洛克群发」执行，或「/取消洛克群发」作废")
+
+        if not tasks and not pending_draft:
+            yield event.plain_result("当前没有任何挂起或正在执行的群发任务。")
+            return
+
+        running_list = []
+        scheduled_list = []
+        paused_list = []
+
+        now = time.time()
+        for tid, t in tasks.items():
+            st = t.get("status", "pending")
+            short_id = str(tid)[:8]
+            prog = t.get("progress", {})
+            summary = str(t.get("summary") or "（无文本摘要）")[:30]
+            if len(str(t.get("summary") or "")) > 30:
+                summary += "..."
+
+            if st == "running" or tid in self._running_broadcast_cancels:
+                sent = prog.get("sent", 0)
+                total = prog.get("total", 0)
+                failed = prog.get("failed", 0)
+                running_list.append(f"• [{short_id}] 正在发送 | 进度: {sent}/{total} (失败: {failed}) | 内容: {summary}")
+            elif st == "paused":
+                target_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t.get("target_ts", now)))
+                paused_list.append(f"• [{short_id}] 已暂停 | 原计划: {target_str} | 内容: {summary}")
+            else:
+                target_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t.get("target_ts", now)))
+                scheduled_list.append(f"• [{short_id}] 定时待执行 | 计划时间: {target_str} | 内容: {summary}")
+
+        if running_list:
+            lines.append("\n🚀 正在执行中：")
+            lines.extend(running_list)
+        if scheduled_list:
+            lines.append("\n⏰ 定时挂起中：")
+            lines.extend(scheduled_list)
+        if paused_list:
+            lines.append("\n⏸️ 已暂停任务：")
+            lines.extend(paused_list)
+
+        lines.append("\n💡 常用管理操作：")
+        lines.append("• 终止正在执行或取消定时：/取消洛克群发 <任务ID>")
+        lines.append("• 暂停定时任务：/暂停洛克群发 <任务ID>")
+        lines.append("• 恢复定时任务：/恢复洛克群发 <任务ID>")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("暂停洛克群发")
+    async def pause_broadcast(self, event: AstrMessageEvent):
+        """暂停指定的定时群发任务"""
+        await self._record_active_user(event)
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+
+        raw_text = event.message_str.strip()
+        query_id = re.sub(r'^[/.#]*暂停洛克群发\s*', '', raw_text).strip()
+        if not query_id:
+            yield event.plain_result("请提供要暂停的定时任务 ID，例如：「/暂停洛克群发 a1b2c3d4」。")
+            return
+
+        matched_id, task = await self._find_broadcast_task(query_id)
+        if not matched_id:
+            yield event.plain_result(f"未找到匹配的群发任务 [{query_id}]。")
+            return
+
+        if task.get("status") == "running" or matched_id in self._running_broadcast_cancels:
+            yield event.plain_result("该任务正在执行中，无法暂停。如需停止请发送「/取消洛克群发 <任务ID>」进行紧急终止。")
+            return
+
+        if task.get("status") == "paused":
+            yield event.plain_result(f"任务 [{matched_id[:8]}] 已经处于暂停状态。")
+            return
+
+        await self.broadcast_task_mgr.update_task(matched_id, {"status": "paused"})
+        yield event.plain_result(f"⏸️ 已暂停定时任务 [{matched_id[:8]}]，到期不会触发发送。回复「/恢复洛克群发 {matched_id[:8]}」可重新激活。")
+
+    @filter.command("恢复洛克群发")
+    async def resume_broadcast(self, event: AstrMessageEvent):
+        """恢复已暂停的定时群发任务"""
+        await self._record_active_user(event)
+        if not event.is_admin():
+            yield event.plain_result("该指令仅供机器人管理员使用。")
+            return
+
+        raw_text = event.message_str.strip()
+        query_id = re.sub(r'^[/.#]*恢复洛克群发\s*', '', raw_text).strip()
+        if not query_id:
+            yield event.plain_result("请提供要恢复的定时任务 ID，例如：「/恢复洛克群发 a1b2c3d4」。")
+            return
+
+        matched_id, task = await self._find_broadcast_task(query_id)
+        if not matched_id:
+            yield event.plain_result(f"未找到匹配的群发任务 [{query_id}]。")
+            return
+
+        if task.get("status") != "paused":
+            yield event.plain_result(f"任务 [{matched_id[:8]}] 当前状态为 {task.get('status', '未知')}，无需恢复。")
+            return
+
+        await self.broadcast_task_mgr.update_task(matched_id, {"status": "pending"})
+        yield event.plain_result(f"▶️ 已恢复定时任务 [{matched_id[:8]}]，将在设定时间正常执行。")
 
     @filter.command("远行商人", alias={"yxsr"})
     async def rocom_merchant(self, event: AstrMessageEvent):
