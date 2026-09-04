@@ -46,7 +46,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.2", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.3", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
