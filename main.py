@@ -5081,6 +5081,7 @@ class RocomPlugin(Star):
                         {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
                         {"cmd": "订阅远行商人 [1/0] [@商品 商品/全部] [-N/-*N/-@N/-@*N]", "desc": "已开启权限的群管理员或 Bot 管理员可订阅远行商人，1=珍稀提醒@全体，@前缀=珍稀提醒商品，全部=每轮必推，-N=结束提醒"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群/私聊远行商人订阅"},
+                        {"cmd": "远行商人订阅状态", "desc": "查看当前群/私聊远行商人的关注商品、强提醒及结束提醒配置 (支持别名：商人订阅状态)"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
                         {"cmd": "洛克wiki [类型] [关键词/ID]", "desc": "统一 Wiki 查询入口；无参数显示支持的专题类型 (支持别名：洛克百科)"},
@@ -7560,6 +7561,130 @@ class RocomPlugin(Star):
         else:
             logger.info(f"[Rocom] 远行商人订阅：未找到可删除的订阅 key={subscription_key}")
             yield event.plain_result(f"{subscription_name}当前没有远行商人订阅。")
+
+    @filter.command("远行商人订阅状态", alias={"商人订阅状态", "yxsr订阅状态"})
+    async def merchant_subscription_status(self, event: AstrMessageEvent):
+        """查看当前群或私聊会话的远行商人订阅配置状态"""
+        await self._record_active_user(event)
+
+        is_private = event.is_private_chat()
+        if is_private:
+            subscription_key = f"private_{event.get_sender_id()}"
+            target_name = "个人私聊"
+        else:
+            subscription_key = str(event.get_group_id())
+            target_name = f"群 {subscription_key}"
+
+        # 检查并获取已有订阅
+        all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+        sub = all_subs.get(subscription_key)
+        if not sub:
+            for k, v in all_subs.items():
+                if str(k) == str(subscription_key) or str(v.get("key", "")) == str(subscription_key):
+                    sub = v
+                    break
+
+        if not sub:
+            if is_private and not self.merchant_private_subscription_enabled:
+                yield event.plain_result(
+                    f"🏪【远行商人订阅状态 · {target_name}】\n"
+                    f"• 状态：⚪ 未开启订阅\n"
+                    f"• 提示：当前个人私聊订阅功能已由管理员禁用。"
+                )
+                return
+
+            yield event.plain_result(
+                f"🏪【远行商人订阅状态 · {target_name}】\n"
+                f"• 当前状态：⚪ 未开启订阅\n\n"
+                f"💡 可通过以下指令开启自动提醒：\n"
+                f"• /订阅远行商人 → 订阅默认商品（{self._default_items_hint()}）\n"
+                f"• /订阅远行商人 全部 → 每轮刷新必推\n"
+                f"• /订阅远行商人 1 国王球 棱镜球 → 指定商品出货时提醒并@全体\n"
+                f"• /订阅远行商人 全部 @国王球 -30 → 每轮开盘推全部（出国王球@全体），结束前30分钟提醒\n"
+                f"• /订阅远行商人 全部 -@30 → 每轮开盘推全部，结束前30分钟强提醒(@全体)"
+            )
+            return
+
+        # 存在订阅时的详细展示
+        all_products = sub.get("all_products", False)
+        items = sub.get("items") or []
+        mention_all = sub.get("mention_all", False)
+        mention_items = sub.get("mention_items") or []
+        ending_minutes = sub.get("ending_reminder_minutes", 0)
+        ending_mention = sub.get("ending_reminder_mention", False)
+        ending_all_items = sub.get("ending_reminder_all_items", False)
+        ending_rare_only = sub.get("ending_reminder_rare_only", False)
+        last_push_round = sub.get("last_push_round", "")
+        last_matched_items = sub.get("last_matched_items") or []
+        last_ending_round = sub.get("last_ending_reminder_round", "")
+
+        # 1. 关注商品与推送策略
+        if all_products:
+            if items:
+                items_desc = f"全部在售商品（每轮必推；特别关注：{'、'.join(items)}）"
+            else:
+                items_desc = "全部在售商品（每轮必推）"
+        elif items:
+            items_desc = f"{'、'.join(items)}（共 {len(items)} 种）"
+        else:
+            items_desc = f"默认关注商品（{self._default_items_hint()}）"
+
+        # 2. 强提醒模式（@全体）
+        if is_private:
+            mention_desc = "私聊消息推送"
+        elif mention_all and mention_items:
+            mention_desc = f"🔔 部分强提醒（仅命中 {'、'.join(mention_items)} 时 @全体成员）"
+        elif mention_all:
+            mention_desc = "🔔 全强提醒（命中关注商品时均 @全体成员）"
+        else:
+            mention_desc = "🔕 普通提醒（不 @全体成员）"
+
+        # 3. 结束提醒
+        if ending_minutes > 0:
+            if ending_all_items:
+                mode_label = "全部在售商品"
+            elif ending_rare_only:
+                mode_label = "默认珍稀列表"
+            elif items:
+                mode_label = f"关注的 {len(items)} 种商品"
+            else:
+                mode_label = "默认常规列表"
+
+            mention_label = "强提醒(@全体)" if (ending_mention and not is_private) else ("强提醒" if ending_mention else "普通提醒")
+            ending_desc = f"⏰ 结束前 {ending_minutes} 分钟（{mention_label} · 范围：{mode_label}）"
+        else:
+            ending_desc = "🔕 未开启结束提醒"
+
+        lines = [
+            f"🏪【远行商人订阅状态 · {target_name}】",
+            f"• 订阅状态：✅ 已开启",
+            f"• 关注商品：{items_desc}",
+            f"• 开盘提醒：{mention_desc}",
+            f"• 结束提醒：{ending_desc}",
+        ]
+
+        if is_private and not self.merchant_private_subscription_enabled:
+            lines.append("⚠️ 注意：当前后台个人私聊订阅功能已关闭，但已有订阅仍会生效。如需关闭可使用 /取消订阅远行商人。")
+
+        # 最近推送动态（若有）
+        recent_info = []
+        if last_push_round:
+            recent_info.append(f"最新开盘推送轮次：{last_push_round}")
+        if last_matched_items:
+            recent_info.append(f"最新命中商品：{'、'.join(last_matched_items)}")
+        if last_ending_round and ending_minutes > 0:
+            recent_info.append(f"最新结束提醒轮次：{last_ending_round}")
+
+        if recent_info:
+            lines.append(f"• 推送动态：{' | '.join(recent_info)}")
+
+        lines.append("")
+        lines.append("💡 管理提示：")
+        lines.append("• 修改配置：/订阅远行商人 [1/0] [@商品 商品/全部] [-N/-*N/-@N/-@*N]")
+        lines.append("• 关闭订阅：/取消订阅远行商人")
+
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("洛克交换大厅", alias={"洛克大厅", "交换大厅"})
     async def rocom_exchange_hall(self, event: AstrMessageEvent, page: str = "1"):
         """查看交换大厅"""
