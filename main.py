@@ -1759,16 +1759,19 @@ class RocomPlugin(Star):
         logger.info(f"[Rocom] 开始执行群发任务: {task_short_id}")
 
         chain = MessageChain()
-        has_at_all = False
-        for comp in task.get("components", []):
+        has_at_all = task.get("mention_all", False) or any(c.get("type") == "at_all" for c in task.get("components", []))
+        body_comps = [c for c in task.get("components", []) if c.get("type") != "at_all"]
+
+        if has_at_all:
+            chain.at_all()
+            chain.message("\n")
+
+        for comp in body_comps:
             if comp["type"] == "plain":
                 chain.message(comp["text"])
             elif comp["type"] == "image":
                 file_url = comp["file"]
                 chain.file_image(file_url)
-            elif comp["type"] == "at_all":
-                chain.at_all()
-                has_at_all = True
 
         # 解析发送目标
         umos = {}
@@ -1829,6 +1832,14 @@ class RocomPlugin(Star):
 
                     if is_private:
                         send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
+                        if send_chain.chain and type(send_chain.chain[0]).__name__ == "Plain":
+                            first_text = getattr(send_chain.chain[0], "text", "")
+                            if first_text.startswith("\n"):
+                                cleaned = first_text.lstrip("\r\n")
+                                if cleaned:
+                                    send_chain.chain[0].text = cleaned
+                                else:
+                                    send_chain.chain.pop(0)
                         if has_at_all:
                             platform_id = umo.split(":")[0] if ":" in umo else ""
                             platform_inst = self.context.get_platform_inst(platform_id)
@@ -1854,6 +1865,14 @@ class RocomPlugin(Star):
                         try:
                             fallback_chain = MessageChain()
                             fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
+                            if fallback_chain.chain and type(fallback_chain.chain[0]).__name__ == "Plain":
+                                first_text = getattr(fallback_chain.chain[0], "text", "")
+                                if first_text.startswith("\n"):
+                                    cleaned = first_text.lstrip("\r\n")
+                                    if cleaned:
+                                        fallback_chain.chain[0].text = cleaned
+                                    else:
+                                        fallback_chain.chain.pop(0)
                             await self.context.send_message(umo, fallback_chain)
                             success_count += 1
                             consecutive_failures = 0
@@ -6414,8 +6433,8 @@ class RocomPlugin(Star):
             return
             
         import uuid
-        chain = MessageChain()
-        components_data = []
+        body_chain = MessageChain()
+        body_components_data = []
         has_content = False
         first_plain_processed = False
         target_ts = 0
@@ -6517,26 +6536,33 @@ class RocomPlugin(Star):
                             break
                             
                     first_plain_processed = True
+                    text = text.lstrip('\r\n')
                 if text:
-                    chain.message(text)
-                    components_data.append({"type": "plain", "text": text})
+                    body_chain.message(text)
+                    body_components_data.append({"type": "plain", "text": text})
                     has_content = True
             elif isinstance(comp, Image):
-                chain.chain.append(comp)
+                body_chain.chain.append(comp)
                 file_url = getattr(comp, "file", None) or getattr(comp, "url", None)
                 if file_url:
-                    components_data.append({"type": "image", "file": file_url})
+                    body_components_data.append({"type": "image", "file": file_url})
                 has_content = True
             else:
-                chain.chain.append(comp)
-                
-        if mention_all:
-            chain.at_all()
-            components_data.append({"type": "at_all"})
-            
+                body_chain.chain.append(comp)
+
         if not has_content:
             yield event.plain_result("请在指令后附带要群发的内容，支持图文。\n若需定时发送，请在指令后加上 -d 或 -t。\n如需@全体，请加上 -a。\n可用标志位：-g [天数|all] (全域，默认all), --active [天数|all] (仅活跃用户), --sub (仅订阅用户, 默认)。")
             return
+
+        chain = MessageChain()
+        components_data = []
+        if mention_all:
+            chain.at_all()
+            chain.message("\n")
+            components_data.append({"type": "at_all"})
+
+        chain.chain.extend(body_chain.chain)
+        components_data.extend(body_components_data)
             
         umos = {}
         
