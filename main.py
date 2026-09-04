@@ -5,6 +5,7 @@ import tempfile
 import asyncio
 import threading
 import re
+import html
 import json
 import random
 import hashlib
@@ -2518,6 +2519,64 @@ class RocomPlugin(Star):
             "pageWidth": 680,
         }
 
+    def _clean_announcement_text(self, raw_html: str, max_length: int = 0) -> str:
+        """清洗公告正文 HTML 内容为排版整齐的纯文本，保留段落换行并反转义 HTML 实体"""
+        if not raw_html:
+            return ""
+
+        # 1. 将换行标签 <br>, <br/> 替换为实际换行符
+        text = re.sub(r'<br\s*/?>', '\n', str(raw_html), flags=re.IGNORECASE)
+
+        # 2. 块级标签闭合处补充换行符
+        text = re.sub(r'</(?:p|div|h[1-6]|li|tr)>', '\n', text, flags=re.IGNORECASE)
+
+        # 3. 处理超链接标签 <a href='...'>...</a>，保留有效链接信息
+        def _link_sub(m):
+            href = m.group(1).strip()
+            inner = m.group(2).strip()
+            if not inner:
+                return href
+            if inner == href:
+                return inner
+            return f"{inner} ({href})"
+
+        text = re.sub(
+            r'<a\s+[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>',
+            _link_sub,
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        # 4. 去除所有剩余 HTML 标签（如 <strong>, <span>, <img> 等）
+        text = re.sub(r'<[^>]+>', '', text)
+
+        # 5. 反转义所有 HTML 实体（如 &gt; -> >, &lt; -> <, &amp; -> &, &nbsp; -> 空格 等）
+        text = html.unescape(text)
+
+        # 6. 不换行空格及特殊全角空白统一规整为标准半角空格
+        text = text.replace('\xa0', ' ').replace('\u3000', ' ')
+
+        # 7. 按行规整：压缩行内多余空白，修剪每行首尾空白字符，并将多个连续空行压缩为最多单个空行
+        lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in text.split('\n')]
+        result_lines: List[str] = []
+        prev_empty = False
+        for line in lines:
+            if line:
+                result_lines.append(line)
+                prev_empty = False
+            else:
+                if not prev_empty and result_lines:
+                    result_lines.append('')
+                    prev_empty = True
+
+        clean_text = '\n'.join(result_lines).strip()
+
+        # 8. 长度截断
+        if max_length > 0 and len(clean_text) > max_length:
+            clean_text = clean_text[:max_length].rstrip() + '…'
+
+        return clean_text
+
     def _build_announcement_detail_render_data(self, item: Dict[str, Any] | None) -> Dict[str, Any]:
         item = item or {}
         content = item.get("content") if isinstance(item.get("content"), dict) else {}
@@ -2909,7 +2968,7 @@ class RocomPlugin(Star):
                     for u in img_urls:
                         chain.file_image(u)
                 elif new_item.get("summary"):
-                    chain.message(str(new_item.get("summary")))
+                    chain.message(self._clean_announcement_text(str(new_item.get("summary")), max_length=500))
 
                 push_ok = False
                 try:
@@ -2925,9 +2984,7 @@ class RocomPlugin(Star):
                             if isinstance(detail, dict):
                                 content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
                                 html_text = content.get("text") or detail.get("summary") or ""
-                                content_text = re.sub(r'<[^>]+>', '', html_text).strip()
-                                if len(content_text) > 500:
-                                    content_text = content_text[:500] + "…"
+                                content_text = self._clean_announcement_text(html_text, max_length=500)
                             text_only = MessageChain().message(
                                 f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n\n{content_text}"
                             )
@@ -6240,7 +6297,8 @@ class RocomPlugin(Star):
             for u in img_urls:
                 components.append(Image.fromFileSystem(u))
         else:
-            components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
+            clean_text = self._clean_announcement_text(data.get("content_html") or data.get("summary") or "该公告暂无正文。", max_length=500)
+            components.append(Plain(f"【{data['title']}】\n\n{clean_text}"))
         yield event.chain_result(components)
         
         for v in data.get("videos", []):
@@ -6271,7 +6329,8 @@ class RocomPlugin(Star):
             for u in img_urls:
                 components.append(Image.fromFileSystem(u))
         else:
-            components.append(Plain(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}"))
+            clean_text = self._clean_announcement_text(data.get("content_html") or data.get("summary") or "该公告暂无正文。", max_length=500)
+            components.append(Plain(f"【{data['title']}】\n\n{clean_text}"))
         yield event.chain_result(components)
         
         for v in data.get("videos", []):
