@@ -46,7 +46,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.3", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.4", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
@@ -1764,11 +1764,16 @@ class RocomPlugin(Star):
 
         if has_at_all:
             chain.at_all()
-            chain.message("\n")
 
+        first_plain_done = False
         for comp in body_comps:
             if comp["type"] == "plain":
-                chain.message(comp["text"])
+                text = comp["text"]
+                if has_at_all and not first_plain_done and text.strip():
+                    first_plain_done = True
+                    if not text.startswith("\n"):
+                        text = "\n" + text
+                chain.message(text)
             elif comp["type"] == "image":
                 file_url = comp["file"]
                 chain.file_image(file_url)
@@ -1826,20 +1831,26 @@ class RocomPlugin(Star):
                     if isinstance(key, str) and key.startswith("private_"):
                         is_private = True
                         target_id = key.split("_", 1)[1] if "_" in key else 0
-                    elif "FriendMessage" in umo or "PrivateMessage" in umo:
+                    elif "FriendMessage" in umo or "PrivateMessage" in umo or umo.startswith("private_"):
                         is_private = True
-                        target_id = umo.split(":")[-1]
+                        target_id = umo.split(":")[-1].split("_")[-1]
 
                     if is_private:
-                        send_chain.chain = [c for c in chain.chain if type(c).__name__ != "AtAll"]
-                        if send_chain.chain and type(send_chain.chain[0]).__name__ == "Plain":
-                            first_text = getattr(send_chain.chain[0], "text", "")
-                            if first_text.startswith("\n"):
-                                cleaned = first_text.lstrip("\r\n")
-                                if cleaned:
-                                    send_chain.chain[0].text = cleaned
-                                else:
-                                    send_chain.chain.pop(0)
+                        send_chain.chain = []
+                        stripped_first = False
+                        for c in chain.chain:
+                            if type(c).__name__ == "AtAll":
+                                continue
+                            if not stripped_first and type(c).__name__ == "Plain":
+                                stripped_first = True
+                                first_text = getattr(c, "text", "")
+                                if first_text.startswith("\n"):
+                                    cleaned = first_text.lstrip("\r\n")
+                                    if cleaned:
+                                        send_chain.message(cleaned)
+                                    continue
+                            send_chain.chain.append(c)
+
                         if has_at_all:
                             platform_id = umo.split(":")[0] if ":" in umo else ""
                             platform_inst = self.context.get_platform_inst(platform_id)
@@ -1864,15 +1875,19 @@ class RocomPlugin(Star):
                         logger.warning(f"[Rocom] 群发推送失败 ({umo})，尝试降级纯文本: {e}")
                         try:
                             fallback_chain = MessageChain()
-                            fallback_chain.chain = [c for c in send_chain.chain if type(c).__name__ not in ("AtAll", "Poke")]
-                            if fallback_chain.chain and type(fallback_chain.chain[0]).__name__ == "Plain":
-                                first_text = getattr(fallback_chain.chain[0], "text", "")
-                                if first_text.startswith("\n"):
-                                    cleaned = first_text.lstrip("\r\n")
-                                    if cleaned:
-                                        fallback_chain.chain[0].text = cleaned
-                                    else:
-                                        fallback_chain.chain.pop(0)
+                            stripped_first = False
+                            for c in send_chain.chain:
+                                if type(c).__name__ in ("AtAll", "Poke"):
+                                    continue
+                                if not stripped_first and type(c).__name__ == "Plain":
+                                    stripped_first = True
+                                    first_text = getattr(c, "text", "")
+                                    if first_text.startswith("\n"):
+                                        cleaned = first_text.lstrip("\r\n")
+                                        if cleaned:
+                                            fallback_chain.message(cleaned)
+                                        continue
+                                fallback_chain.chain.append(c)
                             await self.context.send_message(umo, fallback_chain)
                             success_count += 1
                             consecutive_failures = 0
@@ -6558,10 +6573,20 @@ class RocomPlugin(Star):
         components_data = []
         if mention_all:
             chain.at_all()
-            chain.message("\n")
             components_data.append({"type": "at_all"})
 
-        chain.chain.extend(body_chain.chain)
+        first_plain_done = False
+        for comp in body_chain.chain:
+            if mention_all and not first_plain_done and type(comp).__name__ == "Plain" and getattr(comp, "text", "").strip():
+                first_plain_done = True
+                text = getattr(comp, "text", "")
+                if not text.startswith("\n"):
+                    chain.message("\n" + text)
+                else:
+                    chain.message(text)
+            else:
+                chain.chain.append(comp)
+
         components_data.extend(body_components_data)
             
         umos = {}
