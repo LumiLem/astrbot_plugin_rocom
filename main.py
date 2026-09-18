@@ -46,7 +46,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.4", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.5", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
 
@@ -3794,17 +3794,18 @@ class RocomPlugin(Star):
                 for p in products:
                     pc = p.get("product_category", "round")
                     cat_map.setdefault(pc, []).append(p)
-                active_cats = [k for k in cat_order if k in cat_map]
+                active_cats = [k for k in cat_order if k in cat_map and cat_map[k]]
                 lines = [
                     f"远行商人本轮商品已更新",
                     f"轮次：第{round_info['current']}轮",
                     f"剩余：{round_info['countdown']}",
                 ]
                 if len(active_cats) > 1:
-                    for cat in cat_order:
+                    for cat in active_cats:
                         prods = cat_map.get(cat, [])
-                        names = "、".join(p["name"] for p in prods)
-                        lines.append(f"{category_labels[cat]}：{names}")
+                        names = "、".join(p["name"] for p in prods if p.get("name"))
+                        if names:
+                            lines.append(f"{category_labels[cat]}：{names}")
                 else:
                     lines.append(f"商品：{'、'.join(product_names)}")
                 msg_text = "\n".join(lines).strip()
@@ -6983,7 +6984,7 @@ class RocomPlugin(Star):
         for p in products:
             pc = p.get("product_category", "round")
             cat_map.setdefault(pc, []).append(p)
-        active_cats = [k for k in category_order if k in cat_map]
+        active_cats = [k for k in category_order if k in cat_map and cat_map[k]]
         show_header = len(active_cats) > 1
         for key in active_cats:
             prods = cat_map.get(key)
