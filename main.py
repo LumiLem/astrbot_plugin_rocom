@@ -3535,9 +3535,14 @@ class RocomPlugin(Star):
             render_item = await self._enrich_bilibili_item(item)
             render_data = await self._build_bilibili_dynamic_render_data(render_item)
             img_url = await self.renderer.render_html(
-                "render/announcement/detail.html",
+                "render/announcement/bilibili.html",
                 render_data,
-                {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+                {
+                    "device_scale_factor": 1.5,
+                    "viewport_width": 1100,
+                    "viewport_height": 1200,
+                    "image_wait_timeout": 30000,
+                },
             )
             img_urls = self._slice_and_compress_image(img_url) if img_url else []
 
@@ -3750,30 +3755,6 @@ class RocomPlugin(Star):
             for paragraph in paragraphs
         )
 
-    async def _download_image_as_data_uri(self, url: str) -> str:
-        if not url:
-            return ""
-        local_path = await self._download_announcement_image(url, referer="https://www.bilibili.com/")
-        if not local_path or not os.path.isfile(local_path):
-            return ""
-        try:
-            with open(local_path, "rb") as f:
-                raw = f.read()
-        except Exception:
-            return ""
-        if not raw:
-            return ""
-        lower = local_path.lower()
-        if lower.endswith(".png"):
-            mime = "image/png"
-        elif lower.endswith(".webp"):
-            mime = "image/webp"
-        elif lower.endswith(".gif"):
-            mime = "image/gif"
-        else:
-            mime = "image/jpeg"
-        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-
     async def _enrich_bilibili_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """feed 里的 opus.summary 在 has_more 时是截断的，渲染前用图文详情补全正文与图片。"""
         if not isinstance(item, dict):
@@ -3792,8 +3773,10 @@ class RocomPlugin(Star):
         detail_text = str(detail.get("text") or "").strip()
         if detail_text and len(detail_text) > len(str(item.get("text") or "")):
             enriched["text"] = detail_text
-        if not str(enriched.get("title") or "").strip() and detail.get("title"):
-            enriched["title"] = str(detail["title"]).strip()
+        if detail.get("title"):
+            if not str(enriched.get("title") or "").strip():
+                enriched["title"] = str(detail["title"]).strip()
+            enriched["has_title"] = True
 
         merged_images: List[str] = []
         for url in list(detail.get("images") or []) + list(item.get("images") or []):
@@ -3804,30 +3787,29 @@ class RocomPlugin(Star):
         return enriched
 
     async def _build_bilibili_dynamic_render_data(self, dyn: Dict[str, Any]) -> Dict[str, Any]:
-        """把 B 站动态映射为公告详情模板所需的渲染数据（样式与官方公告保持一致）。"""
+        """把 B 站动态映射为 B 站专用模板数据：无封面、先文后图、无标题则不显示标题。"""
         body_text = self._clean_bilibili_text(dyn.get("text"))
-        caption_html = self._text_to_caption_html(body_text)
+        caption_html = self._text_to_caption_html(body_text) if body_text else ""
 
         images = [str(u) for u in (dyn.get("images") or []) if u]
-        cover_url = ""
-        for index, image_url in enumerate(images):
-            data_uri = await self._download_image_as_data_uri(image_url)
-            src = data_uri or image_url
-            if index == 0:
-                cover_url = src
-            else:
-                caption_html += f'<p style="line-height: 2;"><img src="{src}" /></p>'
-
         video = dyn.get("video") if isinstance(dyn.get("video"), dict) else None
+
+        # 专栏/文章有封面；图文/文字动态没有封面。图片直接使用 B 站图床链接，与官方源一致
+        cover_url = ""
+        cover_src = str(dyn.get("cover") or "").strip()
+        if cover_src and not video:
+            cover_url = cover_src
+
         if video:
-            video_cover = str(video.get("cover") or "")
-            video_src = ""
-            if video_cover:
-                video_src = await self._download_image_as_data_uri(video_cover) or video_cover
+            # 视频动态：正文后放视频占位（用视频封面），不再把封面当图片重复展示
+            video_src = str(video.get("cover") or "")
             caption_html += (
                 f'<div class="announcement-video-placeholder"><img src="{video_src}" '
                 f'class="video-cover" /><div class="video-play-btn">▶</div></div>'
             )
+        else:
+            for image_url in images:
+                caption_html += f'<p style="line-height: 2;"><img src="{image_url}" /></p>'
 
         ts = int(dyn.get("ts") or 0)
         time_str = (
@@ -3835,7 +3817,8 @@ class RocomPlugin(Star):
             if ts
             else ""
         )
-        title = str(dyn.get("title") or "").strip() or self._bilibili_type_label(dyn.get("type"))
+        # 仅动态本身有标题时才显示；纯文本动态用正文承载，不把首行当标题
+        title = str(dyn.get("title") or "").strip() if dyn.get("has_title") else ""
 
         return {
             "title": title,

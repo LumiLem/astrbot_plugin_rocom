@@ -241,6 +241,8 @@ class BilibiliDynamicSource:
         pub_ts = _as_int(author.get("pub_ts"))
         dyn_type = str(item.get("type") or "")
         title = ""
+        has_title = False
+        content_cover = ""
         text = ""
         images: List[str] = []
         video: Optional[Dict[str, str]] = None
@@ -253,6 +255,7 @@ class BilibiliDynamicSource:
 
         if archive:
             title = str(archive.get("title") or "").strip()
+            has_title = bool(title)
             text = str(desc.get("text") or archive.get("desc") or "").strip()
             cover = _absolute_url(archive.get("cover"))
             if cover:
@@ -267,6 +270,7 @@ class BilibiliDynamicSource:
                 video = {"cover": cover, "url": url, "bvid": bvid}
         elif opus:
             title = str(opus.get("title") or "").strip()
+            has_title = bool(title)
             summary = opus.get("summary") if isinstance(opus.get("summary"), dict) else {}
             text = str(summary.get("text") or "").strip()
             pics = opus.get("pics") if isinstance(opus.get("pics"), list) else []
@@ -277,6 +281,10 @@ class BilibiliDynamicSource:
                 if pic_url:
                     images.append(pic_url)
             url = _absolute_url(opus.get("jump_url"))
+            # 专栏/文章的首图是封面，不是正文图（图文动态的 pics 才是正文图）
+            if dyn_type == "DYNAMIC_TYPE_ARTICLE" and images:
+                content_cover = images[0]
+                images = images[1:]
         elif draw:
             draw_items = draw.get("items") if isinstance(draw.get("items"), list) else []
             for entry in draw_items:
@@ -287,6 +295,7 @@ class BilibiliDynamicSource:
                     images.append(pic_url)
         elif article:
             title = str(article.get("title") or "").strip()
+            has_title = bool(title)
             text = str(desc.get("text") or article.get("desc") or "").strip()
             covers = article.get("covers") if isinstance(article.get("covers"), list) else []
             for cover in covers:
@@ -296,6 +305,9 @@ class BilibiliDynamicSource:
             cover = _absolute_url(article.get("cover"))
             if cover and cover not in images:
                 images.insert(0, cover)
+            if images:
+                content_cover = images[0]
+                images = images[1:]
 
         if not text:
             text = str(desc.get("text") or "").strip()
@@ -307,6 +319,8 @@ class BilibiliDynamicSource:
             if inner:
                 if not title:
                     title = inner.get("title") or ""
+                    if title:
+                        has_title = bool(inner.get("has_title"))
                 inner_text = inner.get("text") or ""
                 if inner_text:
                     text = (text + "\n" + inner_text).strip()
@@ -314,6 +328,8 @@ class BilibiliDynamicSource:
                     images = list(inner.get("images") or [])
                 if not video:
                     video = inner.get("video")
+                if not content_cover:
+                    content_cover = str(inner.get("cover") or "")
         if not url:
             jump = _absolute_url((opus or {}).get("jump_url"))
             if jump:
@@ -332,6 +348,8 @@ class BilibiliDynamicSource:
             "ts": pub_ts,
             "pinned": str(tag.get("text") or "").strip() == "置顶",
             "title": title,
+            "has_title": has_title,
+            "cover": content_cover,
             "text": text,
             "has_more": bool((opus.get("summary") or {}).get("has_more")) if opus else False,
             "links": extract_links(f"{text}\n{url}"),

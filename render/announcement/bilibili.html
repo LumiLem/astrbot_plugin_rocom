@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width={{pageWidth}}, initial-scale=1">
+  <title>{{title}}</title>
+  <link rel="stylesheet" href="{{_res_path}}render/announcement/style.css">
+  <style>
+    html,
+    body {
+      width: {{pageWidth}}px;
+      min-width: {{pageWidth}}px;
+      box-sizing: border-box;
+    }
+  </style>
+</head>
+<body>
+  <div class="announcement-detail-page">
+    <div class="detail-top-bar">
+      <div class="detail-header-middle">
+        {% if title %}
+        <h1 class="detail-title">{{title}}</h1>
+        {% endif %}
+        {% if timeStr %}
+        <p class="detail-time">{{timeLabel}}{{timeStr}}</p>
+        {% endif %}
+        <p class="detail-author">{{author}}</p>
+      </div>
+    </div>
+
+    {% if coverUrl %}
+    <div class="detail-cover-wrap">
+      <img src="{{coverUrl}}" alt="" class="detail-cover">
+    </div>
+    {% endif %}
+
+    <div class="detail-content-wrap">
+      <div class="detail-content">{{captionHtml|safe}}</div>
+    </div>
+
+    <footer class="announcement-footer">
+      <div>{{copyright}}</div>
+      <div>{{commandHint}}</div>
+    </footer>
+  </div>
+</body>
+</html>
