@@ -20,8 +20,8 @@
   "render_timeout": {
     "type": "int",
     "description": "渲染超时时间",
-    "hint": "图片渲染最大等待时间（毫秒）",
-    "default": 30000
+    "hint": "图片渲染最大等待时间（毫秒）。需大于卡片图片等待时间（当前 30000ms），否则图片等待会被自动夹小；公告/动态卡片建议保持 60000",
+    "default": 60000
   },
   "low_bandwidth_mode": {
     "type": "bool",

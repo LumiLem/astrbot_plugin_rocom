@@ -45,6 +45,8 @@ class Renderer:
             os.path.join(self.res_path, "render_cache")
         )
         os.makedirs(self._output_dir, exist_ok=True)
+        # 最近一次渲染结束后仍未加载的图片数量（供调用方观测/兜底）
+        self.last_unloaded_images = 0
 
         self._start_cache_cleanup_task()
 
@@ -102,6 +104,69 @@ class Renderer:
             return None
 
         return await self._screenshot(html_content, template_name, options)
+
+    @staticmethod
+    async def _collect_unloaded_images(page) -> list:
+        """返回页面中尚未加载成功的图片 URL 列表。"""
+        try:
+            result = await page.evaluate(
+                """() => Array.from(document.images)
+                    .filter(img => !img.complete || img.naturalWidth === 0)
+                    .map(img => img.currentSrc || img.src)
+                    .filter(Boolean)"""
+            )
+            return list(result) if isinstance(result, list) else []
+        except Exception:
+            return []
+
+    async def _inline_failed_images(self, page, urls, options: Dict[str, Any]) -> int:
+        """把未加载成功的远程图片下载为 data URI 并替换，返回成功替换的图片数。"""
+        try:
+            import httpx
+        except Exception:
+            return 0
+        referer = str(options.get("image_referer") or "").strip()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        if referer:
+            headers["Referer"] = referer
+        inlined = 0
+        try:
+            async with httpx.AsyncClient(
+                verify=False, timeout=30, follow_redirects=True, headers=headers
+            ) as client:
+                for src in urls[:12]:
+                    if not src or src.startswith("data:"):
+                        continue
+                    try:
+                        resp = await client.get(src)
+                        if resp.status_code != 200 or not resp.content:
+                            continue
+                        if len(resp.content) > 12 * 1024 * 1024:
+                            continue
+                        mime = str(resp.headers.get("content-type") or "").split(";")[0].strip()
+                        if not mime.startswith("image/"):
+                            mime = mimetypes.guess_type(src)[0] or "image/jpeg"
+                        data_uri = f"data:{mime};base64,{base64.b64encode(resp.content).decode('ascii')}"
+                        replaced = await page.evaluate(
+                            """args => {
+                                const [src, dataUri] = args;
+                                let n = 0;
+                                document.querySelectorAll('img').forEach(img => {
+                                    if ((img.currentSrc || img.src) === src) { img.src = dataUri; n++; }
+                                });
+                                return n;
+                            }""",
+                            [src, data_uri],
+                        )
+                        if replaced:
+                            inlined += 1
+                    except Exception:
+                        continue
+        except Exception:
+            return inlined
+        return inlined
 
     def _adapt_template(self, content: str) -> str:
         """将 art-template 语法转换为 Jinja2"""
@@ -379,27 +444,69 @@ class Renderer:
             except Exception:
                 pass  # 部分外部资源超时无妨
 
-            # 等待图片加载，但不要让慢速远程资源拖垮整次渲染。
+            # 等待图片加载：整体预算 + 单图超时，避免个别卡住的图片拖满整个预算
             try:
                 image_wait_timeout = int(options.get("image_wait_timeout", 10000))
             except (TypeError, ValueError):
                 image_wait_timeout = 10000
             image_wait_timeout = min(max(image_wait_timeout, 1000), max(int(self.render_timeout) - 1000, 1000))
+            try:
+                image_per_image_timeout = int(options.get("image_per_image_timeout", 8000))
+            except (TypeError, ValueError):
+                image_per_image_timeout = 8000
+            image_per_image_timeout = min(max(image_per_image_timeout, 1000), image_wait_timeout)
             await page.evaluate(
                 """
-                timeout => Promise.race([
+                ([overall, perImage]) => Promise.race([
                     Promise.all(Array.from(document.images).map(img => {
                         if (img.complete) return Promise.resolve();
-                        return new Promise(resolve => {
-                            img.onload = resolve;
-                            img.onerror = resolve;
-                        });
+                        return Promise.race([
+                            new Promise(resolve => {
+                                img.onload = resolve;
+                                img.onerror = resolve;
+                            }),
+                            new Promise(resolve => setTimeout(resolve, perImage))
+                        ]);
                     })),
-                    new Promise(resolve => setTimeout(resolve, timeout))
+                    new Promise(resolve => setTimeout(resolve, overall))
                 ])
                 """,
-                image_wait_timeout,
+                [image_wait_timeout, image_per_image_timeout],
             )
+
+            # 等待结束：若有图片未加载成功，下载内联后重试一次（仅失败时付出代价）
+            label = str(options.get("log_label") or name)
+            unloaded = await self._collect_unloaded_images(page)
+            if unloaded and options.get("inline_failed_images", True):
+                inlined = await self._inline_failed_images(page, unloaded, options)
+                if inlined:
+                    logger.warning(
+                        f"[Rocom Render] {label} 有 {len(unloaded)} 张图片未在 {image_wait_timeout}ms 内加载，"
+                        f"已内联 {inlined} 张后重试"
+                    )
+                    try:
+                        await page.evaluate(
+                            """timeout => Promise.race([
+                                Promise.all(Array.from(document.images).map(img => {
+                                    if (img.complete) return Promise.resolve();
+                                    return new Promise(resolve => {
+                                        img.onload = resolve;
+                                        img.onerror = resolve;
+                                    });
+                                })),
+                                new Promise(resolve => setTimeout(resolve, timeout))
+                            ])""",
+                            5000,
+                        )
+                    except Exception:
+                        pass
+                    unloaded = await self._collect_unloaded_images(page)
+            self.last_unloaded_images = len(unloaded)
+            if unloaded:
+                logger.warning(
+                    f"[Rocom Render] {label} 渲染后仍有 {len(unloaded)} 张图片未加载: {unloaded[:3]}"
+                )
+
             await page.wait_for_timeout(500)
             await page.add_style_tag(
                 content="""

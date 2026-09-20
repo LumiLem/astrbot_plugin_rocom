@@ -64,6 +64,15 @@ class RocomPlugin(Star):
     _DEDUP_BODY_SIMILARITY = 0.75
     _DEDUP_BODY_MIN_LENGTH = 20
     _DEDUP_BODY_MAX_CHARS = 1200
+    # 公告/动态推送卡片统一渲染参数（两源一致）
+    # image_wait_timeout：所有图片等待的整体预算；image_per_image_timeout：单张图片超时（避免个别卡图拖满预算）
+    _CARD_RENDER_OPTIONS = {
+        "device_scale_factor": 1.5,
+        "viewport_width": 1100,
+        "viewport_height": 1200,
+        "image_wait_timeout": 30000,
+        "image_per_image_timeout": 8000,
+    }
 
     # lumlime CDN：头像 / 精灵图标 / 名片皮肤 与 BinData 配置
     LUMLIME_ICON_BASE = "https://rocom.lumlime.cn/Icon/HeadIcon"
@@ -109,7 +118,7 @@ class RocomPlugin(Star):
         self.settings_file = os.path.join(data_dir, "rocom_settings.json")
         self.rocom_settings = self._load_settings()
         
-        render_timeout = self.config.get("render_timeout", 30000)
+        render_timeout = self.config.get("render_timeout", 60000)
         self.low_bandwidth_mode = bool(self.config.get("low_bandwidth_mode", False))
         self.help_prefix_display = str(self.config.get("help_prefix_display", "") or "")
         # res_path point to astrbot_plugin_rocom directory
@@ -3508,7 +3517,7 @@ class RocomPlugin(Star):
             img_url = await self.renderer.render_html(
                 "render/announcement/detail.html",
                 self._build_announcement_detail_render_data(detail),
-                {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+                {**self._CARD_RENDER_OPTIONS, "log_label": f"announcement:{item.get('id')}"},
             )
             img_urls = self._slice_and_compress_image(img_url) if img_url else []
             content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
@@ -3538,10 +3547,9 @@ class RocomPlugin(Star):
                 "render/announcement/bilibili.html",
                 render_data,
                 {
-                    "device_scale_factor": 1.5,
-                    "viewport_width": 1100,
-                    "viewport_height": 1200,
-                    "image_wait_timeout": 30000,
+                    **self._CARD_RENDER_OPTIONS,
+                    "log_label": f"bilibili:{item.get('id')}",
+                    "image_referer": "https://www.bilibili.com/",
                 },
             )
             img_urls = self._slice_and_compress_image(img_url) if img_url else []
