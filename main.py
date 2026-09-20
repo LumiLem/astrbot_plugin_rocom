@@ -24,6 +24,7 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Plain, Image, Video, Node, Nodes, Poke
 
 from .core.client import RocomClient
+from .core.bilibili_source import BilibiliDynamicSource, credential_to_dict, extract_links
 from .core.user import (
     UserManager,
     MerchantSubscriptionManager,
@@ -46,9 +47,23 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.5", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.6", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
+    # B 站数据源与智能去重的固定参数（不对外暴露为配置项）
+    _BILIBILI_UID = 626796832
+    _BILIBILI_DYNAMIC_MAX_PUSH = 5
+    _DEDUP_SIMILARITY = 0.6
+    _DEDUP_WINDOW_SECONDS = 360 * 60
+    # 智能去重：标题过短无法可靠比较时收紧判定窗口
+    _DEDUP_SHORT_TITLE_LENGTH = 6
+    _DEDUP_SHORT_TEXT_WINDOW_SECONDS = 1800
+    _DEDUP_LCS_RATIO = 0.6
+    _DEDUP_LCS_MIN_LENGTH = 6
+    # 智能去重：正文相似度兜底（实测同条内容正文相似度可达 1.0）
+    _DEDUP_BODY_SIMILARITY = 0.75
+    _DEDUP_BODY_MIN_LENGTH = 20
+    _DEDUP_BODY_MAX_CHARS = 1200
 
     # lumlime CDN：头像 / 精灵图标 / 名片皮肤 与 BinData 配置
     LUMLIME_ICON_BASE = "https://rocom.lumlime.cn/Icon/HeadIcon"
@@ -185,6 +200,26 @@ class RocomPlugin(Star):
             self.config.get("announcement_adaptive_poll_enabled", True)
         )
         self._announcement_last_known_fingerprint: tuple[str, int, str] | None = None
+        # 公告推送数据源模式：后台配置仅作为用户订阅时未指定数据源的默认值
+        mode = str(self.config.get("announcement_source_mode", "official") or "official").strip().lower()
+        self.announcement_default_source_mode = (
+            mode if mode in ("smart", "official", "bilibili") else "official"
+        )
+        self.bilibili_uid = self._BILIBILI_UID
+        self.bilibili_proxy = str(self.config.get("bilibili_proxy", "") or "").strip()
+        self.bilibili_config_sessdata = str(self.config.get("bilibili_sessdata", "") or "").strip()
+        self.bilibili_source = BilibiliDynamicSource(
+            sessdata=self.bilibili_config_sessdata,
+            proxy=self.bilibili_proxy,
+            credential_dict=self._load_bili_credential(),
+        )
+        if self.bilibili_source.is_logged_in:
+            logger.info("[Rocom] 已加载 B 站扫码登录凭据")
+        self.bilibili_dynamic_max_push = self._BILIBILI_DYNAMIC_MAX_PUSH
+        self.announcement_dedup_similarity = self._DEDUP_SIMILARITY
+        self.announcement_dedup_window_seconds = self._DEDUP_WINDOW_SECONDS
+        self._bilibili_last_known_fingerprint: tuple[str, int] | None = None
+        self._bilibili_source_warned = False
         self._pending_broadcasts: Dict[str, Dict[str, Any]] = {}
         self._running_broadcast_cancels: Dict[str, asyncio.Event] = {}
         self._announcement_subscription_task = None
@@ -2302,7 +2337,7 @@ class RocomPlugin(Star):
                     })
         return videos
 
-    async def _download_and_compress_video(self, video_url: str) -> str:
+    async def _download_and_compress_video(self, video_url: str, referer: str = "") -> str:
         """异步下载并压缩视频，返回本地路径；若下载或处理失败返回空字符串"""
         if not video_url:
             return ""
@@ -2342,6 +2377,8 @@ class RocomPlugin(Star):
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 }
+                if referer:
+                    headers["Referer"] = referer
                 async with httpx.AsyncClient(verify=False, timeout=timeout, headers=headers) as client:
                     async with client.stream("GET", video_url) as resp:
                         resp.raise_for_status()
@@ -2401,7 +2438,7 @@ class RocomPlugin(Star):
             logger.error(f"[Rocom] 视频压缩异常: {e}")
             return orig_path
 
-    async def _download_announcement_image(self, url: str) -> str | None:
+    async def _download_announcement_image(self, url: str, referer: str = "") -> str | None:
         """异步下载公告原图到本地缓存目录，返回本地路径"""
         url_hash = hashlib.md5(url.encode()).hexdigest()
         temp_dir = os.path.join(os.path.dirname(self.settings_file), "rocom_images")
@@ -2422,7 +2459,12 @@ class RocomPlugin(Star):
         if os.path.exists(local_path):
             return local_path
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            if referer:
+                headers["Referer"] = referer
+            async with httpx.AsyncClient(verify=False, timeout=60, headers=headers) as client:
                 async with client.stream("GET", url) as resp:
                     resp.raise_for_status()
                     with open(local_path, "wb") as f:
@@ -2846,274 +2888,906 @@ class RocomPlugin(Star):
             "copyright": self.copyright,
         }
 
-
     async def _check_announcement_subscriptions(self):
+        """检查官方公告与 B 站动态订阅，按各订阅自身的数据源模式推送新内容。"""
         all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
-        logger.debug(f"[Rocom] 公告检查：{len(all_subs)} 个订阅，执行 Head 探活")
 
-        # 1. 轻量级 Head 探活：先获取前 5 条公告（包含置顶与前 3 条最新普通公告，仅约 3.6KB）
-        head_res = await self.client.get_announcement_list(category_id=99, page=1, limit=5, order="ttDesc")
-        raw_head_items = (head_res.get("list") or head_res.get("items") or []) if isinstance(head_res, dict) else []
-        if not raw_head_items:
-            latest = await self.client.get_announcement_latest()
-            if latest:
-                raw_head_items = [latest]
-
-        if not raw_head_items:
+        sub_modes = {
+            key: self._subscription_source_mode(sub) for key, sub in all_subs.items()
+        }
+        official_on = any(m in ("official", "smart") for m in sub_modes.values())
+        bili_on = any(m in ("bilibili", "smart") for m in sub_modes.values())
+        if bili_on and not self.bilibili_source.is_available:
+            if not self._bilibili_source_warned:
+                logger.warning(
+                    "[Rocom] B 站动态数据源不可用（bilibili-api-python 未安装或加载失败），B 站相关订阅本轮跳过"
+                )
+                self._bilibili_source_warned = True
+            bili_on = False
+        if not official_on and not bili_on:
             return
 
-        # 提取探活列表中的最新公告指纹
-        head_latest = max(
-            raw_head_items,
-            key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
-        )
-        head_latest_id = self._announcement_id(head_latest)
-        head_latest_ts = self._announcement_ts(head_latest)
-        head_latest_title = str(head_latest.get("title") or "").strip()
-        head_fingerprint = (head_latest_id, head_latest_ts, head_latest_title)
-
-        # 检查是否有未初始化的全新订阅（last_ts == 0 且 not last_id）
-        has_uninitialized = any(
-            not sub.get("last_id") and not sub.get("since_ts")
-            for sub in all_subs.values()
+        logger.debug(
+            f"[Rocom] 公告检查：{len(all_subs)} 个订阅 official={official_on} bilibili={bili_on}"
         )
 
-        # 指纹未变且无未初始化新订阅时，直接短路跳过（Fast Path）
-        if not has_uninitialized and self._announcement_last_known_fingerprint == head_fingerprint:
-            logger.debug(f"[Rocom] 公告探活：最新条目未发生变动 (id={head_latest_id} title={head_latest_title})，快速短路跳过")
-            return
+        # 1. 快速探活：官方公告取前 5 条，B 站动态取最新一页，分别计算指纹
+        official_head_items: List[Dict[str, Any]] = []
+        official_fingerprint = None
+        if official_on:
+            head_res = await self.client.get_announcement_list(
+                category_id=99, page=1, limit=5, order="ttDesc"
+            )
+            official_head_items = (
+                (head_res.get("list") or head_res.get("items") or [])
+                if isinstance(head_res, dict)
+                else []
+            )
+            if not official_head_items:
+                latest = await self.client.get_announcement_latest()
+                if latest:
+                    official_head_items = [latest]
+            if official_head_items:
+                head_latest = max(
+                    official_head_items,
+                    key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+                )
+                official_fingerprint = (
+                    self._announcement_id(head_latest),
+                    self._announcement_ts(head_latest),
+                    str(head_latest.get("title") or "").strip(),
+                )
 
-        logger.info(f"[Rocom] 公告检查：检测到新公告或订阅初始化 (fingerprint={head_fingerprint})，拉取完整列表")
+        bili_items: List[Dict[str, Any]] = []
+        bili_fingerprint = None
+        if bili_on:
+            dyn = await self.bilibili_source.get_latest_dynamics(self.bilibili_uid)
+            bili_items = [
+                p
+                for p in BilibiliDynamicSource.parse_items(dyn, self.bilibili_uid)
+                if not p.get("pinned")
+            ]
+            if bili_items:
+                newest_bili = max(bili_items, key=lambda x: (int(x.get("ts") or 0), int(x.get("id") or 0)))
+                bili_fingerprint = (str(newest_bili.get("id") or ""), int(newest_bili.get("ts") or 0))
 
-        # 2. 完整拉取与推送（Slow Path）：获取第一页完整列表（包含置顶与普通公告）
-        list_res = await self.client.get_announcement_list(category_id=99, page=1, limit=10, order="ttDesc")
-        raw_items = (list_res.get("list") or list_res.get("items") or []) if isinstance(list_res, dict) else []
-        if not raw_items:
-            raw_items = raw_head_items
-
-        if not raw_items:
-            return
-
-        # 去重并按发布时间从旧到新正序排列（保证多条公告时按发布顺序推送）
-        unique_items = {}
-        for it in raw_items:
-            tid = self._announcement_id(it)
-            if tid and tid not in unique_items:
-                unique_items[tid] = it
-
-        sorted_items = sorted(
-            unique_items.values(),
-            key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+        has_uninitialized_official = any(
+            sub_modes.get(key, "") in ("official", "smart")
+            and not sub.get("last_id")
+            and not sub.get("since_ts")
+            for key, sub in all_subs.items()
         )
-        if not sorted_items:
+        has_uninitialized_bili = any(
+            sub_modes.get(key, "") in ("bilibili", "smart")
+            and not sub.get("bili_last_id")
+            and not sub.get("bili_last_ts")
+            for key, sub in all_subs.items()
+        )
+
+        official_changed = bool(official_on and official_head_items) and (
+            has_uninitialized_official
+            or self._announcement_last_known_fingerprint != official_fingerprint
+        )
+        bili_changed = bool(bili_on and bili_items) and (
+            has_uninitialized_bili
+            or self._bilibili_last_known_fingerprint != bili_fingerprint
+        )
+
+        if not official_changed and not bili_changed:
+            logger.debug("[Rocom] 公告探活：官方与 B 站均无变动，快速短路跳过")
             return
 
-        # 全新订阅未初始化时，基线对齐到当前最新一条，避免初始时刷屏推送历史所有条目
+        logger.info(
+            f"[Rocom] 公告检查：检测到更新 (official_changed={official_changed} bili_changed={bili_changed})"
+        )
+
+        # 2. 慢路径：构建候选并按发布时间从旧到新排序（保证先发布先推）
+        candidates: List[Dict[str, Any]] = []
+        official_sorted_items: List[Dict[str, Any]] = []
+        if official_changed:
+            list_res = await self.client.get_announcement_list(
+                category_id=99, page=1, limit=10, order="ttDesc"
+            )
+            raw_items = (
+                (list_res.get("list") or list_res.get("items") or [])
+                if isinstance(list_res, dict)
+                else []
+            )
+            if not raw_items:
+                raw_items = official_head_items
+            unique_items: Dict[str, Dict[str, Any]] = {}
+            for it in raw_items:
+                tid = self._announcement_id(it)
+                if tid and tid not in unique_items:
+                    unique_items[tid] = it
+            official_sorted_items = sorted(
+                unique_items.values(),
+                key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+            )
+            candidates.extend(self._normalize_official_item(it) for it in official_sorted_items)
+        if bili_changed:
+            candidates.extend(bili_items)
+
+        candidates.sort(
+            key=lambda x: (int(x.get("ts") or 0), 0 if x.get("source") == "official" else 1)
+        )
+
+        # 2.1 智能订阅需要正文判重：为官方候选补全详情正文（仅在已有另一源推送记录时）
+        if "smart" in sub_modes.values():
+            has_cross_recent = any(
+                sub_modes.get(key) == "smart"
+                and isinstance(sub.get("recent_pushed"), list)
+                and any(e.get("src") == "bilibili" for e in sub["recent_pushed"])
+                for key, sub in all_subs.items()
+            )
+            if has_cross_recent:
+                detail_cache: Dict[str, Any] = {}
+                for cand in candidates:
+                    if cand.get("source") != "official":
+                        continue
+                    cid = str(cand.get("id") or "")
+                    if not cid:
+                        continue
+                    detail = detail_cache.get(cid)
+                    if detail is None:
+                        detail = await self.client.get_announcement_detail(cid)
+                        detail_cache[cid] = detail
+                    if isinstance(detail, dict) and detail:
+                        cand["detail"] = detail
+                        content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+                        body = self._clean_announcement_text(
+                            str(content.get("text") or detail.get("summary") or ""),
+                            max_length=0,
+                        )
+                        if body:
+                            cand["text"] = body
+
+        # 3. 未初始化订阅基线对齐到当前最新，避免初始时刷屏推送历史
+        official_latest = official_sorted_items[-1] if official_sorted_items else None
+        bili_latest = (
+            max(bili_items, key=lambda x: (int(x.get("ts") or 0), int(x.get("id") or 0)))
+            if bili_items
+            else None
+        )
         for key, sub in all_subs.items():
-            last_id = str(sub.get("last_id") or "")
-            last_ts = int(sub.get("since_ts") or 0)
-            if last_ts == 0 and not last_id:
-                latest_one = sorted_items[-1]
-                sub["last_id"] = self._announcement_id(latest_one)
-                sub["last_title"] = str(latest_one.get("title") or "").strip()
-                sub["since_ts"] = self._announcement_ts(latest_one) or int(time.time())
+            sub_mode = sub_modes.get(key, "official")
+            changed = False
+            if (
+                sub_mode in ("official", "smart")
+                and official_latest
+                and not sub.get("last_id")
+                and not sub.get("since_ts")
+            ):
+                sub["last_id"] = self._announcement_id(official_latest)
+                sub["last_title"] = str(official_latest.get("title") or "").strip()
+                sub["since_ts"] = self._announcement_ts(official_latest) or int(time.time())
+                changed = True
+            if (
+                sub_mode in ("bilibili", "smart")
+                and bili_latest
+                and not sub.get("bili_last_id")
+                and not sub.get("bili_last_ts")
+            ):
+                sub["bili_last_id"] = str(bili_latest.get("id") or "")
+                sub["bili_last_title"] = str(bili_latest.get("title") or "").strip()
+                sub["bili_last_ts"] = int(bili_latest.get("ts") or 0) or int(time.time())
+                changed = True
+            if changed:
                 sub["updated_at"] = int(time.time())
                 await self.announcement_sub_mgr.upsert_subscription(key, sub)
 
+        # 4. 逐条推送
         rendered_cache: Dict[str, Dict[str, Any]] = {}
+        bili_pushed_counts: Dict[str, int] = {}
+        pushed_count = 0
 
-        async def get_rendered_content(item: Dict[str, Any]) -> Dict[str, Any]:
-            """获取公告详情和图文渲染结果（仅执行 HTML 渲染与切片，秒级完成，不阻塞视频下载）"""
-            target_id = self._announcement_id(item)
-            if target_id in rendered_cache:
-                entry = rendered_cache[target_id]
-                # 校验图片文件是否仍然存在，若被清理则自动重新渲染
-                if not entry.get("img_urls") or all(os.path.isfile(p) for p in entry["img_urls"]):
-                    return entry
+        for item in candidates:
+            source = item.get("source") or "official"
+            item_id = str(item.get("id") or "")
 
-            logger.info(f"[Rocom] 公告订阅：新公告 id={target_id} title={item.get('title', '?')}，准备渲染图文")
-            detail = await self.client.get_announcement_detail(target_id) or item
+            target_subs = self._select_announcement_target_subs(item, all_subs)
+            if source == "bilibili":
+                target_subs = [
+                    (key, sub)
+                    for key, sub in target_subs
+                    if bili_pushed_counts.get(key, 0) < self.bilibili_dynamic_max_push
+                ]
+            if not target_subs:
+                continue
+
+            rendered = await self._render_announcement_item(item, rendered_cache)
+
+            pushed_subs = []
+            for key, sub in target_subs:
+                if sub_modes.get(key, "official") == "smart" and self._is_duplicate_for_sub(item, sub):
+                    logger.info(f"[Rocom] 智能去重跳过 → {key} (source={source} id={item_id})")
+                    self._advance_announcement_cursor(sub, item)
+                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                    await asyncio.sleep(1)
+                    continue
+
+                push_ok = await self._send_announcement_item(key, sub, item, rendered)
+                if push_ok:
+                    pushed_count += 1
+                    self._advance_announcement_cursor(sub, item)
+                    self._record_recent_pushed(sub, item, rendered)
+                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                    pushed_subs.append((key, sub))
+                    if source == "bilibili":
+                        bili_pushed_counts[key] = bili_pushed_counts.get(key, 0) + 1
+                await asyncio.sleep(2)
+
+            if pushed_subs:
+                await self._send_announcement_extras(item, rendered, pushed_subs)
+
+        if pushed_count:
+            logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新内容")
+
+        # 5. 更新全局指纹，供下次快速探活比对
+        if official_changed and official_fingerprint is not None:
+            self._announcement_last_known_fingerprint = official_fingerprint
+        if bili_changed and bili_fingerprint is not None:
+            self._bilibili_last_known_fingerprint = bili_fingerprint
+
+    def _normalize_official_item(self, item: Dict[str, Any] | None) -> Dict[str, Any]:
+        item = item or {}
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        content_text = str(content.get("text") or "")
+        summary = str(item.get("summary") or "")
+        raw_text = f"{summary}\n{content_text}".strip()
+        return {
+            "source": "official",
+            "id": self._announcement_id(item),
+            "type": "official",
+            "ts": self._announcement_ts(item),
+            "pinned": False,
+            "title": str(item.get("title") or "").strip(),
+            "text": raw_text,
+            "links": extract_links(raw_text),
+            "images": self._announcement_images(item),
+            "video": None,
+            "url": "",
+            "raw": item,
+        }
+
+    def _subscription_source_mode(self, sub: Dict[str, Any]) -> str:
+        """取订阅自身的数据源模式，未设置时回退到后台默认值。"""
+        mode = str((sub or {}).get("source_mode") or "").strip().lower()
+        if mode in ("smart", "official", "bilibili"):
+            return mode
+        return getattr(self, "announcement_default_source_mode", "official")
+
+    def _bili_credential_path(self) -> str:
+        return os.path.join(os.path.dirname(self.settings_file), "bili_credential.json")
+
+    def _load_bili_credential(self) -> Dict[str, Any] | None:
+        path = self._bili_credential_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 读取 B 站登录凭据失败: {exc}")
+            return None
+        if isinstance(data, dict) and str(data.get("sessdata") or "").strip():
+            return data
+        return None
+
+    def _save_bili_credential(self, credential_dict: Dict[str, Any] | None) -> bool:
+        data = dict(credential_dict or {})
+        if not str(data.get("sessdata") or "").strip():
+            return False
+        data["saved_at"] = int(time.time())
+        path = self._bili_credential_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(path, 0o600)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 保存 B 站登录凭据失败: {exc}")
+            return False
+
+    def _clear_bili_credential(self) -> None:
+        path = self._bili_credential_path()
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 清除 B 站登录凭据失败: {exc}")
+
+    def _rebuild_bilibili_source(self, credential_dict: Dict[str, Any] | None = None) -> None:
+        self.bilibili_source = BilibiliDynamicSource(
+            sessdata=self.bilibili_config_sessdata,
+            proxy=self.bilibili_proxy,
+            credential_dict=credential_dict,
+        )
+        self._bilibili_last_known_fingerprint = None
+        self._bilibili_source_warned = False
+
+    def _select_announcement_target_subs(
+        self, item: Dict[str, Any], all_subs: Dict[str, Dict[str, Any]]
+    ) -> List[tuple]:
+        source = item.get("source") or "official"
+        if source == "official":
+            id_key, ts_key, title_key = "last_id", "since_ts", "last_title"
+        else:
+            id_key, ts_key, title_key = "bili_last_id", "bili_last_ts", "bili_last_title"
+
+        item_id = str(item.get("id") or "")
+        item_ts = int(item.get("ts") or 0)
+        item_title = str(item.get("title") or "").strip()
+
+        targets: List[tuple] = []
+        for key, sub in all_subs.items():
+            sub_mode = self._subscription_source_mode(sub)
+            if source == "official" and sub_mode == "bilibili":
+                continue
+            if source == "bilibili" and sub_mode == "official":
+                continue
+            last_id = str(sub.get(id_key) or "")
+            last_ts = int(sub.get(ts_key) or 0)
+            last_title = str(sub.get(title_key) or "").strip()
+
+            if item_id and item_id == last_id:
+                continue
+            if item_ts and last_ts and item_ts < last_ts:
+                continue
+            if item_ts and last_ts and item_ts == last_ts:
+                try:
+                    if int(item_id) <= int(last_id):
+                        continue
+                except (ValueError, TypeError):
+                    if item_title and last_title and item_title == last_title:
+                        continue
+            # 官方公告标题唯一，可用于兜底去重；B 站存在周期性同名动态，不能按标题跳过
+            if source == "official" and item_title and last_title and item_title == last_title:
+                continue
+            targets.append((key, sub))
+        return targets
+
+    def _advance_announcement_cursor(self, sub: Dict[str, Any], item: Dict[str, Any]) -> None:
+        now = int(time.time())
+        item_ts = int(item.get("ts") or 0)
+        item_id = str(item.get("id") or "")
+        item_title = str(item.get("title") or "").strip()
+        if (item.get("source") or "official") == "official":
+            sub["last_id"] = item_id
+            sub["last_title"] = item_title
+            sub["since_ts"] = max(int(sub.get("since_ts") or 0), item_ts or now)
+        else:
+            sub["bili_last_id"] = item_id
+            sub["bili_last_title"] = item_title
+            sub["bili_last_ts"] = max(int(sub.get("bili_last_ts") or 0), item_ts or now)
+        sub["updated_at"] = now
+
+    def _normalize_match_text(self, raw: Any) -> str:
+        text = self._clean_announcement_text(str(raw or ""), max_length=0)
+        if not text:
+            return ""
+        text = text.lower()
+        text = re.sub(r"[\[\u3010][^\]\u3011]*[\]\u3011]", " ", text)
+        text = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+        return text
+
+    def _record_recent_pushed(
+        self, sub: Dict[str, Any], item: Dict[str, Any], rendered: Dict[str, Any] | None = None
+    ) -> None:
+        source = item.get("source") or "official"
+        body = ""
+        detail = (rendered or {}).get("detail")
+        if isinstance(detail, dict):
+            if source == "official":
+                content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+                body = str(content.get("text") or detail.get("summary") or "")
+            else:
+                body = str(detail.get("text") or "")
+        if not body:
+            body = str(item.get("text") or "")
+        entry = {
+            "src": source,
+            "id": str(item.get("id") or ""),
+            "ts": int(item.get("ts") or 0),
+            "title": self._normalize_match_text(item.get("title")),
+            "text": self._normalize_match_text(body),
+            "links": list(item.get("links") or []),
+            "pushed_at": int(time.time()),
+        }
+        recent = sub.get("recent_pushed")
+        if not isinstance(recent, list):
+            recent = []
+        recent = [
+            e
+            for e in recent
+            if not (
+                isinstance(e, dict)
+                and e.get("src") == entry["src"]
+                and str(e.get("id")) == entry["id"]
+            )
+        ]
+        recent.append(entry)
+        sub["recent_pushed"] = recent[-20:]
+
+    @staticmethod
+    def _lcs_length(a: str, b: str, cap: int = 120) -> int:
+        """最长公共子串长度（截断到 cap 字符，避免长文本 O(n*m) 开销）。"""
+        a = str(a or "")[:cap]
+        b = str(b or "")[:cap]
+        if not a or not b:
+            return 0
+        prev = [0] * (len(b) + 1)
+        best = 0
+        for i in range(1, len(a) + 1):
+            cur = [0] * (len(b) + 1)
+            ai = a[i - 1]
+            for j in range(1, len(b) + 1):
+                if ai == b[j - 1]:
+                    cur[j] = prev[j - 1] + 1
+                    if cur[j] > best:
+                        best = cur[j]
+            prev = cur
+        return best
+
+    def _is_duplicate_for_sub(self, item: Dict[str, Any], sub: Dict[str, Any]) -> bool:
+        """智能模式：判断该条目是否与订阅最近推送的另一数据源内容重复。
+
+        官方公告列表常无正文（仅标题），因此以「标题相似度」为主，「正文包含/最长公共子串」
+        为辅；标题过短无法可靠比较时，退化为短时间窗口判定。
+        """
+        recent = sub.get("recent_pushed")
+        if not isinstance(recent, list) or not recent:
+            return False
+
+        source = item.get("source") or "official"
+        a_ts = int(item.get("ts") or 0)
+        a_links = set(item.get("links") or [])
+        a_title = self._normalize_match_text(item.get("title"))
+        a_text = self._normalize_match_text(item.get("text"))
+        a_full = a_title + a_text
+
+        for entry in recent:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("src") == source:
+                continue
+            b_links = set(entry.get("links") or [])
+            if a_links and b_links and (a_links & b_links):
+                return True
+            b_ts = int(entry.get("ts") or 0)
+            if not a_ts or not b_ts:
+                continue
+            b_title = str(entry.get("title") or "")
+            b_text = str(entry.get("text") or "")
+            b_full = b_title + b_text
+
+            # 标题过短/缺失时无法可靠比较，退化为短时间窗口判定
+            short = (
+                not a_full
+                or not b_full
+                or len(a_title) < self._DEDUP_SHORT_TITLE_LENGTH
+                or len(b_title) < self._DEDUP_SHORT_TITLE_LENGTH
+            )
+            window = (
+                self._DEDUP_SHORT_TEXT_WINDOW_SECONDS
+                if short
+                else self.announcement_dedup_window_seconds
+            )
+            if abs(a_ts - b_ts) > window:
+                continue
+            if short:
+                return True
+
+            matched = False
+            if a_title and b_title:
+                if a_title in b_title or b_title in a_title:
+                    matched = True
+                else:
+                    try:
+                        matched = (
+                            SequenceMatcher(None, a_title, b_title).ratio()
+                            >= self.announcement_dedup_similarity
+                        )
+                    except Exception:
+                        matched = False
+            if not matched and a_text and b_text:
+                if a_text in b_text or b_text in a_text:
+                    matched = True
+                elif (
+                    min(len(a_text), len(b_text)) >= self._DEDUP_BODY_MIN_LENGTH
+                    and SequenceMatcher(
+                        None,
+                        a_text[: self._DEDUP_BODY_MAX_CHARS],
+                        b_text[: self._DEDUP_BODY_MAX_CHARS],
+                    ).ratio()
+                    >= self._DEDUP_BODY_SIMILARITY
+                ):
+                    matched = True
+            if not matched and a_full and b_full:
+                lcs = self._lcs_length(a_full, b_full)
+                if (
+                    lcs >= self._DEDUP_LCS_MIN_LENGTH
+                    and lcs / max(1, min(len(a_full), len(b_full))) >= self._DEDUP_LCS_RATIO
+                ):
+                    matched = True
+            if matched:
+                return True
+        return False
+
+    async def _render_announcement_item(
+        self, item: Dict[str, Any], rendered_cache: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        source = item.get("source") or "official"
+        cache_key = f"{source}:{item.get('id')}"
+        cached = rendered_cache.get(cache_key)
+        if cached is not None:
+            img_urls = cached.get("img_urls") or []
+            if not img_urls or all(os.path.isfile(p) for p in img_urls):
+                return cached
+
+        if source == "official":
+            detail = item.get("detail") if isinstance(item.get("detail"), dict) else None
+            if not detail:
+                detail = await self.client.get_announcement_detail(item.get("id")) or item.get("raw") or item
+            logger.info(
+                f"[Rocom] 公告订阅：新公告 id={item.get('id')} title={item.get('title', '?')}，准备渲染图文"
+            )
             img_url = await self.renderer.render_html(
                 "render/announcement/detail.html",
                 self._build_announcement_detail_render_data(detail),
                 {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
             )
-            img_urls = []
-            if img_url:
-                img_urls = self._slice_and_compress_image(img_url)
-
-            videos = self._extract_videos(detail)
-
+            img_urls = self._slice_and_compress_image(img_url) if img_url else []
+            content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
+            original_urls: List[str] = []
+            for index in content_data.get("indexes") or []:
+                if isinstance(index, dict):
+                    urls = index.get("imageUrl")
+                    if isinstance(urls, list):
+                        original_urls.extend([str(u) for u in urls if u])
             entry = {
+                "source": source,
                 "detail": detail,
                 "img_urls": img_urls,
-                "videos": videos,
+                "videos": self._extract_videos(detail),
+                "original_images": original_urls,
+                "fallback_text": self._clean_announcement_text(
+                    str(content_data.get("text") or detail.get("summary") or ""), max_length=500
+                ),
             }
-            rendered_cache[target_id] = entry
-            return entry
-
-        pushed_count = 0
-        # 按时间正序遍历新公告（保证多条公告时按发布顺序推送）
-        for new_item in sorted_items:
-            item_id = self._announcement_id(new_item)
-            item_ts = self._announcement_ts(new_item)
-            item_title = str(new_item.get("title") or "").strip()
-
-            # 筛选需要接收该公告的目标订阅者
-            target_subs = []
-            for key, sub in all_subs.items():
-                last_id = str(sub.get("last_id") or "")
-                last_ts = int(sub.get("since_ts") or 0)
-                last_title = str(sub.get("last_title") or "").strip()
-
-                if item_id == last_id:
-                    continue
-                if item_ts and last_ts and item_ts < last_ts:
-                    continue
-                if item_ts and last_ts and item_ts == last_ts:
-                    try:
-                        if int(item_id) <= int(last_id):
-                            continue
-                    except (ValueError, TypeError):
-                        if item_title and last_title and item_title == last_title:
-                            continue
-                if item_title and last_title and item_title == last_title:
-                    continue
-                target_subs.append((key, sub))
-
-            if not target_subs:
-                continue
-
-            # 1. 快速渲染图文（毫秒/秒级，不阻塞视频下载）
-            rendered = await get_rendered_content(new_item)
-            detail = rendered["detail"]
-            img_urls = rendered["img_urls"]
-            videos = rendered.get("videos") or []
-
-            # 2. 优先即时推送图文公告给所有目标订阅者
-            pushed_subs = []
-            for key, sub in target_subs:
-                chain = MessageChain().message(
-                    f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n"
-                )
-                if img_urls:
-                    for u in img_urls:
-                        chain.file_image(u)
-                elif new_item.get("summary"):
-                    chain.message(self._clean_announcement_text(str(new_item.get("summary")), max_length=500))
-
-                push_ok = False
-                try:
-                    await self.context.send_message(sub["umo"], chain)
-                    logger.info(f"[Rocom] 公告订阅推送成功 → {key} (id={item_id} title={item_title})")
-                    push_ok = True
-                except Exception as e:
-                    logger.warning(f"[Rocom] 公告订阅图文推送失败 ({key}, id={item_id}): {e}")
-                    # 降级纯文本重试
-                    if img_urls:
-                        try:
-                            content_text = ""
-                            if isinstance(detail, dict):
-                                content = detail.get("content") if isinstance(detail.get("content"), dict) else {}
-                                html_text = content.get("text") or detail.get("summary") or ""
-                                content_text = self._clean_announcement_text(html_text, max_length=500)
-                            text_only = MessageChain().message(
-                                f"【洛克王国新公告】\n{new_item.get('title', '未命名公告')}\n\n{content_text}"
-                            )
-                            await self.context.send_message(sub["umo"], text_only)
-                            logger.info(f"[Rocom] 公告订阅降级纯文本推送成功 → {key} (id={item_id})")
-                            push_ok = True
-                        except Exception as text_e:
-                            logger.warning(f"[Rocom] 公告订阅降级纯文本也失败 ({key}): {text_e}")
-
-                if push_ok:
-                    pushed_count += 1
-                    sub["last_id"] = item_id
-                    sub["last_title"] = item_title
-                    sub["since_ts"] = max(int(sub.get("since_ts") or 0), item_ts or int(time.time()))
-                    sub["updated_at"] = int(time.time())
-                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
-                    pushed_subs.append((key, sub))
-
-                await asyncio.sleep(2)
-
-            # 3. 图文推送完毕后，再进行附加推送（视频 / 多图原图），避免大视频下载压缩阻塞图文发送
-            if pushed_subs:
-                # 3.1 附加推送：视频
-                if videos:
-                    video_paths = []
-                    for v in videos:
-                        p = await self._download_and_compress_video(v["url"])
-                        if p and os.path.isfile(p):
-                            video_paths.append(p)
-
-                    valid_video_paths = [p for p in video_paths if p and os.path.isfile(p)]
-                    if valid_video_paths:
-                        for key, sub in pushed_subs:
-                            v_chain = MessageChain()
-                            for p in valid_video_paths:
-                                v_chain.chain.append(Video.fromFileSystem(p))
-                            try:
-                                await self.context.send_message(sub["umo"], v_chain)
-                                logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key} (id={item_id})")
-                            except Exception as e:
-                                logger.warning(f"[Rocom] 公告订阅视频附加推送失败 ({key}, id={item_id}): {e}")
-                            await asyncio.sleep(2)
-                    else:
-                        # 视频下载失败或无法直接发送时，降级推送视频直链
-                        video_urls_text = "\n".join(v["url"] for v in videos if v.get("url"))
-                        if video_urls_text:
-                            for key, sub in pushed_subs:
-                                v_chain = MessageChain().message(f"📹 该公告包含视频内容，可前往查看：\n{video_urls_text}")
-                                try:
-                                    await self.context.send_message(sub["umo"], v_chain)
-                                    logger.info(f"[Rocom] 公告订阅降级视频直链推送成功 → {key} (id={item_id})")
-                                except Exception as e:
-                                    logger.warning(f"[Rocom] 公告订阅降级视频直链推送失败 ({key}, id={item_id}): {e}")
-                                await asyncio.sleep(2)
-
-                # 3.2 附加推送：多图合并转发（>= 2 张时）
-                image_nodes = []
-                original_urls = []
-                content_data = detail.get("content") if isinstance(detail.get("content"), dict) else {}
-                for index in content_data.get("indexes") or []:
-                    if isinstance(index, dict):
-                        urls = index.get("imageUrl")
-                        if isinstance(urls, list):
-                            original_urls.extend([str(u) for u in urls if u])
-                if len(original_urls) >= 2:
-                    for url in original_urls:
-                        local_path = await self._download_announcement_image(url)
-                        if local_path:
-                            sliced_paths = self._slice_and_compress_image(local_path)
-                            for p in sliced_paths:
-                                image_nodes.append(
-                                    Node(uin=0, name="洛克王国公告", content=[Image.fromFileSystem(p)])
-                                )
-                    if len(image_nodes) >= 2:
-                        for key, sub in pushed_subs:
-                            fwd_chain = MessageChain()
-                            fwd_chain.chain.append(Nodes(image_nodes))
-                            try:
-                                await self.context.send_message(sub["umo"], fwd_chain)
-                                logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (id={item_id})")
-                            except Exception as e:
-                                logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, id={item_id}): {e}")
-                            await asyncio.sleep(2)
-
-        if pushed_count:
-            logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新公告")
-
-        # 3. 记录全局最新指纹，供下次快速探活比对
-        if sorted_items:
-            newest_item = sorted_items[-1]
-            self._announcement_last_known_fingerprint = (
-                self._announcement_id(newest_item),
-                self._announcement_ts(newest_item),
-                str(newest_item.get("title") or "").strip(),
+        else:
+            logger.info(
+                f"[Rocom] 公告订阅：新 B 站动态 id={item.get('id')} type={item.get('type')}，准备渲染卡片"
             )
+            render_item = await self._enrich_bilibili_item(item)
+            render_data = await self._build_bilibili_dynamic_render_data(render_item)
+            img_url = await self.renderer.render_html(
+                "render/announcement/detail.html",
+                render_data,
+                {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+            )
+            img_urls = self._slice_and_compress_image(img_url) if img_url else []
+
+            # B 站视频动态：解析可直接下载的 mp4，交由与官方相同的附加推送逻辑处理
+            videos: List[Dict[str, str]] = []
+            video_info = render_item.get("video") if isinstance(render_item.get("video"), dict) else None
+            if video_info:
+                page_url = str(video_info.get("url") or "")
+                bvid = str(video_info.get("bvid") or "")
+                download_url = await self.bilibili_source.get_video_download_url(bvid) if bvid else ""
+                videos = [
+                    {
+                        "url": download_url,
+                        "cover": str(video_info.get("cover") or ""),
+                        "page": page_url,
+                    }
+                ]
+
+            entry = {
+                "source": source,
+                "detail": render_item,
+                "img_urls": img_urls,
+                "videos": videos,
+                "original_images": list(render_item.get("images") or []),
+                "fallback_text": self._clean_announcement_text(
+                    str(render_item.get("text") or ""), max_length=500
+                ),
+            }
+        rendered_cache[cache_key] = entry
+        return entry
+
+    async def _send_announcement_item(
+        self,
+        key: str,
+        sub: Dict[str, Any],
+        item: Dict[str, Any],
+        rendered: Dict[str, Any],
+    ) -> bool:
+        umo = sub.get("umo")
+        if not umo:
+            return False
+        source = item.get("source") or "official"
+        if source == "official":
+            header = f"【洛克王国新公告】\n{item.get('title') or '未命名公告'}\n"
+        else:
+            header = f"【洛克王国动态】\n{item.get('title') or '新动态'}\n"
+
+        img_urls = rendered.get("img_urls") or []
+        chain = MessageChain().message(header)
+        if img_urls:
+            for u in img_urls:
+                chain.file_image(u)
+        else:
+            chain.message(rendered.get("fallback_text") or "")
+
+        try:
+            await self.context.send_message(umo, chain)
+            logger.info(
+                f"[Rocom] 公告订阅推送成功 → {key} (source={source} id={item.get('id')})"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[Rocom] 公告订阅图文推送失败 ({key}, source={source} id={item.get('id')}): {e}"
+            )
+            try:
+                text_only = MessageChain().message(
+                    header + "\n" + (rendered.get("fallback_text") or "")
+                )
+                await self.context.send_message(umo, text_only)
+                logger.info(f"[Rocom] 公告订阅降级纯文本推送成功 → {key}")
+                return True
+            except Exception as text_e:
+                logger.warning(f"[Rocom] 公告订阅降级纯文本也失败 ({key}): {text_e}")
+                return False
+
+    async def _send_announcement_extras(
+        self,
+        item: Dict[str, Any],
+        rendered: Dict[str, Any],
+        pushed_subs: List[tuple],
+    ) -> None:
+        """卡片推送后附加推送视频与多图原图（官方公告与 B 站动态共用同一逻辑）。"""
+        item_id = item.get("id")
+        source = item.get("source") or "official"
+        referer = "https://www.bilibili.com/" if source == "bilibili" else ""
+        fwd_name = "洛克王国公告" if source == "official" else "洛克王国动态"
+
+        videos = rendered.get("videos") or []
+        if videos:
+            video_paths = []
+            for v in videos:
+                video_url = str(v.get("url") or "")
+                if not video_url:
+                    continue
+                p = await self._download_and_compress_video(video_url, referer=referer)
+                if p and os.path.isfile(p):
+                    video_paths.append(p)
+
+            valid_video_paths = [p for p in video_paths if p and os.path.isfile(p)]
+            if valid_video_paths:
+                for key, sub in pushed_subs:
+                    v_chain = MessageChain()
+                    for p in valid_video_paths:
+                        v_chain.chain.append(Video.fromFileSystem(p))
+                    try:
+                        await self.context.send_message(sub["umo"], v_chain)
+                        logger.info(f"[Rocom] 公告订阅视频附加推送成功 → {key} (source={source} id={item_id})")
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 公告订阅视频附加推送失败 ({key}, source={source} id={item_id}): {e}")
+                    await asyncio.sleep(2)
+            else:
+                fallback_links = [
+                    str(v.get("page") or v.get("url") or "").strip()
+                    for v in videos
+                    if str(v.get("page") or v.get("url") or "").strip()
+                ]
+                video_urls_text = "\n".join(fallback_links)
+                if video_urls_text:
+                    for key, sub in pushed_subs:
+                        v_chain = MessageChain().message(
+                            f"📹 该内容包含视频，可前往查看：\n{video_urls_text}"
+                        )
+                        try:
+                            await self.context.send_message(sub["umo"], v_chain)
+                            logger.info(f"[Rocom] 公告订阅降级视频直链推送成功 → {key} (source={source} id={item_id})")
+                        except Exception as e:
+                            logger.warning(f"[Rocom] 公告订阅降级视频直链推送失败 ({key}, source={source} id={item_id}): {e}")
+                        await asyncio.sleep(2)
+
+        original_urls = rendered.get("original_images") or []
+        if len(original_urls) >= 2:
+            image_nodes = []
+            for url in original_urls:
+                local_path = await self._download_announcement_image(url, referer=referer)
+                if local_path:
+                    sliced_paths = self._slice_and_compress_image(local_path)
+                    for p in sliced_paths:
+                        image_nodes.append(
+                            Node(uin=0, name=fwd_name, content=[Image.fromFileSystem(p)])
+                        )
+            if len(image_nodes) >= 2:
+                for key, sub in pushed_subs:
+                    fwd_chain = MessageChain()
+                    fwd_chain.chain.append(Nodes(image_nodes))
+                    try:
+                        await self.context.send_message(sub["umo"], fwd_chain)
+                        logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (source={source} id={item_id})")
+                    except Exception as e:
+                        logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, source={source} id={item_id}): {e}")
+                    await asyncio.sleep(2)
+
+    def _bilibili_type_label(self, dyn_type: Any) -> str:
+        return {
+            "DYNAMIC_TYPE_AV": "新视频",
+            "DYNAMIC_TYPE_DRAW": "新图文动态",
+            "DYNAMIC_TYPE_WORD": "新动态",
+            "DYNAMIC_TYPE_ARTICLE": "新专栏",
+            "DYNAMIC_TYPE_FORWARD": "转发动态",
+        }.get(str(dyn_type or ""), "新动态")
+
+    def _clean_bilibili_text(self, text: Any) -> str:
+        """清理 B 站动态正文：去掉纯链接行、链接引导语，保留正文内容。"""
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not raw.strip():
+            return ""
+
+        lines = raw.split("\n")
+        keep = [True] * len(lines)
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            without_url = re.sub(r"https?://\S+", "", stripped).strip()
+            has_url = without_url != stripped
+            if not without_url:
+                keep[i] = False
+            elif has_url and len(without_url) <= 30 and without_url.endswith(("：", ":")):
+                keep[i] = False
+            else:
+                lines[i] = without_url
+
+        # 去掉“引导语：”+ 纯链接 这种悬空行
+        for i, line in enumerate(lines):
+            if not keep[i]:
+                continue
+            stripped = line.strip()
+            if len(stripped) <= 30 and stripped.endswith(("：", ":")):
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines) and not keep[j] and re.search(r"https?://", lines[j]):
+                    keep[i] = False
+
+        result = "\n".join(lines[i] for i in range(len(lines)) if keep[i])
+        return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+    def _text_to_caption_html(self, text: Any) -> str:
+        """把纯文本转成与官方公告一致的段落 HTML（<p style="line-height: 2;">）。"""
+        raw = str(text or "").strip()
+        if not raw:
+            return "该公告暂无正文。"
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
+        if not paragraphs:
+            return "该公告暂无正文。"
+        return "".join(
+            '<p style="line-height: 2;">'
+            + html.escape(paragraph).replace("\n", "<br>")
+            + "</p>"
+            for paragraph in paragraphs
+        )
+
+    async def _download_image_as_data_uri(self, url: str) -> str:
+        if not url:
+            return ""
+        local_path = await self._download_announcement_image(url, referer="https://www.bilibili.com/")
+        if not local_path or not os.path.isfile(local_path):
+            return ""
+        try:
+            with open(local_path, "rb") as f:
+                raw = f.read()
+        except Exception:
+            return ""
+        if not raw:
+            return ""
+        lower = local_path.lower()
+        if lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith(".webp"):
+            mime = "image/webp"
+        elif lower.endswith(".gif"):
+            mime = "image/gif"
+        else:
+            mime = "image/jpeg"
+        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+    async def _enrich_bilibili_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """feed 里的 opus.summary 在 has_more 时是截断的，渲染前用图文详情补全正文与图片。"""
+        if not isinstance(item, dict):
+            return item
+        dyn_type = str(item.get("type") or "")
+        need_detail = bool(item.get("has_more")) or dyn_type == "DYNAMIC_TYPE_ARTICLE"
+        if not need_detail or not item.get("id"):
+            return item
+
+        info = await self.bilibili_source.get_opus_detail(item.get("id"))
+        detail = BilibiliDynamicSource.parse_opus_detail(info)
+        if not detail:
+            return item
+
+        enriched = dict(item)
+        detail_text = str(detail.get("text") or "").strip()
+        if detail_text and len(detail_text) > len(str(item.get("text") or "")):
+            enriched["text"] = detail_text
+        if not str(enriched.get("title") or "").strip() and detail.get("title"):
+            enriched["title"] = str(detail["title"]).strip()
+
+        merged_images: List[str] = []
+        for url in list(detail.get("images") or []) + list(item.get("images") or []):
+            if url and url not in merged_images:
+                merged_images.append(url)
+        if merged_images:
+            enriched["images"] = merged_images
+        return enriched
+
+    async def _build_bilibili_dynamic_render_data(self, dyn: Dict[str, Any]) -> Dict[str, Any]:
+        """把 B 站动态映射为公告详情模板所需的渲染数据（样式与官方公告保持一致）。"""
+        body_text = self._clean_bilibili_text(dyn.get("text"))
+        caption_html = self._text_to_caption_html(body_text)
+
+        images = [str(u) for u in (dyn.get("images") or []) if u]
+        cover_url = ""
+        for index, image_url in enumerate(images):
+            data_uri = await self._download_image_as_data_uri(image_url)
+            src = data_uri or image_url
+            if index == 0:
+                cover_url = src
+            else:
+                caption_html += f'<p style="line-height: 2;"><img src="{src}" /></p>'
+
+        video = dyn.get("video") if isinstance(dyn.get("video"), dict) else None
+        if video:
+            video_cover = str(video.get("cover") or "")
+            video_src = ""
+            if video_cover:
+                video_src = await self._download_image_as_data_uri(video_cover) or video_cover
+            caption_html += (
+                f'<div class="announcement-video-placeholder"><img src="{video_src}" '
+                f'class="video-cover" /><div class="video-play-btn">▶</div></div>'
+            )
+
+        ts = int(dyn.get("ts") or 0)
+        time_str = (
+            datetime.fromtimestamp(ts, tz=self._cn_tz()).strftime("%Y-%m-%d %H:%M:%S")
+            if ts
+            else ""
+        )
+        title = str(dyn.get("title") or "").strip() or self._bilibili_type_label(dyn.get("type"))
+
+        return {
+            "title": title,
+            "summary": body_text[:200],
+            "cover": "",
+            "coverUrl": cover_url,
+            "time": time_str,
+            "timeLabel": "发布时间：",
+            "timeStr": time_str,
+            "author": "洛克王国：世界",
+            "content_html": "",
+            "captionHtml": caption_html,
+            "images": images,
+            "videos": [video] if video else [],
+            "stats": [],
+            "commandHint": "💡 /订阅洛克公告 可订阅新公告推送",
+            "copyright": self.copyright,
+            "pageWidth": 760,
+        }
 
     def _resolve_merchant_timezone(self, configured_name: str):
         """Resolve the merchant timezone without letting a missing tzdata alter the default."""
@@ -5161,7 +5835,7 @@ class RocomPlugin(Star):
                         {"cmd": "洛克公告详情 <公告ID>", "desc": "查看指定公告详情"},
                         {"cmd": "洛克公告最新", "desc": "查看最新一条公告"},
                         {"cmd": "洛克活动日历", "desc": "查询 activities/info 活动日历"},
-                        {"cmd": "订阅洛克公告", "desc": "订阅新公告推送（群聊需已开启的群管理员或 Bot 管理员权限）"},
+                        {"cmd": "订阅洛克公告 [smart|official|bilibili]", "desc": "订阅新公告推送，可选指定数据源（默认用后台配置；群聊需已开启的群管理员或 Bot 管理员权限）"},
                         {"cmd": "取消订阅洛克公告", "desc": "关闭当前会话的新公告推送"},
                         {"cmd": "洛克商店 <shop_id>", "desc": "实验性：查询商店信息，接口返回暂不稳定"},
                         {"cmd": "洛克玩家 [UID]", "desc": "通过 ingame 队列接口查询玩家基础信息"},
@@ -6400,30 +7074,73 @@ class RocomPlugin(Star):
 
     @filter.command("订阅洛克公告")
     async def subscribe_announcement(self, event: AstrMessageEvent):
-        """订阅洛克王国新公告提醒"""
+        """订阅洛克王国新公告提醒，可选指定数据源：smart/official/bilibili"""
         await self._record_active_user(event)
         if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
             yield event.plain_result("仅群管理员或 Bot 管理员可以配置洛克公告订阅。")
             return
         key = str(event.unified_msg_origin)
-        latest = await self.client.get_announcement_latest()
-        latest_id = self._announcement_id(latest) if latest else ""
-        latest_ts = self._announcement_ts(latest) if latest else int(time.time())
-        latest_title = str((latest or {}).get("title") or "").strip()
-        await self.announcement_sub_mgr.upsert_subscription(
-            key,
-            {
-                "key": key,
-                "umo": event.unified_msg_origin,
-                "updated_by": str(event.get_sender_id()),
-                "last_id": latest_id,
-                "last_title": latest_title,
-                "since_ts": latest_ts,
-                "updated_at": int(time.time()),
-            },
-        )
+
+        raw_text = str(getattr(event, "message_str", "") or "").strip()
+        arg = re.sub(r"^[/.#]*订阅洛克公告\s*", "", raw_text).strip().lower()
+        alias = {
+            "smart": "smart", "智能": "smart", "自动": "smart", "全部": "smart", "双源": "smart",
+            "official": "official", "官方": "official", "小程序": "official", "公告": "official",
+            "bilibili": "bilibili", "b站": "bilibili", "b站动态": "bilibili", "动态": "bilibili",
+        }
+        if arg:
+            mode = alias.get(arg)
+            if not mode:
+                yield event.plain_result(
+                    "数据源参数无效。用法：/订阅洛克公告 [smart|official|bilibili]\n"
+                    "smart=官方公告+B站动态（智能去重）\n"
+                    "official=仅官方小程序公告\n"
+                    "bilibili=仅 B 站动态\n"
+                    "不填则使用后台默认数据源。"
+                )
+                return
+        else:
+            mode = self.announcement_default_source_mode
+
+        subscription: Dict[str, Any] = {
+            "key": key,
+            "umo": event.unified_msg_origin,
+            "updated_by": str(event.get_sender_id()),
+            "source_mode": mode,
+            "updated_at": int(time.time()),
+        }
+        if mode in ("official", "smart"):
+            latest = await self.client.get_announcement_latest()
+            if latest:
+                subscription["last_id"] = self._announcement_id(latest)
+                subscription["last_title"] = str(latest.get("title") or "").strip()
+                subscription["since_ts"] = self._announcement_ts(latest) or int(time.time())
+        if mode in ("bilibili", "smart") and self.bilibili_source.is_available:
+            dyn = await self.bilibili_source.get_latest_dynamics(self.bilibili_uid)
+            parsed = [
+                p
+                for p in BilibiliDynamicSource.parse_items(dyn, self.bilibili_uid)
+                if not p.get("pinned")
+            ]
+            if parsed:
+                latest_bili = max(
+                    parsed, key=lambda x: (int(x.get("ts") or 0), int(x.get("id") or 0))
+                )
+                subscription["bili_last_id"] = str(latest_bili.get("id") or "")
+                subscription["bili_last_title"] = str(latest_bili.get("title") or "").strip()
+                subscription["bili_last_ts"] = int(latest_bili.get("ts") or 0) or int(time.time())
+        await self.announcement_sub_mgr.upsert_subscription(key, subscription)
         self._announcement_last_known_fingerprint = None
-        yield event.plain_result("已订阅洛克公告，新公告发布后会推送到当前会话。")
+        self._bilibili_last_known_fingerprint = None
+        mode_label = {
+            "smart": "官方公告 + B 站动态（智能去重）",
+            "official": "官方公告",
+            "bilibili": "B 站动态",
+        }.get(mode, mode)
+        yield event.plain_result(
+            f"已订阅洛克公告，数据源：{mode_label}，有新内容后会推送到当前会话。\n"
+            f"如需更换数据源，重新执行「/订阅洛克公告 smart|official|bilibili」即可。"
+        )
 
     @filter.command("取消订阅洛克公告")
     async def unsubscribe_announcement(self, event: AstrMessageEvent):
@@ -6436,9 +7153,84 @@ class RocomPlugin(Star):
         deleted = await self.announcement_sub_mgr.delete_subscription(key)
         if deleted:
             self._announcement_last_known_fingerprint = None
+            self._bilibili_last_known_fingerprint = None
             yield event.plain_result("已取消当前会话的洛克公告订阅。")
         else:
             yield event.plain_result("当前会话没有洛克公告订阅。")
+
+    @filter.command("B站登录", alias={"bili_login", "b站登录", "B站扫码登录"})
+    async def bili_login(self, event: AstrMessageEvent):
+        """扫码登录 B 站（仅 Bot 管理员私聊可用）"""
+        await self._record_active_user(event)
+        if not self._is_bot_admin(event):
+            yield event.plain_result("仅 Bot 管理员可以登录 B 站。")
+            return
+        if not event.is_private_chat():
+            yield event.plain_result("为避免二维码泄露，请在私聊中使用「/B站登录」。")
+            return
+
+        login = BilibiliDynamicSource.create_qr_login()
+        if login is None:
+            yield event.plain_result(
+                "当前环境不支持扫码登录（bilibili-api-python 未正确加载）。"
+            )
+            return
+
+        try:
+            await login.generate_qrcode()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 生成 B 站登录二维码失败: {exc}")
+            yield event.plain_result(f"生成二维码失败：{exc}")
+            return
+
+        qr_path = os.path.join(tempfile.gettempdir(), "rocom_bili_qrcode.png")
+        try:
+            login.get_qrcode_picture().to_file(qr_path)
+        except Exception:  # noqa: BLE001
+            qr_path = os.path.join(tempfile.gettempdir(), "qrcode.png")
+
+        yield event.plain_result("请使用 B站 App 扫描下方二维码登录（约 2 分钟内有效）")
+        yield event.image_result(qr_path)
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            try:
+                state = await login.check_state()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Rocom] 轮询 B 站登录状态失败: {exc}")
+                yield event.plain_result(f"轮询登录状态失败：{exc}")
+                return
+            state_name = getattr(state, "name", str(state))
+            if state_name == "DONE":
+                credential = credential_to_dict(login.get_credential())
+                if not str(credential.get("sessdata") or "").strip():
+                    yield event.plain_result("登录成功但未获取到 SESSDATA，请重试。")
+                    return
+                if not self._save_bili_credential(credential):
+                    yield event.plain_result("登录成功，但保存凭据失败，请检查插件数据目录权限。")
+                    return
+                self._rebuild_bilibili_source(credential)
+                logger.info("[Rocom] B 站扫码登录成功，凭据已保存并生效")
+                yield event.plain_result("✅ B站登录成功，凭据已保存并立即生效。")
+                return
+            if state_name == "TIMEOUT":
+                yield event.plain_result("❌ 二维码已超时，请重新执行「/B站登录」。")
+                return
+            await asyncio.sleep(2)
+        yield event.plain_result("❌ 登录等待超时，请重新执行「/B站登录」。")
+
+    @filter.command("B站登出", alias={"bili_logout", "b站登出", "B站退出登录"})
+    async def bili_logout(self, event: AstrMessageEvent):
+        """清除已保存的 B 站登录凭据（仅 Bot 管理员可用）"""
+        await self._record_active_user(event)
+        if not self._is_bot_admin(event):
+            yield event.plain_result("仅 Bot 管理员可以登出 B 站。")
+            return
+        had_credential = self.bilibili_source.is_logged_in
+        self._clear_bili_credential()
+        self._rebuild_bilibili_source(None)
+        suffix = "" if had_credential else "（此前没有已保存的登录凭据）"
+        yield event.plain_result(f"✅ 已清除 B站登录凭据，恢复为配置的 SESSDATA/匿名模式。{suffix}")
 
     @filter.command("洛克群发公告")
     async def rocom_broadcast(self, event: AstrMessageEvent):

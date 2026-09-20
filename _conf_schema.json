@@ -178,6 +178,30 @@
     "hint": "开启后根据官方发帖高峰智能调整轮询间隔：周三晚/周四早晚/每日10点档 2分钟，日常 10分钟，深夜及午休 30分钟；关闭则固定使用常规间隔",
     "default": true
   },
+  "announcement_source_mode": {
+    "type": "string",
+    "description": "订阅默认数据源模式",
+    "options": [
+      "smart",
+      "official",
+      "bilibili"
+    ],
+    "hint": "默认数据源：用户执行 /订阅洛克公告 未指定数据源时使用。smart=官方小程序与B站动态双源（相同内容只推先发布的）；official=仅官方小程序公告；bilibili=仅B站动态。用户可在订阅时用 /订阅洛克公告 smart|official|bilibili 单独指定；修改后需重载插件生效。",
+    "default": "official"
+  },
+  "bilibili_sessdata": {
+    "type": "string",
+    "description": "B站 SESSDATA（备用）",
+    "hint": "可选备用项，建议直接用 Bot 管理员私聊执行 /B站登录 扫码获取凭据（自动保存并生效）。此处留空则匿名请求，B站对未登录请求可能返回风控空结果；官方小程序源不受影响",
+    "default": "",
+    "secret": true
+  },
+  "bilibili_proxy": {
+    "type": "string",
+    "description": "B站请求代理",
+    "hint": "可选，例如 http://127.0.0.1:7890，留空不使用",
+    "default": ""
+  },
   "copyright": {
     "type": "string",
     "description": "自定义版权信息",

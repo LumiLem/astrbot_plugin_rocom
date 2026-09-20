@@ -101,6 +101,9 @@ playwright install chromium
 | `announcement_subscription_enabled` | bool | `true` | 是否启用洛克公告订阅推送 |
 | `announcement_poll_interval_minutes` | int | `10` | 洛克公告订阅检查基础间隔（分钟） |
 | `announcement_adaptive_poll_enabled` | bool | `true` | 是否启用公告智能自适应变速轮询：根据官方发帖高峰自动调频（周三晚、周四早/晚、每日10点档 2分钟，日常 10分钟，深夜与午休 30分钟） |
+| `announcement_source_mode` | string | `official` | 订阅默认数据源模式：用户 `/订阅洛克公告` 未指定数据源时使用。`smart`=官方小程序 + B站动态双源（相同内容只推先发布的）；`official`=仅官方小程序；`bilibili`=仅B站动态。用户可在订阅时用 `/订阅洛克公告 smart\|official\|bilibili` 单独指定。修改后需重载插件生效 |
+| `bilibili_sessdata` | string | `""` | 备用 B站 SESSDATA；推荐直接用 Bot 管理员私聊执行 `/B站登录` 扫码获取凭据（自动保存并生效）。此处留空则匿名请求 |
+| `bilibili_proxy` | string | `""` | 可选 B站请求代理，例如 `http://127.0.0.1:7890` |
 
 ### 安全免责声明
 
@@ -190,8 +193,10 @@ astrbot_plugin_rocom/
 | `洛克公告详情 <公告ID>` | 查看指定公告详情 |
 | `洛克公告最新` | 查看最新一条公告 |
 | `洛克活动日历` | 查询 `activities/info` 活动日历（别名：`洛克活动`、`洛克日历`） |
-| `订阅洛克公告` | 订阅新公告推送（群聊需已开启的群管理员或 Bot 管理员权限） |
+| `订阅洛克公告 [smart\|official\|bilibili]` | 订阅新公告推送，可指定数据源（不填则用后台配置 `announcement_source_mode`；群聊需已开启的群管理员或 Bot 管理员权限） |
 | `取消订阅洛克公告` | 关闭当前会话的新公告推送 |
+| `B站登录`（别名 `bili_login`/`b站登录`） | Bot 管理员私聊扫码登录 B 站，获取并保存登录凭据（自动用于 B站动态数据源） |
+| `B站登出`（别名 `bili_logout`/`b站登出`） | Bot 管理员清除已保存的 B站登录凭据 |
 | `洛克商店 <shop_id>` | 实验性功能：通过 ingame 接口查询指定商店信息，接口返回暂不稳定 |
 | `洛克玩家 [UID]` | 通过 ingame 队列接口查询玩家基础资料，不填 UID 时查询当前绑定账号 |
 | `洛克家园 [UID]` | 通过 UID 查询自己或他人的家园菜园、守卫精灵和室内精灵情况 |

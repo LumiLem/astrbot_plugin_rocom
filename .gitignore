@@ -9,3 +9,5 @@ render/*/tmp_*.html
 reference/
 测试文件/
 .DS_Store
+.kilo/plans/
+.kilo/worktrees/

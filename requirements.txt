@@ -2,3 +2,7 @@ httpx
 playwright
 jinja2
 tzdata
+bilibili-api-python>=17.4.1
+curl_cffi>=0.14.0
+qrcode>=8.2
+qrcode_terminal>=0.8
