@@ -215,6 +215,7 @@ class RocomPlugin(Star):
         )
         if self.bilibili_source.is_logged_in:
             logger.info("[Rocom] 已加载 B 站扫码登录凭据")
+        self._bili_credential_checked_at = 0.0
         self.bilibili_dynamic_max_push = self._BILIBILI_DYNAMIC_MAX_PUSH
         self.announcement_dedup_similarity = self._DEDUP_SIMILARITY
         self.announcement_dedup_window_seconds = self._DEDUP_WINDOW_SECONDS
@@ -304,7 +305,7 @@ class RocomPlugin(Star):
     def _register_background_task(self, name: str, coro) -> asyncio.Task:
         task = asyncio.create_task(
             coro,
-            name=f"rocom:{name}:{self._instance_id}",
+            name=f"rocom:{name}:{getattr(self, '_instance_id', 'default')}",
         )
         self._background_task_registry()[name] = task
         return task
@@ -2913,6 +2914,9 @@ class RocomPlugin(Star):
             f"[Rocom] 公告检查：{len(all_subs)} 个订阅 official={official_on} bilibili={bili_on}"
         )
 
+        if bili_on:
+            await self._maybe_refresh_bili_credential()
+
         # 1. 快速探活：官方公告取前 5 条，B 站动态取最新一页，分别计算指纹
         official_head_items: List[Dict[str, Any]] = []
         official_fingerprint = None
@@ -2966,12 +2970,26 @@ class RocomPlugin(Star):
             for key, sub in all_subs.items()
         )
 
+        # 游标落后于探活最新：说明上一轮可能因单轮限流/异常仍有未处理条目，继续慢路径补推
+        has_pending_official = bool(official_fingerprint) and any(
+            sub_modes.get(key, "") in ("official", "smart")
+            and int(sub.get("since_ts") or 0) < int(official_fingerprint[1] or 0)
+            for key, sub in all_subs.items()
+        )
+        has_pending_bili = bool(bili_fingerprint) and any(
+            sub_modes.get(key, "") in ("bilibili", "smart")
+            and int(sub.get("bili_last_ts") or 0) < int(bili_fingerprint[1] or 0)
+            for key, sub in all_subs.items()
+        )
+
         official_changed = bool(official_on and official_head_items) and (
             has_uninitialized_official
+            or has_pending_official
             or self._announcement_last_known_fingerprint != official_fingerprint
         )
         bili_changed = bool(bili_on and bili_items) and (
             has_uninitialized_bili
+            or has_pending_bili
             or self._bilibili_last_known_fingerprint != bili_fingerprint
         )
 
@@ -3086,41 +3104,48 @@ class RocomPlugin(Star):
         for item in candidates:
             source = item.get("source") or "official"
             item_id = str(item.get("id") or "")
-
-            target_subs = self._select_announcement_target_subs(item, all_subs)
-            if source == "bilibili":
-                target_subs = [
-                    (key, sub)
-                    for key, sub in target_subs
-                    if bili_pushed_counts.get(key, 0) < self.bilibili_dynamic_max_push
-                ]
-            if not target_subs:
-                continue
-
-            rendered = await self._render_announcement_item(item, rendered_cache)
-
-            pushed_subs = []
-            for key, sub in target_subs:
-                if sub_modes.get(key, "official") == "smart" and self._is_duplicate_for_sub(item, sub):
-                    logger.info(f"[Rocom] 智能去重跳过 → {key} (source={source} id={item_id})")
-                    self._advance_announcement_cursor(sub, item)
-                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
-                    await asyncio.sleep(1)
+            try:
+                target_subs = self._select_announcement_target_subs(item, all_subs)
+                if source == "bilibili":
+                    target_subs = [
+                        (key, sub)
+                        for key, sub in target_subs
+                        if bili_pushed_counts.get(key, 0) < self.bilibili_dynamic_max_push
+                    ]
+                if not target_subs:
                     continue
 
-                push_ok = await self._send_announcement_item(key, sub, item, rendered)
-                if push_ok:
-                    pushed_count += 1
-                    self._advance_announcement_cursor(sub, item)
-                    self._record_recent_pushed(sub, item, rendered)
-                    await self.announcement_sub_mgr.upsert_subscription(key, sub)
-                    pushed_subs.append((key, sub))
-                    if source == "bilibili":
-                        bili_pushed_counts[key] = bili_pushed_counts.get(key, 0) + 1
-                await asyncio.sleep(2)
+                rendered = await self._render_announcement_item(item, rendered_cache)
 
-            if pushed_subs:
-                await self._send_announcement_extras(item, rendered, pushed_subs)
+                pushed_subs = []
+                for key, sub in target_subs:
+                    if sub_modes.get(key, "official") == "smart" and self._is_duplicate_for_sub(item, sub):
+                        logger.info(f"[Rocom] 智能去重跳过 → {key} (source={source} id={item_id})")
+                        self._advance_announcement_cursor(sub, item)
+                        await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                        await asyncio.sleep(1)
+                        continue
+
+                    push_ok = await self._send_announcement_item(key, sub, item, rendered)
+                    if push_ok:
+                        pushed_count += 1
+                        self._advance_announcement_cursor(sub, item)
+                        self._record_recent_pushed(sub, item, rendered)
+                        await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                        pushed_subs.append((key, sub))
+                        if source == "bilibili":
+                            bili_pushed_counts[key] = bili_pushed_counts.get(key, 0) + 1
+                    await asyncio.sleep(2)
+
+                if pushed_subs:
+                    await self._schedule_announcement_extras(item, rendered, pushed_subs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"[Rocom] 处理公告候选失败，已跳过 (source={source} id={item_id}): {exc}"
+                )
+                continue
 
         if pushed_count:
             logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新内容")
@@ -3212,6 +3237,42 @@ class RocomPlugin(Star):
         self._bilibili_last_known_fingerprint = None
         self._bilibili_source_warned = False
 
+    async def _maybe_refresh_bili_credential(self) -> None:
+        """低频刷新扫码登录态，成功后持久化，避免登录过期后静默失效。"""
+        try:
+            if not self.bilibili_source.is_logged_in:
+                return
+            now = time.time()
+            last = float(getattr(self, "_bili_credential_checked_at", 0.0) or 0.0)
+            if now - last < 3600:
+                return
+            self._bili_credential_checked_at = now
+            refreshed = await self.bilibili_source.refresh_credential()
+            if refreshed and self._save_bili_credential(refreshed):
+                logger.info("[Rocom] B 站登录态已自动刷新并保存")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] B 站登录态刷新检查异常: {exc}")
+
+    async def _schedule_announcement_extras(
+        self,
+        item: Dict[str, Any],
+        rendered: Dict[str, Any],
+        pushed_subs: List[tuple],
+    ) -> None:
+        """把视频/多图附加推送放到后台，避免下载阻塞订阅轮询。"""
+        source = item.get("source") or "official"
+        item_id = str(item.get("id") or "")
+        name = f"announcement_extras:{source}:{item_id}"
+        try:
+            task = self._register_background_task(
+                name, self._send_announcement_extras(item, rendered, pushed_subs)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 启动公告附加推送任务失败，改为同步执行: {exc}")
+            await self._send_announcement_extras(item, rendered, pushed_subs)
+            return
+        task.add_done_callback(lambda t: self._unregister_background_task(name, t))
+
     def _select_announcement_target_subs(
         self, item: Dict[str, Any], all_subs: Dict[str, Dict[str, Any]]
     ) -> List[tuple]:
@@ -3248,7 +3309,13 @@ class RocomPlugin(Star):
                     if item_title and last_title and item_title == last_title:
                         continue
             # 官方公告标题唯一，可用于兜底去重；B 站存在周期性同名动态，不能按标题跳过
-            if source == "official" and item_title and last_title and item_title == last_title:
+            if (
+                source == "official"
+                and (not item_ts or not last_ts)
+                and item_title
+                and last_title
+                and item_title == last_title
+            ):
                 continue
             targets.append((key, sub))
         return targets
