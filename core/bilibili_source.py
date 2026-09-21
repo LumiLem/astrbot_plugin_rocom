@@ -245,6 +245,7 @@ class BilibiliDynamicSource:
         content_cover = ""
         text = ""
         images: List[str] = []
+        images_meta: List[Dict[str, Any]] = []
         video: Optional[Dict[str, str]] = None
         url = ""
 
@@ -260,6 +261,7 @@ class BilibiliDynamicSource:
             cover = _absolute_url(archive.get("cover"))
             if cover:
                 images.append(cover)
+                images_meta.append({"url": cover, "width": 0, "height": 0})
             bvid = str(archive.get("bvid") or "").strip()
             jump = _absolute_url(archive.get("jump_url"))
             if jump:
@@ -280,11 +282,19 @@ class BilibiliDynamicSource:
                 pic_url = _absolute_url(pic.get("url"))
                 if pic_url:
                     images.append(pic_url)
+                    images_meta.append(
+                        {
+                            "url": pic_url,
+                            "width": _as_int(pic.get("width")),
+                            "height": _as_int(pic.get("height")),
+                        }
+                    )
             url = _absolute_url(opus.get("jump_url"))
             # 专栏/文章的首图是封面，不是正文图（图文动态的 pics 才是正文图）
             if dyn_type == "DYNAMIC_TYPE_ARTICLE" and images:
                 content_cover = images[0]
                 images = images[1:]
+                images_meta = images_meta[1:]
         elif draw:
             draw_items = draw.get("items") if isinstance(draw.get("items"), list) else []
             for entry in draw_items:
@@ -293,6 +303,13 @@ class BilibiliDynamicSource:
                 pic_url = _absolute_url(entry.get("src"))
                 if pic_url:
                     images.append(pic_url)
+                    images_meta.append(
+                        {
+                            "url": pic_url,
+                            "width": _as_int(entry.get("width")),
+                            "height": _as_int(entry.get("height")),
+                        }
+                    )
         elif article:
             title = str(article.get("title") or "").strip()
             has_title = bool(title)
@@ -302,12 +319,15 @@ class BilibiliDynamicSource:
                 cover_url = _absolute_url(cover)
                 if cover_url:
                     images.append(cover_url)
+                    images_meta.append({"url": cover_url, "width": 0, "height": 0})
             cover = _absolute_url(article.get("cover"))
             if cover and cover not in images:
                 images.insert(0, cover)
+                images_meta.insert(0, {"url": cover, "width": 0, "height": 0})
             if images:
                 content_cover = images[0]
                 images = images[1:]
+                images_meta = images_meta[1:]
 
         if not text:
             text = str(desc.get("text") or "").strip()
@@ -326,6 +346,7 @@ class BilibiliDynamicSource:
                     text = (text + "\n" + inner_text).strip()
                 if not images:
                     images = list(inner.get("images") or [])
+                    images_meta = list(inner.get("images_meta") or [])
                 if not video:
                     video = inner.get("video")
                 if not content_cover:
@@ -355,6 +376,7 @@ class BilibiliDynamicSource:
             "links": extract_links(f"{text}\n{url}"),
             "author": str(author.get("name") or "洛克王国世界").strip(),
             "images": images,
+            "images_meta": images_meta,
             "video": video,
             "url": url,
         }

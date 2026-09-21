@@ -283,3 +283,16 @@ body {
     border: 3px solid rgba(255,255,255,0.8);
     backdrop-filter: blur(4px);
 }
+
+/* B 站动态：预切宫格小图按网格展示（还原平台九宫格观感） */
+.dyn-image-grid {
+    display: grid;
+    gap: 4px;
+    margin: 8px 0;
+}
+.dyn-image-grid img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 6px;
+}

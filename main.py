@@ -3533,6 +3533,7 @@ class RocomPlugin(Star):
                 "img_urls": img_urls,
                 "videos": self._extract_videos(detail),
                 "original_images": original_urls,
+                "original_files": [],
                 "fallback_text": self._clean_announcement_text(
                     str(content_data.get("text") or detail.get("summary") or ""), max_length=500
                 ),
@@ -3569,12 +3570,35 @@ class RocomPlugin(Star):
                     }
                 ]
 
+            # 附加推送素材：宫格组先拼成一张原图，其余图片按张转发
+            meta_by_url = {
+                str(m.get("url")): m
+                for m in (render_item.get("images_meta") or [])
+                if isinstance(m, dict)
+            }
+            original_files: List[str] = []
+            original_urls: List[str] = []
+            for group in self._bilibili_image_groups(
+                [str(u) for u in (render_item.get("images") or []) if u], meta_by_url
+            ):
+                if group["type"] == "grid" and len(group["urls"]) >= 2:
+                    stitched = await self._stitch_bilibili_grid(
+                        group["urls"], int(group.get("cols") or 3)
+                    )
+                    if stitched:
+                        original_files.append(stitched)
+                    else:
+                        original_urls.extend(group["urls"])
+                else:
+                    original_urls.extend(group["urls"])
+
             entry = {
                 "source": source,
                 "detail": render_item,
                 "img_urls": img_urls,
                 "videos": videos,
-                "original_images": list(render_item.get("images") or []),
+                "original_images": original_urls,
+                "original_files": original_files,
                 "fallback_text": self._clean_announcement_text(
                     str(render_item.get("text") or ""), max_length=500
                 ),
@@ -3681,9 +3705,17 @@ class RocomPlugin(Star):
                             logger.warning(f"[Rocom] 公告订阅降级视频直链推送失败 ({key}, source={source} id={item_id}): {e}")
                         await asyncio.sleep(2)
 
+        original_files = rendered.get("original_files") or []
         original_urls = rendered.get("original_images") or []
-        if len(original_urls) >= 2:
+        if original_files or len(original_urls) >= 2:
             image_nodes = []
+            # 宫格小图已拼接为单张原图，直接切片转发
+            for local_file in original_files:
+                if local_file and os.path.isfile(local_file):
+                    for p in self._slice_and_compress_image(local_file):
+                        image_nodes.append(
+                            Node(uin=0, name=fwd_name, content=[Image.fromFileSystem(p)])
+                        )
             for url in original_urls:
                 local_path = await self._download_announcement_image(url, referer=referer)
                 if local_path:
@@ -3692,7 +3724,7 @@ class RocomPlugin(Star):
                         image_nodes.append(
                             Node(uin=0, name=fwd_name, content=[Image.fromFileSystem(p)])
                         )
-            if len(image_nodes) >= 2:
+            if image_nodes:
                 for key, sub in pushed_subs:
                     fwd_chain = MessageChain()
                     fwd_chain.chain.append(Nodes(image_nodes))
@@ -3787,12 +3819,107 @@ class RocomPlugin(Star):
             enriched["has_title"] = True
 
         merged_images: List[str] = []
+        merged_meta: List[Dict[str, Any]] = []
+        feed_meta = {
+            str(m.get("url")): m for m in (item.get("images_meta") or []) if isinstance(m, dict)
+        }
         for url in list(detail.get("images") or []) + list(item.get("images") or []):
             if url and url not in merged_images:
                 merged_images.append(url)
+                src = feed_meta.get(str(url)) or {}
+                merged_meta.append(
+                    {
+                        "url": url,
+                        "width": int(src.get("width") or 0),
+                        "height": int(src.get("height") or 0),
+                    }
+                )
         if merged_images:
             enriched["images"] = merged_images
+            enriched["images_meta"] = merged_meta
         return enriched
+
+    async def _stitch_bilibili_grid(self, urls: List[str], cols: int) -> str | None:
+        """把预切宫格小图拼回一张原图（用于附加转发）；下载/拼接失败返回 None。"""
+        if not urls or cols < 2:
+            return None
+        try:
+            from PIL import Image as PILImage
+        except Exception:
+            return None
+        old_max = PILImage.MAX_IMAGE_PIXELS
+        PILImage.MAX_IMAGE_PIXELS = 300_000_000
+        try:
+            tiles = []
+            for url in urls:
+                local = await self._download_announcement_image(
+                    url, referer="https://www.bilibili.com/"
+                )
+                if not local or not os.path.isfile(local):
+                    return None
+                try:
+                    tiles.append(PILImage.open(local).convert("RGB"))
+                except Exception:
+                    return None
+            if not tiles:
+                return None
+            width, height = tiles[0].size
+            if any(tile.size != (width, height) for tile in tiles):
+                return None
+            rows = (len(tiles) + cols - 1) // cols
+            if width * cols * height * rows > 80_000_000:
+                return None
+            canvas = PILImage.new("RGB", (width * cols, height * rows), (255, 255, 255))
+            for index, tile in enumerate(tiles):
+                canvas.paste(tile, ((index % cols) * width, (index // cols) * height))
+            key = hashlib.md5("|".join(urls).encode()).hexdigest()
+            out_dir = os.path.join(os.path.dirname(self.settings_file), "rocom_images")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"stitch_{key}.jpg")
+            canvas.save(out_path, "JPEG", quality=90)
+            logger.info(
+                f"[Rocom] 宫格小图已拼接为一张原图：{len(tiles)} 张 → {cols}x{rows} ({width * cols}x{height * rows})"
+            )
+            return out_path
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 宫格拼接失败: {exc}")
+            return None
+        finally:
+            PILImage.MAX_IMAGE_PIXELS = old_max
+
+    @staticmethod
+    def _bilibili_image_groups(
+        images: List[str], meta_by_url: Dict[str, Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """按尺寸把连续的方图归为一组（预切的宫格小图），其余按单图全宽展示。
+
+        - 方图判据：宽高比在 0.6~1.67 之间且尺寸相同、在序列中连续。
+        - 组内 ≥2 张才按网格渲染：2/3 张按自身列数，4 张 2 列，其余 3 列。
+        """
+        raw_groups: List[Dict[str, Any]] = []
+        for url in images:
+            meta = meta_by_url.get(url) or {}
+            width = int(meta.get("width") or 0)
+            height = int(meta.get("height") or 0)
+            square = width > 0 and height > 0 and 0.6 <= (width / height) <= 1.67
+            if not square:
+                raw_groups.append({"type": "single", "urls": [url], "key": None})
+                continue
+            key = (width, height)
+            if raw_groups and raw_groups[-1]["type"] == "grid" and raw_groups[-1]["key"] == key:
+                raw_groups[-1]["urls"].append(url)
+            else:
+                raw_groups.append({"type": "grid", "urls": [url], "key": key})
+
+        result: List[Dict[str, Any]] = []
+        for group in raw_groups:
+            count = len(group["urls"])
+            if group["type"] == "grid" and count >= 2:
+                group["cols"] = 2 if count == 4 else (count if count <= 3 else 3)
+                result.append(group)
+            else:
+                result.append({"type": "single", "urls": group["urls"]})
+        return result
 
     async def _build_bilibili_dynamic_render_data(self, dyn: Dict[str, Any]) -> Dict[str, Any]:
         """把 B 站动态映射为 B 站专用模板数据：无封面、先文后图、无标题则不显示标题。"""
@@ -3816,8 +3943,24 @@ class RocomPlugin(Star):
                 f'class="video-cover" /><div class="video-play-btn">▶</div></div>'
             )
         else:
-            for image_url in images:
-                caption_html += f'<p style="line-height: 2;"><img src="{image_url}" /></p>'
+            meta_by_url = {
+                str(m.get("url")): m
+                for m in (dyn.get("images_meta") or [])
+                if isinstance(m, dict)
+            }
+            for group in self._bilibili_image_groups(images, meta_by_url):
+                if group["type"] == "grid":
+                    caption_html += (
+                        f'<div class="dyn-image-grid" '
+                        f'style="grid-template-columns: repeat({group["cols"]}, 1fr);">'
+                    )
+                    for image_url in group["urls"]:
+                        caption_html += f'<img src="{image_url}" />'
+                    caption_html += "</div>"
+                else:
+                    caption_html += (
+                        f'<p style="line-height: 2;"><img src="{group["urls"][0]}" /></p>'
+                    )
 
         ts = int(dyn.get("ts") or 0)
         time_str = (
