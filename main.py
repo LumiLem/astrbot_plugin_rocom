@@ -24,7 +24,7 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Plain, Image, Video, Node, Nodes, Poke
 
 from .core.client import RocomClient
-from .core.bilibili_source import BilibiliDynamicSource, credential_to_dict, extract_links
+from .core.bilibili_source import BilibiliDynamicSource, extract_links
 from .core.user import (
     UserManager,
     MerchantSubscriptionManager,
@@ -2900,6 +2900,10 @@ class RocomPlugin(Star):
 
     async def _check_announcement_subscriptions(self):
         """检查官方公告与 B 站动态订阅，按各订阅自身的数据源模式推送新内容。"""
+        # 只要当前持有 B 站登录态即按低频策略（每小时至多1次）自维护，与是否有具体群订阅脱钩
+        if self.bilibili_source.is_logged_in:
+            await self._maybe_refresh_bili_credential()
+
         all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return
@@ -2922,9 +2926,6 @@ class RocomPlugin(Star):
         logger.debug(
             f"[Rocom] 公告检查：{len(all_subs)} 个订阅 official={official_on} bilibili={bili_on}"
         )
-
-        if bili_on:
-            await self._maybe_refresh_bili_credential()
 
         # 1. 快速探活：官方公告取前 5 条，B 站动态取最新一页，分别计算指纹
         official_head_items: List[Dict[str, Any]] = []
@@ -3218,12 +3219,14 @@ class RocomPlugin(Star):
         path = self._bili_credential_path()
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            tmp_path = f"{path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             try:
-                os.chmod(path, 0o600)
+                os.chmod(tmp_path, 0o600)
             except Exception:
                 pass
+            os.replace(tmp_path, path)
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[Rocom] 保存 B 站登录凭据失败: {exc}")
@@ -7369,56 +7372,86 @@ class RocomPlugin(Star):
         if not event.is_private_chat():
             yield event.plain_result("为避免二维码泄露，请在私聊中使用「/B站登录」。")
             return
+        if getattr(self, "_bili_login_in_progress", False):
+            yield event.plain_result("当前已有正在进行的 B 站扫码登录流程，请等待其完成或超时后再试。")
+            return
 
-        login = BilibiliDynamicSource.create_qr_login()
+        login = BilibiliDynamicSource.create_qr_login(proxy=self.bilibili_proxy)
         if login is None:
             yield event.plain_result(
-                "当前环境不支持扫码登录（bilibili-api-python 未正确加载）。"
+                "当前环境不支持扫码登录（缺少必要依赖）。"
             )
             return
 
+        self._bili_login_in_progress = True
+        qrcode_info = None
         try:
-            await login.generate_qrcode()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[Rocom] 生成 B 站登录二维码失败: {exc}")
-            yield event.plain_result(f"生成二维码失败：{exc}")
-            return
-
-        qr_path = os.path.join(tempfile.gettempdir(), "rocom_bili_qrcode.png")
-        try:
-            login.get_qrcode_picture().to_file(qr_path)
-        except Exception:  # noqa: BLE001
-            qr_path = os.path.join(tempfile.gettempdir(), "qrcode.png")
-
-        yield event.plain_result("请使用 B站 App 扫描下方二维码登录（约 2 分钟内有效）")
-        yield event.image_result(qr_path)
-
-        deadline = time.time() + 120
-        while time.time() < deadline:
             try:
-                state = await login.check_state()
+                qrcode_info = await login.generate_qrcode()
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[Rocom] 轮询 B 站登录状态失败: {exc}")
-                yield event.plain_result(f"轮询登录状态失败：{exc}")
+                logger.warning(f"[Rocom] 生成 B 站登录二维码失败: {exc}")
+                yield event.plain_result(f"生成二维码失败：{exc}")
                 return
-            state_name = getattr(state, "name", str(state))
-            if state_name == "DONE":
-                credential = credential_to_dict(login.get_credential())
-                if not str(credential.get("sessdata") or "").strip():
-                    yield event.plain_result("登录成功但未获取到 SESSDATA，请重试。")
+
+            yield event.plain_result("请使用 B站 App 扫描下方二维码登录（约 3 分钟内有效）：")
+            yield event.image_result(qrcode_info.image_path)
+
+            deadline = time.time() + 180
+            consecutive_poll_errors = 0
+            while time.time() < deadline:
+                try:
+                    result = await login.poll()
+                    consecutive_poll_errors = 0
+                except Exception as exc:  # noqa: BLE001
+                    consecutive_poll_errors += 1
+                    logger.warning(
+                        f"[Rocom] 轮询 B 站登录状态异常 ({consecutive_poll_errors}/5): {exc}"
+                    )
+                    if consecutive_poll_errors >= 5:
+                        yield event.plain_result(f"轮询登录状态连续失败，已中止：{exc}")
+                        return
+                    await asyncio.sleep(2)
+                    continue
+
+                if result.is_done:
+                    credential = result.credential or {}
+                    if not str(credential.get("sessdata") or "").strip():
+                        yield event.plain_result("登录成功但未获取到 SESSDATA，请重试。")
+                        return
+
+                    # 临时生效并在服务端通过 nav 接口严格校验会话有效性
+                    self._rebuild_bilibili_source(credential)
+                    ok, uname, mid = await self.bilibili_source.verify_credential()
+                    if not ok:
+                        self._clear_bili_credential()
+                        self._rebuild_bilibili_source(None)
+                        yield event.plain_result(
+                            "❌ 登录态服务端校验未通过：B 站提示会话无效或未登录，请重试。"
+                        )
+                        return
+
+                    if not self._save_bili_credential(credential):
+                        yield event.plain_result("登录成功，但保存凭据失败，请检查插件数据目录权限。")
+                        return
+
+                    account_desc = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
+                    logger.info(f"[Rocom] B 站扫码登录成功并已生效: {account_desc}")
+                    yield event.plain_result(
+                        f"✅ B站登录成功！当前登录账号：{account_desc}，凭据已保存并立即生效。"
+                    )
                     return
-                if not self._save_bili_credential(credential):
-                    yield event.plain_result("登录成功，但保存凭据失败，请检查插件数据目录权限。")
+                if result.is_timeout:
+                    yield event.plain_result("❌ 二维码已超时，请重新执行「/B站登录」。")
                     return
-                self._rebuild_bilibili_source(credential)
-                logger.info("[Rocom] B 站扫码登录成功，凭据已保存并生效")
-                yield event.plain_result("✅ B站登录成功，凭据已保存并立即生效。")
-                return
-            if state_name == "TIMEOUT":
-                yield event.plain_result("❌ 二维码已超时，请重新执行「/B站登录」。")
-                return
-            await asyncio.sleep(2)
-        yield event.plain_result("❌ 登录等待超时，请重新执行「/B站登录」。")
+                await asyncio.sleep(2)
+            yield event.plain_result("❌ 登录等待超时，请重新执行「/B站登录」。")
+        finally:
+            self._bili_login_in_progress = False
+            try:
+                if qrcode_info and os.path.isfile(qrcode_info.image_path):
+                    os.remove(qrcode_info.image_path)
+            except Exception:
+                pass
 
     @filter.command("B站登出", alias={"bili_logout", "b站登出", "B站退出登录"})
     async def bili_logout(self, event: AstrMessageEvent):
@@ -7428,10 +7461,21 @@ class RocomPlugin(Star):
             yield event.plain_result("仅 Bot 管理员可以登出 B 站。")
             return
         had_credential = self.bilibili_source.is_logged_in
+        server_logout_ok = False
+        if had_credential:
+            try:
+                server_logout_ok = await self.bilibili_source.logout()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[Rocom] B 站服务端注销异常: {exc}")
         self._clear_bili_credential()
         self._rebuild_bilibili_source(None)
-        suffix = "" if had_credential else "（此前没有已保存的登录凭据）"
-        yield event.plain_result(f"✅ 已清除 B站登录凭据，恢复为配置的 SESSDATA/匿名模式。{suffix}")
+
+        if not had_credential:
+            yield event.plain_result("当前没有已保存的登录凭据，已恢复为默认模式。")
+        elif server_logout_ok:
+            yield event.plain_result("✅ 已登出 B 站：服务端登录态已成功注销，本地凭据已清除。")
+        else:
+            yield event.plain_result("⚠️ 已清除本地凭据（服务端注销未确认或凭据已在服务端失效）。")
 
     @filter.command("洛克群发公告")
     async def rocom_broadcast(self, event: AstrMessageEvent):

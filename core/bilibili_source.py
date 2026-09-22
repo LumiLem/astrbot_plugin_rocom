@@ -13,7 +13,6 @@ from astrbot.api import logger
 try:  # pragma: no cover - 依赖可用性取决于运行环境
     from bilibili_api import (
         Credential,
-        login_v2 as bili_login_v2,
         opus as bili_opus,
         request_settings,
         user as bili_user,
@@ -22,14 +21,13 @@ try:  # pragma: no cover - 依赖可用性取决于运行环境
 
     BILIBILI_AVAILABLE = True
     BILIBILI_IMPORT_ERROR = ""
-    QR_LOGIN_AVAILABLE = True
 except Exception as _exc:  # noqa: BLE001
     BILIBILI_AVAILABLE = False
     BILIBILI_IMPORT_ERROR = str(_exc)
-    QR_LOGIN_AVAILABLE = False
-    bili_login_v2 = None
     bili_opus = None
     bili_video = None
+
+from .bili_login import BiliLoginError, BiliQrLoginClient
 
 
 _URL_RE = re.compile(r"https?://[^\s<>\"')]+")
@@ -100,7 +98,7 @@ class BilibiliDynamicSource:
                 self.set_credential_dict(saved)
             elif self.sessdata:
                 try:
-                    self.credential = Credential(sessdata=self.sessdata)
+                    self.credential = Credential(sessdata=self.sessdata, proxy=self.proxy or None)
                     self.credential_dict = credential_to_dict(self.credential)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"[Rocom] B 站 SESSDATA 构建失败，将匿名请求: {exc}")
@@ -131,6 +129,7 @@ class BilibiliDynamicSource:
                 buvid4=str(data.get("buvid4") or "") or None,
                 dedeuserid=str(data.get("dedeuserid") or "") or None,
                 ac_time_value=str(data.get("ac_time_value") or "") or None,
+                proxy=self.proxy or None,
             )
             self.credential_dict = credential_to_dict(self.credential)
         except Exception as exc:  # noqa: BLE001
@@ -148,6 +147,7 @@ class BilibiliDynamicSource:
             return None
         if not str(getattr(self.credential, "ac_time_value", "") or ""):
             return None
+        old_dict = dict(self.credential_dict)
         try:
             self._apply_proxy()
             if await self.credential.check_refresh():
@@ -155,16 +155,65 @@ class BilibiliDynamicSource:
                 self.credential_dict = credential_to_dict(self.credential)
                 return dict(self.credential_dict)
         except Exception as exc:  # noqa: BLE001
+            try:
+                self.set_credential_dict(old_dict)
+            except Exception:
+                pass
             logger.warning(f"[Rocom] B 站登录态刷新失败: {exc}")
         return None
 
-    @staticmethod
-    def create_qr_login() -> Any:
-        """创建扫码登录对象；环境不支持时返回 None。"""
-        if not QR_LOGIN_AVAILABLE or bili_login_v2 is None:
-            return None
+    async def verify_credential(self) -> tuple[bool, str, int]:
+        """校验当前凭据是否在服务端真正有效，成功返回 (True, uname, mid)，失败返回 (False, '', 0)。"""
+        if not BILIBILI_AVAILABLE or self.credential is None:
+            return False, "", 0
+        self._apply_proxy()
         try:
-            return bili_login_v2.QrCodeLogin()
+            from bilibili_api.utils.network import Api
+
+            resp = await Api(
+                url="https://api.bilibili.com/x/web-interface/nav",
+                method="GET",
+                credential=self.credential,
+                no_csrf=True,
+                ignore_code=True,
+            ).result
+            if isinstance(resp, dict) and resp.get("isLogin"):
+                uname = str(resp.get("uname") or "")
+                mid = int(resp.get("mid") or 0)
+                return True, uname, mid
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 校验 B 站登录态异常: {exc}")
+        return False, "", 0
+
+    async def logout(self) -> bool:
+        """调用 B 站服务端登出接口注销凭据（参考 astrbot_plugin_bilibili）。"""
+        if not BILIBILI_AVAILABLE or self.credential is None:
+            return False
+        bili_jct = str(getattr(self.credential, "bili_jct", "") or "")
+        if not bili_jct:
+            return False
+        self._apply_proxy()
+        try:
+            from bilibili_api.utils.network import Api
+
+            resp = await Api(
+                url="https://api.bilibili.com/login/exit/v2",
+                method="POST",
+                no_csrf=True,
+                data={"biliCSRF": bili_jct},
+                credential=self.credential,
+                ignore_code=True,
+            ).result
+            return isinstance(resp, dict) and "redirectUrl" in resp
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Rocom] B 站服务端登出接口调用异常: {exc}")
+            return False
+
+    @staticmethod
+    def create_qr_login(proxy: str = "") -> Optional[BiliQrLoginClient]:
+        """创建扫码登录对象；环境不支持时返回 None。"""
+        try:
+            return BiliQrLoginClient(proxy=proxy)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[Rocom] 初始化 B 站扫码登录失败: {exc}")
             return None
