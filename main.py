@@ -2347,12 +2347,15 @@ class RocomPlugin(Star):
                     })
         return videos
 
-    async def _download_and_compress_video(self, video_url: str, referer: str = "") -> str:
-        """异步下载并压缩视频，返回本地路径；若下载或处理失败返回空字符串"""
+    async def _download_and_compress_video(
+        self, video_url: str, audio_url: str = "", referer: str = ""
+    ) -> str:
+        """异步下载并压缩视频（支持单文件 MP4 及 DASH 音视频分离流自动合流），返回本地路径；失败返回空"""
         if not video_url:
             return ""
 
-        url_hash = hashlib.md5(video_url.encode()).hexdigest()
+        hash_src = f"{video_url}|{audio_url}" if audio_url else video_url
+        url_hash = hashlib.md5(hash_src.encode()).hexdigest()
         temp_dir = os.path.join(os.path.dirname(self.settings_file), "rocom_videos")
         os.makedirs(temp_dir, exist_ok=True)
         
@@ -2381,6 +2384,8 @@ class RocomPlugin(Star):
                 pass
 
         if not os.path.exists(orig_path):
+            v_tmp = os.path.join(temp_dir, f"{url_hash}_v.m4s.tmp")
+            a_tmp = os.path.join(temp_dir, f"{url_hash}_a.m4s.tmp")
             try:
                 # 增大流式下载超时（单次 read 60s，总超时 600s），并添加常见 User-Agent
                 timeout = httpx.Timeout(timeout=600.0, connect=15.0, read=60.0, write=30.0)
@@ -2390,24 +2395,71 @@ class RocomPlugin(Star):
                 if referer:
                     headers["Referer"] = referer
                 async with httpx.AsyncClient(verify=False, timeout=timeout, headers=headers) as client:
-                    async with client.stream("GET", video_url) as resp:
-                        resp.raise_for_status()
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.aiter_bytes():
-                                f.write(chunk)
+                    if audio_url:
+                        # DASH 分离流：分别下载视频轨与音频轨，再通过 ffmpeg -c copy 秒级合流
+                        async with client.stream("GET", video_url) as resp:
+                            resp.raise_for_status()
+                            with open(v_tmp, "wb") as f:
+                                async for chunk in resp.aiter_bytes():
+                                    f.write(chunk)
+                        async with client.stream("GET", audio_url) as resp:
+                            resp.raise_for_status()
+                            with open(a_tmp, "wb") as f:
+                                async for chunk in resp.aiter_bytes():
+                                    f.write(chunk)
+
+                        if not (
+                            os.path.exists(v_tmp)
+                            and os.path.getsize(v_tmp) > 0
+                            and os.path.exists(a_tmp)
+                            and os.path.getsize(a_tmp) > 0
+                        ):
+                            raise RuntimeError("DASH 视频或音频轨道下载文件为空")
+
+                        merge_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", v_tmp,
+                            "-i", a_tmp,
+                            "-c", "copy",
+                            "-f", "mp4",
+                            tmp_path,
+                        ]
+                        proc = await asyncio.create_subprocess_exec(
+                            *merge_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        stdout, stderr = await proc.communicate()
+                        if proc.returncode != 0:
+                            err_msg = stderr.decode(errors="replace")[-300:]
+                            raise RuntimeError(f"ffmpeg DASH 合流失败: {err_msg}")
+                    else:
+                        async with client.stream("GET", video_url) as resp:
+                            resp.raise_for_status()
+                            with open(tmp_path, "wb") as f:
+                                async for chunk in resp.aiter_bytes():
+                                    f.write(chunk)
+
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                     os.replace(tmp_path, orig_path)
                 else:
-                    raise RuntimeError("下载的视频文件为空")
+                    raise RuntimeError("下载或合流后的视频文件为空")
             except Exception as e:
                 err_msg = str(e) or type(e).__name__
-                logger.error(f"[Rocom] 视频下载失败 ({type(e).__name__}): {err_msg}")
+                logger.error(f"[Rocom] 视频下载或合流失败 ({type(e).__name__}): {err_msg}")
                 if os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
                 return ""
+            finally:
+                for p in (v_tmp, a_tmp):
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
                 
         if not os.path.exists(orig_path) or os.path.getsize(orig_path) == 0:
             return ""
@@ -3558,18 +3610,24 @@ class RocomPlugin(Star):
             )
             img_urls = self._slice_and_compress_image(img_url) if img_url else []
 
-            # B 站视频动态：解析可直接下载的 mp4，交由与官方相同的附加推送逻辑处理
+            # B 站视频动态：解析可直接下载的 mp4 或 DASH 流，交由与官方相同的附加推送逻辑处理
             videos: List[Dict[str, str]] = []
             video_info = render_item.get("video") if isinstance(render_item.get("video"), dict) else None
             if video_info:
                 page_url = str(video_info.get("url") or "")
                 bvid = str(video_info.get("bvid") or "")
-                download_url = await self.bilibili_source.get_video_download_url(bvid) if bvid else ""
+                download_url, audio_url = (
+                    await self.bilibili_source.get_video_stream_urls(bvid)
+                    if bvid
+                    else ("", None)
+                )
                 videos = [
                     {
                         "url": download_url,
+                        "audio_url": audio_url or "",
                         "cover": str(video_info.get("cover") or ""),
                         "page": page_url,
+                        "bvid": bvid,
                     }
                 ]
 
@@ -3671,9 +3729,23 @@ class RocomPlugin(Star):
             video_paths = []
             for v in videos:
                 video_url = str(v.get("url") or "")
+                audio_url = str(v.get("audio_url") or "")
+                bvid = str(v.get("bvid") or "")
+                if not video_url and bvid and hasattr(self, "bilibili_source") and self.bilibili_source:
+                    try:
+                        retry_v, retry_a = await self.bilibili_source.get_video_stream_urls(bvid)
+                        if retry_v:
+                            video_url = retry_v
+                            audio_url = retry_a or ""
+                            v["url"] = video_url
+                            v["audio_url"] = audio_url
+                    except Exception as err:
+                        logger.debug(f"[Rocom] 附加推送前重试获取 B 站视频流异常: {err}")
                 if not video_url:
                     continue
-                p = await self._download_and_compress_video(video_url, referer=referer)
+                p = await self._download_and_compress_video(
+                    video_url, audio_url=audio_url, referer=referer
+                )
                 if p and os.path.isfile(p):
                     video_paths.append(p)
 

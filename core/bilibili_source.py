@@ -442,24 +442,70 @@ class BilibiliDynamicSource:
             logger.warning(f"[Rocom] 获取 B 站图文详情失败 (opus={opus_id}): {exc}")
             return None
 
-    async def get_video_download_url(self, bvid: Any) -> str:
-        """获取 B 站视频的可直接下载流地址（html5 单文件 mp4，无需鉴权）。"""
+    async def get_video_stream_urls(self, bvid: Any) -> tuple[str, Optional[str]]:
+        """获取 B 站视频流地址：(video_url, audio_url)。
+
+        若获取到单文件 MP4（如 HTML5 流），返回 (video_url, None)；
+        若 HTML5 流未就绪（如新投稿刚发布），回退提取 DASH 音视频分离流，返回 (video_url, audio_url)；
+        获取失败返回 ("", None)。
+        """
         bvid = str(bvid or "").strip()
         if not BILIBILI_AVAILABLE or bili_video is None or not bvid:
-            return ""
+            return "", None
+        self._apply_proxy()
+
+        # 1. 优先尝试移动端单文件 HTML5 MP4 流（单流无需合流）
         try:
-            self._apply_proxy()
             info = await bili_video.Video(bvid=bvid, credential=self.credential).get_download_url(
                 0, html5=True
             )
             for entry in (info or {}).get("durl") or []:
                 url = str((entry or {}).get("url") or "").strip()
                 if url:
-                    return url
-            return ""
+                    logger.debug(f"[Rocom] 命中 B 站 HTML5 单文件视频流 (bvid={bvid})")
+                    return url, None
+            logger.debug(f"[Rocom] B 站未返回 HTML5 单文件流，准备尝试 DASH 流 (bvid={bvid})")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[Rocom] 获取 B 站视频下载地址失败 (bvid={bvid}): {exc}")
-            return ""
+            logger.debug(f"[Rocom] 获取 B 站 HTML5 视频流异常，准备尝试 DASH 流 (bvid={bvid}): {exc}")
+
+        # 2. 回退尝试 DASH 流（音视频分离流，支持刚发布视频）
+        try:
+            data = await bili_video.Video(bvid=bvid, credential=self.credential).get_download_url(
+                0, html5=False
+            )
+            detecter = getattr(bili_video, "VideoDownloadURLDataDetecter", None)
+            if detecter and isinstance(data, dict):
+                codec_pref = []
+                for c in ("AVC", "HEV", "AV1"):
+                    attr = getattr(bili_video.VideoCodecs, c, None)
+                    if attr is not None:
+                        codec_pref.append(attr)
+                streams = detecter(data).detect_best_streams(
+                    codecs=codec_pref or None,
+                    no_dolby_video=True,
+                    no_hdr=True,
+                    no_dolby_audio=True,
+                    no_hires=True,
+                )
+                v_stream = streams[0] if len(streams) > 0 else None
+                a_stream = streams[1] if len(streams) > 1 else None
+                v_url = str(getattr(v_stream, "url", "") or "").strip()
+                a_url = str(getattr(a_stream, "url", "") or "").strip()
+                if v_url:
+                    logger.info(
+                        f"[Rocom] 命中 B 站 DASH 音视频分离流 (bvid={bvid}, has_audio={bool(a_url)})"
+                    )
+                    return v_url, (a_url or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 获取 B 站 DASH 视频流失败 (bvid={bvid}): {exc}")
+
+        logger.warning(f"[Rocom] 获取 B 站视频流失败 (bvid={bvid}): 无可用媒体流")
+        return "", None
+
+    async def get_video_download_url(self, bvid: Any) -> str:
+        """获取 B 站视频的可直接下载流地址（兼容旧接口）。"""
+        v_url, _ = await self.get_video_stream_urls(bvid)
+        return v_url
 
     @staticmethod
     def parse_opus_detail(info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
