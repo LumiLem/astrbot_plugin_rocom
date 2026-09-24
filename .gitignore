@@ -11,3 +11,4 @@ reference/
 .DS_Store
 .kilo/plans/
 .kilo/worktrees/
+data/
