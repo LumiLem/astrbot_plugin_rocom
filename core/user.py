@@ -268,7 +268,20 @@ class AnnouncementSubscriptionManager(AsyncDataManager):
 
     async def upsert_subscription(self, key: str, subscription: Dict[str, Any]):
         async with self.lock:
-            self.data[str(key)] = copy.deepcopy(subscription)
+            sub = copy.deepcopy(subscription)
+            sub.pop("recent_pushed", None)
+            self.data[str(key)] = sub
+            await self._save()
+
+    async def upsert_subscriptions_batch(self, updates: Dict[str, Dict[str, Any]]):
+        """批量更新多个订阅条目并单次保存，避免逐个用户写盘导致的写放大"""
+        if not updates:
+            return
+        async with self.lock:
+            for key, subscription in updates.items():
+                sub = copy.deepcopy(subscription)
+                sub.pop("recent_pushed", None)
+                self.data[str(key)] = sub
             await self._save()
 
     async def get_subscription(self, key: str) -> Optional[Dict[str, Any]]:
@@ -288,6 +301,90 @@ class AnnouncementSubscriptionManager(AsyncDataManager):
     async def get_all_subscriptions(self) -> Dict[str, Dict[str, Any]]:
         async with self.lock:
             return copy.deepcopy(self.data)
+
+
+class AnnouncementHistoryManager(AsyncDataManager):
+    """RoCom announcement global push history storage."""
+
+    MAX_HISTORY_ITEMS = 50
+
+    def __init__(self, data_dir: str):
+        super().__init__(data_dir, "rocom_announcement_history.json", [])
+        # 兼容迁移：若全新生成且全局历史为空，从已存在的旧版订阅文件中自动提取历史记录
+        if not self.data:
+            self._migrate_from_legacy_subscriptions(data_dir)
+
+    def _migrate_from_legacy_subscriptions(self, data_dir: str):
+        subs_path = os.path.join(data_dir, "rocom_announcement_subscriptions.json")
+        if not os.path.isfile(subs_path):
+            return
+        try:
+            with open(subs_path, "r", encoding="utf-8") as f:
+                subs = json.load(f)
+            if not isinstance(subs, dict):
+                return
+            collected: List[Dict[str, Any]] = []
+            seen = set()
+            for sub in subs.values():
+                if not isinstance(sub, dict):
+                    continue
+                for item in sub.get("recent_pushed") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    key = (str(item.get("src") or ""), str(item.get("id") or ""))
+                    if key in seen or not key[1]:
+                        continue
+                    seen.add(key)
+                    collected.append(copy.deepcopy(item))
+            if collected:
+                collected.sort(key=lambda x: int(x.get("ts") or x.get("pushed_at") or 0))
+                self.data = collected[-self.MAX_HISTORY_ITEMS:]
+                self._save_sync()
+                logger.info(f"[Rocom] 已自动从旧版订阅配置中迁移 {len(self.data)} 条历史去重记录到全局历史池")
+        except Exception as e:
+            logger.debug(f"[Rocom] 检查旧版去重历史跳过: {e}")
+
+    def _save_sync(self):
+        try:
+            temp_path = self.path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.path)
+        except Exception as e:
+            logger.error(f"[Rocom] 同步保存 {self.path} 失败: {e}")
+
+    async def get_recent_history(self) -> List[Dict[str, Any]]:
+        async with self.lock:
+            if not isinstance(self.data, list):
+                self.data = []
+            return copy.deepcopy(self.data)
+
+    async def record_entries(self, entries: List[Dict[str, Any]]) -> None:
+        """批量记录新推送内容，保持全局单份存储，并截断到最近 MAX_HISTORY_ITEMS 条"""
+        if not entries:
+            return
+        async with self.lock:
+            if not isinstance(self.data, list):
+                self.data = []
+            seen_keys = {
+                (str(e.get("src") or ""), str(e.get("id") or ""))
+                for e in self.data
+                if isinstance(e, dict)
+            }
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                key = (str(entry.get("src") or ""), str(entry.get("id") or ""))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                self.data.append(copy.deepcopy(entry))
+
+            self.data = [e for e in self.data if isinstance(e, dict)]
+            self.data.sort(key=lambda x: int(x.get("ts") or x.get("pushed_at") or 0))
+            if len(self.data) > self.MAX_HISTORY_ITEMS:
+                self.data = self.data[-self.MAX_HISTORY_ITEMS:]
+            await self._save()
 
 
 class BroadcastTaskManager(AsyncDataManager):

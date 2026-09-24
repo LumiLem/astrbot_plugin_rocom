@@ -30,6 +30,7 @@ from .core.user import (
     MerchantSubscriptionManager,
     HomeSubscriptionManager,
     AnnouncementSubscriptionManager,
+    AnnouncementHistoryManager,
     BroadcastTaskManager,
     ActiveUserManager,
 )
@@ -112,6 +113,7 @@ class RocomPlugin(Star):
         self.merchant_sub_mgr = MerchantSubscriptionManager(data_dir)
         self.home_sub_mgr = HomeSubscriptionManager(data_dir)
         self.announcement_sub_mgr = AnnouncementSubscriptionManager(data_dir)
+        self.announcement_history_mgr = AnnouncementHistoryManager(data_dir)
         self.broadcast_task_mgr = BroadcastTaskManager(data_dir)
         self.active_user_mgr = ActiveUserManager(data_dir)
         
@@ -3111,15 +3113,14 @@ class RocomPlugin(Star):
             key=lambda x: (int(x.get("ts") or 0), 0 if x.get("source") == "official" else 1)
         )
 
-        # 2.1 智能订阅需要正文判重：为官方候选补全详情正文（仅在已有另一源推送记录时）
+        # 2.1 智能订阅需要正文判重：获取全局历史并在有跨源上下文时为官方候选补全详情正文
+        history = await self.announcement_history_mgr.get_recent_history()
         if "smart" in sub_modes.values():
-            has_cross_recent = any(
-                sub_modes.get(key) == "smart"
-                and isinstance(sub.get("recent_pushed"), list)
-                and any(e.get("src") == "bilibili" for e in sub["recent_pushed"])
-                for key, sub in all_subs.items()
+            has_cross_context = bool(bili_changed) or any(
+                isinstance(e, dict) and (e.get("src") == "bilibili" or e.get("source") == "bilibili")
+                for e in history
             )
-            if has_cross_recent:
+            if has_cross_context:
                 detail_cache: Dict[str, Any] = {}
                 for cand in candidates:
                     if cand.get("source") != "official":
@@ -3140,6 +3141,9 @@ class RocomPlugin(Star):
                         )
                         if body:
                             cand["text"] = body
+
+            # 2.2 在分发给用户前，执行全局单次去重（计算复杂度由 O(N*M) 降至 O(M)）
+            self._deduplicate_candidates_globally(candidates, history)
 
         # 3. 未初始化订阅基线对齐到当前最新，避免初始时刷屏推送历史
         official_latest = official_sorted_items[-1] if official_sorted_items else None
@@ -3179,6 +3183,8 @@ class RocomPlugin(Star):
         rendered_cache: Dict[str, Dict[str, Any]] = {}
         bili_pushed_counts: Dict[str, int] = {}
         pushed_count = 0
+        modified_subs: Dict[str, Dict[str, Any]] = {}
+        new_history_entries: List[Dict[str, Any]] = []
 
         for item in candidates:
             source = item.get("source") or "official"
@@ -3199,18 +3205,20 @@ class RocomPlugin(Star):
                 pushed_subs = []
                 for key, sub in target_subs:
                     if sub_modes.get(key, "official") == "smart" and self._is_duplicate_for_sub(item, sub):
-                        logger.info(f"[Rocom] 智能去重跳过 → {key} (source={source} id={item_id})")
+                        logger.info(
+                            f"[Rocom] 智能去重跳过 → {key} (source={source} id={item_id} duplicate_of={item.get('duplicate_of')})"
+                        )
                         self._advance_announcement_cursor(sub, item)
-                        await self.announcement_sub_mgr.upsert_subscription(key, sub)
-                        await asyncio.sleep(1)
+                        self._mark_sub_seen(sub, item)
+                        modified_subs[key] = sub
                         continue
 
                     push_ok = await self._send_announcement_item(key, sub, item, rendered)
                     if push_ok:
                         pushed_count += 1
                         self._advance_announcement_cursor(sub, item)
-                        self._record_recent_pushed(sub, item, rendered)
-                        await self.announcement_sub_mgr.upsert_subscription(key, sub)
+                        self._mark_sub_seen(sub, item)
+                        modified_subs[key] = sub
                         pushed_subs.append((key, sub))
                         if source == "bilibili":
                             bili_pushed_counts[key] = bili_pushed_counts.get(key, 0) + 1
@@ -3218,6 +3226,10 @@ class RocomPlugin(Star):
 
                 if pushed_subs:
                     await self._schedule_announcement_extras(item, rendered, pushed_subs)
+                    new_history_entries.append(self._build_history_entry(item, rendered))
+                elif any(sub_modes.get(k) == "smart" for k, _ in target_subs):
+                    # 即使全部被智能去重跳过，也记录到全局历史，避免后续轮次重复计算
+                    new_history_entries.append(self._build_history_entry(item, rendered))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -3225,6 +3237,12 @@ class RocomPlugin(Star):
                     f"[Rocom] 处理公告候选失败，已跳过 (source={source} id={item_id}): {exc}"
                 )
                 continue
+
+        # 5. 批量持久化更新：一次性写盘，彻底解决逐个用户写盘的写放大问题
+        if modified_subs:
+            await self.announcement_sub_mgr.upsert_subscriptions_batch(modified_subs)
+        if new_history_entries:
+            await self.announcement_history_mgr.record_entries(new_history_entries)
 
         if pushed_count:
             logger.info(f"[Rocom] 公告订阅：本轮成功推送 {pushed_count} 次新内容")
@@ -3425,9 +3443,23 @@ class RocomPlugin(Star):
         text = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
         return text
 
-    def _record_recent_pushed(
-        self, sub: Dict[str, Any], item: Dict[str, Any], rendered: Dict[str, Any] | None = None
-    ) -> None:
+    def _mark_sub_seen(self, sub: Dict[str, Any], item: Dict[str, Any]) -> None:
+        """记录该订阅已见过的条目 ID 及主题 Key（轻量级游标记录，不存正文）。"""
+        source = item.get("source") or "official"
+        item_id = str(item.get("id") or "")
+        topic_key = item.get("topic_key") or f"{source}:{item_id}"
+        seen = sub.get("seen_topics")
+        if not isinstance(seen, list):
+            seen = []
+        for key in (topic_key, f"{source}:{item_id}"):
+            if key and key not in seen:
+                seen.append(key)
+        sub["seen_topics"] = seen[-50:]
+
+    def _build_history_entry(
+        self, item: Dict[str, Any], rendered: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        """构建放入全局公告历史池的条目，包含规范化文本以便后续去重匹配。"""
         source = item.get("source") or "official"
         body = ""
         detail = (rendered or {}).get("detail")
@@ -3439,29 +3471,17 @@ class RocomPlugin(Star):
                 body = str(detail.get("text") or "")
         if not body:
             body = str(item.get("text") or "")
-        entry = {
+        return {
             "src": source,
             "id": str(item.get("id") or ""),
             "ts": int(item.get("ts") or 0),
             "title": self._normalize_match_text(item.get("title")),
             "text": self._normalize_match_text(body),
             "links": list(item.get("links") or []),
+            "topic_key": item.get("topic_key") or f"{source}:{item.get('id')}",
+            "duplicate_of": item.get("duplicate_of"),
             "pushed_at": int(time.time()),
         }
-        recent = sub.get("recent_pushed")
-        if not isinstance(recent, list):
-            recent = []
-        recent = [
-            e
-            for e in recent
-            if not (
-                isinstance(e, dict)
-                and e.get("src") == entry["src"]
-                and str(e.get("id")) == entry["id"]
-            )
-        ]
-        recent.append(entry)
-        sub["recent_pushed"] = recent[-20:]
 
     @staticmethod
     def _lcs_length(a: str, b: str, cap: int = 120) -> int:
@@ -3483,89 +3503,144 @@ class RocomPlugin(Star):
             prev = cur
         return best
 
-    def _is_duplicate_for_sub(self, item: Dict[str, Any], sub: Dict[str, Any]) -> bool:
-        """智能模式：判断该条目是否与订阅最近推送的另一数据源内容重复。
-
-        官方公告列表常无正文（仅标题），因此以「标题相似度」为主，「正文包含/最长公共子串」
-        为辅；标题过短无法可靠比较时，退化为短时间窗口判定。
-        """
-        recent = sub.get("recent_pushed")
-        if not isinstance(recent, list) or not recent:
+    def _is_duplicate_pair(self, a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """判断两条公告/动态是否属于不同数据源的同一事件（跨源去重）。"""
+        a_src = a.get("source") or a.get("src") or "official"
+        b_src = b.get("source") or b.get("src") or "official"
+        if a_src == b_src:
             return False
 
-        source = item.get("source") or "official"
-        a_ts = int(item.get("ts") or 0)
-        a_links = set(item.get("links") or [])
-        a_title = self._normalize_match_text(item.get("title"))
-        a_text = self._normalize_match_text(item.get("text"))
+        a_links = set(a.get("links") or [])
+        b_links = set(b.get("links") or [])
+        if a_links and b_links and (a_links & b_links):
+            return True
+
+        a_ts = int(a.get("ts") or 0)
+        b_ts = int(b.get("ts") or 0)
+        if not a_ts or not b_ts:
+            return False
+
+        a_title = self._normalize_match_text(a.get("title"))
+        b_title = self._normalize_match_text(b.get("title"))
+        a_text = self._normalize_match_text(a.get("text"))
+        b_text = self._normalize_match_text(b.get("text"))
         a_full = a_title + a_text
+        b_full = b_title + b_text
 
-        for entry in recent:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("src") == source:
-                continue
-            b_links = set(entry.get("links") or [])
-            if a_links and b_links and (a_links & b_links):
-                return True
-            b_ts = int(entry.get("ts") or 0)
-            if not a_ts or not b_ts:
-                continue
-            b_title = str(entry.get("title") or "")
-            b_text = str(entry.get("text") or "")
-            b_full = b_title + b_text
+        # 标题过短/缺失时无法可靠比较，退化为短时间窗口判定
+        short = (
+            not a_full
+            or not b_full
+            or len(a_title) < self._DEDUP_SHORT_TITLE_LENGTH
+            or len(b_title) < self._DEDUP_SHORT_TITLE_LENGTH
+        )
+        window = (
+            self._DEDUP_SHORT_TEXT_WINDOW_SECONDS
+            if short
+            else self.announcement_dedup_window_seconds
+        )
+        if abs(a_ts - b_ts) > window:
+            return False
+        if short:
+            return True
 
-            # 标题过短/缺失时无法可靠比较，退化为短时间窗口判定
-            short = (
-                not a_full
-                or not b_full
-                or len(a_title) < self._DEDUP_SHORT_TITLE_LENGTH
-                or len(b_title) < self._DEDUP_SHORT_TITLE_LENGTH
-            )
-            window = (
-                self._DEDUP_SHORT_TEXT_WINDOW_SECONDS
-                if short
-                else self.announcement_dedup_window_seconds
-            )
-            if abs(a_ts - b_ts) > window:
+        matched = False
+        if a_title and b_title:
+            if a_title in b_title or b_title in a_title:
+                matched = True
+            else:
+                try:
+                    matched = (
+                        SequenceMatcher(None, a_title, b_title).ratio()
+                        >= self.announcement_dedup_similarity
+                    )
+                except Exception:
+                    matched = False
+        if not matched and a_text and b_text:
+            if a_text in b_text or b_text in a_text:
+                matched = True
+            elif (
+                min(len(a_text), len(b_text)) >= self._DEDUP_BODY_MIN_LENGTH
+                and SequenceMatcher(
+                    None,
+                    a_text[: self._DEDUP_BODY_MAX_CHARS],
+                    b_text[: self._DEDUP_BODY_MAX_CHARS],
+                ).ratio()
+                >= self._DEDUP_BODY_SIMILARITY
+            ):
+                matched = True
+        if not matched and a_full and b_full:
+            lcs = self._lcs_length(a_full, b_full)
+            if (
+                lcs >= self._DEDUP_LCS_MIN_LENGTH
+                and lcs / max(1, min(len(a_full), len(b_full))) >= self._DEDUP_LCS_RATIO
+            ):
+                matched = True
+        return matched
+
+    def _deduplicate_candidates_globally(
+        self, candidates: List[Dict[str, Any]], history: List[Dict[str, Any]]
+    ) -> None:
+        """在分发给用户前执行全局去重标记：
+        1. 对比当前批次候选（按发布时间排序，时间早的优先为主条目）
+        2. 对比历史池中的已有条目
+        标记 duplicate_of 和 topic_key。
+        """
+        for i, cand in enumerate(candidates):
+            cand_src = cand.get("source") or "official"
+            cand_id = str(cand.get("id") or "")
+            cand_key = f"{cand_src}:{cand_id}"
+            cand.setdefault("duplicate_of", None)
+            cand.setdefault("topic_key", cand_key)
+
+            # 优先检查当前批次中排在前面的条目 (先发布的作为主主题)
+            matched_target = None
+            for prev in candidates[:i]:
+                if self._is_duplicate_pair(cand, prev):
+                    matched_target = prev
+                    break
+
+            if matched_target is not None:
+                cand["duplicate_of"] = (
+                    matched_target.get("topic_key")
+                    or f"{matched_target.get('source')}:{matched_target.get('id')}"
+                )
+                cand["topic_key"] = cand["duplicate_of"]
                 continue
-            if short:
+
+            # 其次检查历史池中的已有条目
+            for hist_entry in reversed(history):
+                if self._is_duplicate_pair(cand, hist_entry):
+                    cand["duplicate_of"] = (
+                        hist_entry.get("topic_key")
+                        or f"{hist_entry.get('src')}:{hist_entry.get('id')}"
+                    )
+                    cand["topic_key"] = cand["duplicate_of"]
+                    break
+
+    def _is_duplicate_for_sub(self, item: Dict[str, Any], sub: Dict[str, Any]) -> bool:
+        """智能模式：判断该条目对当前用户是否为重复推送（O(1) 查表）。"""
+        seen = set(sub.get("seen_topics") or [])
+        # 兼容未清理的旧订阅 recent_pushed
+        if "recent_pushed" in sub and isinstance(sub["recent_pushed"], list):
+            for e in sub["recent_pushed"]:
+                if isinstance(e, dict):
+                    seen.add(f"{e.get('src')}:{e.get('id')}")
+
+        duplicate_of = item.get("duplicate_of")
+        if duplicate_of:
+            if duplicate_of in seen:
+                return True
+            # 兼容游标判定（例如冷启动或未记入 seen_topics 的旧订阅）
+            if duplicate_of.startswith("official:") and str(sub.get("last_id")) == duplicate_of.split(":", 1)[1]:
+                return True
+            if duplicate_of.startswith("bilibili:") and str(sub.get("bili_last_id")) == duplicate_of.split(":", 1)[1]:
                 return True
 
-            matched = False
-            if a_title and b_title:
-                if a_title in b_title or b_title in a_title:
-                    matched = True
-                else:
-                    try:
-                        matched = (
-                            SequenceMatcher(None, a_title, b_title).ratio()
-                            >= self.announcement_dedup_similarity
-                        )
-                    except Exception:
-                        matched = False
-            if not matched and a_text and b_text:
-                if a_text in b_text or b_text in a_text:
-                    matched = True
-                elif (
-                    min(len(a_text), len(b_text)) >= self._DEDUP_BODY_MIN_LENGTH
-                    and SequenceMatcher(
-                        None,
-                        a_text[: self._DEDUP_BODY_MAX_CHARS],
-                        b_text[: self._DEDUP_BODY_MAX_CHARS],
-                    ).ratio()
-                    >= self._DEDUP_BODY_SIMILARITY
-                ):
-                    matched = True
-            if not matched and a_full and b_full:
-                lcs = self._lcs_length(a_full, b_full)
-                if (
-                    lcs >= self._DEDUP_LCS_MIN_LENGTH
-                    and lcs / max(1, min(len(a_full), len(b_full))) >= self._DEDUP_LCS_RATIO
-                ):
-                    matched = True
-            if matched:
-                return True
+        topic_key = item.get("topic_key")
+        if topic_key and topic_key in seen:
+            return True
+
         return False
 
     async def _render_announcement_item(
