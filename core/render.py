@@ -120,7 +120,7 @@ class Renderer:
             return []
 
     async def _inline_failed_images(self, page, urls, options: Dict[str, Any]) -> int:
-        """把未加载成功的远程图片下载为 data URI 并替换，返回成功替换的图片数。"""
+        """把未加载成功的远程图片下载为 data URI 或本地文件并替换，返回成功替换的图片数。"""
         try:
             import httpx
         except Exception:
@@ -133,32 +133,54 @@ class Renderer:
             headers["Referer"] = referer
         inlined = 0
         try:
+            max_size = int(options.get("max_inline_image_size", 50 * 1024 * 1024))
+        except (TypeError, ValueError):
+            max_size = 50 * 1024 * 1024
+        try:
+            timeout = float(options.get("inline_http_timeout", 60.0))
+        except (TypeError, ValueError):
+            timeout = 60.0
+
+        try:
             async with httpx.AsyncClient(
-                verify=False, timeout=30, follow_redirects=True, headers=headers
+                verify=False, timeout=timeout, follow_redirects=True, headers=headers
             ) as client:
                 for src in urls[:12]:
-                    if not src or src.startswith("data:"):
+                    if not src or src.startswith("data:") or src.startswith("file:"):
                         continue
                     try:
                         resp = await client.get(src)
                         if resp.status_code != 200 or not resp.content:
                             continue
-                        if len(resp.content) > 12 * 1024 * 1024:
+                        if len(resp.content) > max_size:
                             continue
-                        mime = str(resp.headers.get("content-type") or "").split(";")[0].strip()
-                        if not mime.startswith("image/"):
-                            mime = mimetypes.guess_type(src)[0] or "image/jpeg"
-                        data_uri = f"data:{mime};base64,{base64.b64encode(resp.content).decode('ascii')}"
+                        # 如果图片体积较大（>4MB），保存为本地文件并用 file:/// 注入，避免巨型 base64 造成浏览器内存与 IPC 压力
+                        if len(resp.content) > 4 * 1024 * 1024:
+                            ext = mimetypes.guess_extension(resp.headers.get("content-type") or "") or ".jpg"
+                            if not ext or ext == ".bin":
+                                ext = ".jpg"
+                            local_file = os.path.join(
+                                self._output_dir, f"inlined_{uuid.uuid4().hex[:10]}{ext}"
+                            )
+                            with open(local_file, "wb") as f:
+                                f.write(resp.content)
+                            replacement_url = Path(local_file).resolve().as_uri()
+                        else:
+                            mime = str(resp.headers.get("content-type") or "").split(";")[0].strip()
+                            if not mime.startswith("image/"):
+                                mime = mimetypes.guess_type(src)[0] or "image/jpeg"
+                            replacement_url = f"data:{mime};base64,{base64.b64encode(resp.content).decode('ascii')}"
+
                         replaced = await page.evaluate(
                             """args => {
-                                const [src, dataUri] = args;
+                                const [src, repUrl] = args;
                                 let n = 0;
                                 document.querySelectorAll('img').forEach(img => {
-                                    if ((img.currentSrc || img.src) === src) { img.src = dataUri; n++; }
+                                    if ((img.currentSrc || img.src) === src) { img.src = repUrl; n++; }
                                 });
                                 return n;
                             }""",
-                            [src, data_uri],
+                            [src, replacement_url],
                         )
                         if replaced:
                             inlined += 1

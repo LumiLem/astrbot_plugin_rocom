@@ -5,6 +5,7 @@ B 站动态数据源
 依赖为懒加载：安装失败时插件仍可正常加载，仅 B 站源不可用。
 """
 
+import html
 import re
 from typing import Any, Dict, List, Optional
 
@@ -518,6 +519,7 @@ class BilibiliDynamicSource:
         title = ""
         images: List[str] = []
         lines: List[str] = []
+        html_parts: List[str] = []
 
         for module in modules:
             if not isinstance(module, dict):
@@ -542,38 +544,156 @@ class BilibiliDynamicSource:
             for para in content.get("paragraphs") or []:
                 if not isinstance(para, dict):
                     continue
-                text_bits: List[str] = []
-                for key in ("text", "heading", "blockquote", "code"):
-                    block = para.get(key)
-                    if not isinstance(block, dict):
-                        continue
-                    for node in block.get("nodes") or []:
+
+                para_type = para.get("para_type")
+                align_obj = para.get("align")
+                align_val = align_obj.get("align") if isinstance(align_obj, dict) else 0
+                align_style = ""
+                if align_val == 2:
+                    align_style = " text-align: center;"
+                elif align_val == 3:
+                    align_style = " text-align: right;"
+
+                # 1. 插图段落 (para_type == 2 或包含 pic)
+                para_pic = para.get("pic")
+                if para_type == 2 or isinstance(para_pic, dict):
+                    pic_urls = []
+                    if isinstance(para_pic, dict):
+                        for pic in para_pic.get("pics") or []:
+                            pic_url = _absolute_url((pic or {}).get("url"))
+                            if pic_url:
+                                pic_urls.append(pic_url)
+                                images.append(pic_url)
+                    for u in pic_urls:
+                        html_parts.append(
+                            f'<p style="line-height: 2;{align_style}"><img src="{html.escape(u)}" /></p>'
+                        )
+                    continue
+
+                # 2. 标题段落 (heading)
+                heading_obj = para.get("heading")
+                if isinstance(heading_obj, dict):
+                    h_level = heading_obj.get("level")
+                    try:
+                        level_num = int(h_level or 2)
+                    except (TypeError, ValueError):
+                        level_num = 2
+                    tag = f"h{min(max(level_num, 2), 4)}"
+                    heading_bits: List[str] = []
+                    for node in heading_obj.get("nodes") or []:
                         if not isinstance(node, dict):
                             continue
                         word = node.get("word")
                         if isinstance(word, dict) and word.get("words"):
-                            text_bits.append(str(word["words"]))
-                        link_card = node.get("link_card")
-                        if isinstance(link_card, dict) and link_card.get("jump_url"):
-                            text_bits.append(str(link_card["jump_url"]))
+                            heading_bits.append(str(word["words"]))
+                    heading_text = "".join(heading_bits).strip()
+                    if heading_text:
+                        lines.append(heading_text)
+                        html_parts.append(
+                            f'<{tag} style="margin: 14px 0 8px; font-weight: bold;{align_style}">{html.escape(heading_text)}</{tag}>'
+                        )
+                    continue
+
+                # 3. 引用段落 (blockquote)
+                quote_obj = para.get("blockquote")
+                if isinstance(quote_obj, dict):
+                    quote_bits: List[str] = []
+                    for node in quote_obj.get("nodes") or []:
+                        if not isinstance(node, dict):
+                            continue
+                        word = node.get("word")
+                        if isinstance(word, dict) and word.get("words"):
+                            quote_bits.append(str(word["words"]))
+                    quote_text = "".join(quote_bits).strip()
+                    if quote_text:
+                        lines.append(quote_text)
+                        html_parts.append(
+                            f'<blockquote style="border-left: 3px solid #be6423; padding-left: 10px; margin: 8px 0; color: #6b5b45;{align_style}">{html.escape(quote_text)}</blockquote>'
+                        )
+                    continue
+
+                # 4. 代码段落 (code)
+                code_obj = para.get("code")
+                if isinstance(code_obj, dict):
+                    code_bits: List[str] = []
+                    for node in code_obj.get("nodes") or []:
+                        if not isinstance(node, dict):
+                            continue
+                        word = node.get("word")
+                        if isinstance(word, dict) and word.get("words"):
+                            code_bits.append(str(word["words"]))
+                    code_text = "".join(code_bits).strip()
+                    if code_text:
+                        lines.append(code_text)
+                        html_parts.append(
+                            f'<pre style="background: rgba(0,0,0,0.05); padding: 8px; border-radius: 6px; overflow-x: auto;{align_style}"><code>{html.escape(code_text)}</code></pre>'
+                        )
+                    continue
+
+                # 5. 列表段落 (list)
                 para_list = para.get("list")
                 if isinstance(para_list, dict):
+                    list_items: List[str] = []
                     for list_item in para_list.get("items") or []:
                         if not isinstance(list_item, dict):
                             continue
+                        item_bits: List[str] = []
                         for node in list_item.get("nodes") or []:
                             if isinstance(node, dict):
                                 word = node.get("word")
                                 if isinstance(word, dict) and word.get("words"):
-                                    text_bits.append(str(word["words"]))
-                para_pic = para.get("pic")
-                if isinstance(para_pic, dict):
-                    for pic in para_pic.get("pics") or []:
-                        pic_url = _absolute_url((pic or {}).get("url"))
-                        if pic_url:
-                            images.append(pic_url)
-                joined = "".join(text_bits).strip()
-                lines.append(joined)
+                                    item_bits.append(str(word["words"]))
+                        it = "".join(item_bits).strip()
+                        if it:
+                            list_items.append(it)
+                            lines.append(f"• {it}")
+                    if list_items:
+                        items_html = "".join(
+                            f'<li style="line-height: 2;">{html.escape(it)}</li>' for it in list_items
+                        )
+                        html_parts.append(
+                            f'<ul style="margin: 8px 0; padding-left: 20px;{align_style}">{items_html}</ul>'
+                        )
+                    continue
+
+                # 6. 普通文本段落 (text)
+                text_obj = para.get("text")
+                plain_bits: List[str] = []
+                html_bits: List[str] = []
+                nodes = (text_obj.get("nodes") if isinstance(text_obj, dict) else None) or []
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    word = node.get("word")
+                    if isinstance(word, dict) and word.get("words") is not None:
+                        raw_w = str(word["words"])
+                        plain_bits.append(raw_w)
+                        esc_w = html.escape(raw_w).replace("\n", "<br>")
+                        style = word.get("style") if isinstance(word.get("style"), dict) else {}
+                        if style.get("bold"):
+                            esc_w = f"<strong>{esc_w}</strong>"
+                        if style.get("italic"):
+                            esc_w = f"<em>{esc_w}</em>"
+                        if style.get("underline"):
+                            esc_w = f"<u>{esc_w}</u>"
+                        if style.get("strikethrough"):
+                            esc_w = f"<s>{esc_w}</s>"
+                        html_bits.append(esc_w)
+                    link_card = node.get("link_card")
+                    if isinstance(link_card, dict) and link_card.get("jump_url"):
+                        u = str(link_card["jump_url"])
+                        plain_bits.append(u)
+                        esc_u = html.escape(u)
+                        html_bits.append(f'<a href="{esc_u}">{esc_u}</a>')
+
+                plain_joined = "".join(plain_bits).strip()
+                if plain_joined:
+                    lines.append(plain_joined)
+                html_joined = "".join(html_bits).strip()
+                if html_joined and html_joined != "<br>":
+                    html_parts.append(
+                        f'<p style="line-height: 2;{align_style}">{html_joined}</p>'
+                    )
 
         text = "\n".join(lines)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -581,4 +701,5 @@ class BilibiliDynamicSource:
             "title": title,
             "text": text,
             "images": list(dict.fromkeys(images)),
+            "content_html": "".join(html_parts).strip(),
         }

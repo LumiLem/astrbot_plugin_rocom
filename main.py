@@ -70,8 +70,8 @@ class RocomPlugin(Star):
         "device_scale_factor": 1.5,
         "viewport_width": 1100,
         "viewport_height": 1200,
-        "image_wait_timeout": 30000,
-        "image_per_image_timeout": 8000,
+        "image_wait_timeout": 45000,
+        "image_per_image_timeout": 30000,
     }
 
     # lumlime CDN：头像 / 精灵图标 / 名片皮肤 与 BinData 配置
@@ -2718,7 +2718,24 @@ class RocomPlugin(Star):
     def _build_announcement_detail_render_data(self, item: Dict[str, Any] | None) -> Dict[str, Any]:
         item = item or {}
         content = item.get("content") if isinstance(item.get("content"), dict) else {}
-        caption_html = content.get("text") or item.get("summary") or "该公告暂无正文。"
+        content_text = str(content.get("text") or "").strip()
+        caption_html = content_text or item.get("summary") or ""
+
+        # 兜底：若正文 HTML 为空，但 content.indexes 或 item 中包含图片，将图片作为正文展示
+        if not content_text:
+            body_images: List[str] = []
+            for index in (content.get("indexes") or []):
+                if isinstance(index, dict):
+                    for u in (index.get("imageUrl") or []):
+                        if u and u not in body_images:
+                            body_images.append(str(u))
+            if not body_images:
+                body_images = self._announcement_images(item)
+            if body_images:
+                caption_html = "".join(f'<p><img src="{u}" /></p>' for u in body_images)
+
+        if not caption_html:
+            caption_html = "该公告暂无正文。"
 
         videos = self._extract_videos(item)
         if videos:
@@ -3892,6 +3909,8 @@ class RocomPlugin(Star):
             if not str(enriched.get("title") or "").strip():
                 enriched["title"] = str(detail["title"]).strip()
             enriched["has_title"] = True
+        if detail.get("content_html"):
+            enriched["content_html"] = detail["content_html"]
 
         merged_images: List[str] = []
         merged_meta: List[Dict[str, Any]] = []
@@ -3997,10 +4016,13 @@ class RocomPlugin(Star):
         return result
 
     async def _build_bilibili_dynamic_render_data(self, dyn: Dict[str, Any]) -> Dict[str, Any]:
-        """把 B 站动态映射为 B 站专用模板数据：无封面、先文后图、无标题则不显示标题。"""
+        """把 B 站动态映射为 B 站专用模板数据：
+        - 专栏/文章（DYNAMIC_TYPE_ARTICLE）且含有 content_html 时：流式图文混排，正文插图内联，不在文末重复追加；
+        - 普通图文/文字/视频动态：按原有规则渲染（先正文后网格或视频占位）。
+        """
         body_text = self._clean_bilibili_text(dyn.get("text"))
-        caption_html = self._text_to_caption_html(body_text) if body_text else ""
-
+        dyn_type = str(dyn.get("type") or "")
+        content_html = str(dyn.get("content_html") or "").strip()
         images = [str(u) for u in (dyn.get("images") or []) if u]
         video = dyn.get("video") if isinstance(dyn.get("video"), dict) else None
 
@@ -4010,14 +4032,20 @@ class RocomPlugin(Star):
         if cover_src and not video:
             cover_url = cover_src
 
-        if video:
+        if dyn_type == "DYNAMIC_TYPE_ARTICLE" and content_html:
+            # 专栏/文章类型：图文混排渲染
+            # 正文中的插图已在 content_html 中以内联方式插入，无需在末尾重复追加
+            caption_html = content_html
+        elif video:
             # 视频动态：正文后放视频占位（用视频封面），不再把封面当图片重复展示
+            caption_html = self._text_to_caption_html(body_text) if body_text else ""
             video_src = str(video.get("cover") or "")
             caption_html += (
                 f'<div class="announcement-video-placeholder"><img src="{video_src}" '
                 f'class="video-cover" /><div class="video-play-btn">▶</div></div>'
             )
         else:
+            caption_html = self._text_to_caption_html(body_text) if body_text else ""
             meta_by_url = {
                 str(m.get("url")): m
                 for m in (dyn.get("images_meta") or [])
