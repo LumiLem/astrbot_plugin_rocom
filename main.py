@@ -3063,15 +3063,30 @@ class RocomPlugin(Star):
             for key, sub in all_subs.items()
         )
 
+        # 探活变更判定：
+        # 若内存指纹为 None（刚重启），检查是否存在未初始化订阅或落后的待补发订阅：
+        # - 若无任何待补发且无新订阅，说明停机期间外部无新动态，立即静默建立基线并快速跳过；
+        # - 若有待补发或新订阅，进入慢路径处理；
+        # 若已有内存指纹，直接按指纹是否变化判定。
+        if self._announcement_last_known_fingerprint is None:
+            if not has_uninitialized_official and not has_pending_official and official_fingerprint:
+                self._announcement_last_known_fingerprint = official_fingerprint
+            official_diff = (self._announcement_last_known_fingerprint != official_fingerprint)
+        else:
+            official_diff = (self._announcement_last_known_fingerprint != official_fingerprint)
+
+        if self._bilibili_last_known_fingerprint is None:
+            if not has_uninitialized_bili and not has_pending_bili and bili_fingerprint:
+                self._bilibili_last_known_fingerprint = bili_fingerprint
+            bili_diff = (self._bilibili_last_known_fingerprint != bili_fingerprint)
+        else:
+            bili_diff = (self._bilibili_last_known_fingerprint != bili_fingerprint)
+
         official_changed = bool(official_on and official_head_items) and (
-            has_uninitialized_official
-            or has_pending_official
-            or self._announcement_last_known_fingerprint != official_fingerprint
+            has_uninitialized_official or has_pending_official or official_diff
         )
         bili_changed = bool(bili_on and bili_items) and (
-            has_uninitialized_bili
-            or has_pending_bili
-            or self._bilibili_last_known_fingerprint != bili_fingerprint
+            has_uninitialized_bili or has_pending_bili or bili_diff
         )
 
         if not official_changed and not bili_changed:
@@ -3128,6 +3143,15 @@ class RocomPlugin(Star):
                     cid = str(cand.get("id") or "")
                     if not cid:
                         continue
+                    # 懒加载优化：若该官方公告所有订阅者全员已读且已在全局历史中，无需重复请求详情正文
+                    if not self._select_announcement_target_subs(cand, all_subs):
+                        if any(
+                            isinstance(h, dict)
+                            and (h.get("src") == "official" or h.get("source") == "official")
+                            and str(h.get("id")) == cid
+                            for h in history
+                        ):
+                            continue
                     detail = detail_cache.get(cid)
                     if detail is None:
                         detail = await self.client.get_announcement_detail(cid)
