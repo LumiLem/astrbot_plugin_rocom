@@ -75,6 +75,24 @@ class RocomPlugin(Star):
         "image_per_image_timeout": 30000,
     }
 
+    # 公告/动态原图附加推送：属于壁纸、表情包、图鉴、活动日历等便于保存的内容时，单张图片也进行附加推送；其他内容保持 >= 2 张才附加推送
+    _IMAGE_PREVIEW_KEYWORDS = (
+        "壁纸",
+        "表情包",
+        "表情",
+        "图鉴",
+        "日历",
+        "贺图",
+        "立绘",
+        "插画",
+        "海报",
+        "头像",
+        "贴纸",
+        "wallpaper",
+        "calendar",
+        "emoji",
+    )
+
     # lumlime CDN：头像 / 精灵图标 / 名片皮肤 与 BinData 配置
     LUMLIME_ICON_BASE = "https://rocom.lumlime.cn/Icon/HeadIcon"
     LUMLIME_CARD_BG_BASE = "https://rocom.lumlime.cn/Icon/BusinessCardBg"
@@ -3755,8 +3773,14 @@ class RocomPlugin(Star):
             }
             original_files: List[str] = []
             original_urls: List[str] = []
+            dyn_type = str(render_item.get("type") or "")
+            bili_candidate_images = [
+                str(u)
+                for u in (render_item.get("images") or [])
+                if u and (dyn_type != "DYNAMIC_TYPE_AV" or not video_info)
+            ]
             for group in self._bilibili_image_groups(
-                [str(u) for u in (render_item.get("images") or []) if u], meta_by_url
+                bili_candidate_images, meta_by_url
             ):
                 if group["type"] == "grid" and len(group["urls"]) >= 2:
                     stitched = await self._stitch_bilibili_grid(
@@ -3834,7 +3858,7 @@ class RocomPlugin(Star):
         rendered: Dict[str, Any],
         pushed_subs: List[tuple],
     ) -> None:
-        """卡片推送后附加推送视频与多图原图（官方公告与 B 站动态共用同一逻辑）。"""
+        """卡片推送后附加推送视频与原图（壁纸、表情包、图鉴、活动日历等内容支持单图附加推送，其余内容保持 >= 2 张原图时附加推送）。"""
         item_id = item.get("id")
         source = item.get("source") or "official"
         referer = "https://www.bilibili.com/" if source == "bilibili" else ""
@@ -3898,7 +3922,13 @@ class RocomPlugin(Star):
 
         original_files = rendered.get("original_files") or []
         original_urls = rendered.get("original_images") or []
-        if original_files or len(original_urls) >= 2:
+        is_preview = self._is_image_preview_content(item, rendered)
+        should_send_images = (
+            bool(original_files)
+            or len(original_urls) >= 2
+            or (len(original_urls) == 1 and is_preview)
+        )
+        if should_send_images:
             image_nodes = []
             # 宫格小图已拼接为单张原图，直接切片转发
             for local_file in original_files:
@@ -3923,8 +3953,37 @@ class RocomPlugin(Star):
                         await self.context.send_message(sub["umo"], fwd_chain)
                         logger.info(f"[Rocom] 公告原图转发推送成功 → {key} (source={source} id={item_id})")
                     except Exception as e:
-                        logger.warning(f"[Rocom] 公告原图转发推送失败 ({key}, source={source} id={item_id}): {e}")
+                        logger.warning(
+                            f"[Rocom] 公告原图转发推送失败 ({key}, source={source} id={item_id}): {e}，尝试降级直接发送图片"
+                        )
+                        try:
+                            fallback_chain = MessageChain()
+                            for node in image_nodes:
+                                for comp in getattr(node, "content", []):
+                                    fallback_chain.chain.append(comp)
+                            await self.context.send_message(sub["umo"], fallback_chain)
+                            logger.info(
+                                f"[Rocom] 公告原图降级直接推送成功 → {key} (source={source} id={item_id})"
+                            )
+                        except Exception as direct_e:
+                            logger.warning(
+                                f"[Rocom] 公告原图降级直接推送也失败 ({key}, source={source} id={item_id}): {direct_e}"
+                            )
                     await asyncio.sleep(2)
+
+    def _is_image_preview_content(self, item: Dict[str, Any], rendered: Dict[str, Any]) -> bool:
+        """判断公告或动态是否属于壁纸、表情包、图鉴、活动日历等需要方便图片预览保存的内容。"""
+        detail = rendered.get("detail") if isinstance(rendered.get("detail"), dict) else {}
+        title = str(item.get("title") or detail.get("title") or "").strip()
+        body = str(
+            item.get("text")
+            or detail.get("text")
+            or detail.get("summary")
+            or rendered.get("fallback_text")
+            or ""
+        ).strip()
+        full_text = f"{title}\n{body}".lower()
+        return any(kw in full_text for kw in self._IMAGE_PREVIEW_KEYWORDS)
 
     def _bilibili_type_label(self, dyn_type: Any) -> str:
         return {
