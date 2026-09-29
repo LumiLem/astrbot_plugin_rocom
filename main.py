@@ -244,13 +244,13 @@ class RocomPlugin(Star):
         )
         if self.bilibili_source.is_logged_in:
             logger.info("[Rocom] 已加载 B 站扫码登录凭据")
-        self._bili_credential_checked_at = 0.0
+        self._bili_credential_checked_at: float = time.time()
         self.bilibili_dynamic_max_push = self._BILIBILI_DYNAMIC_MAX_PUSH
         self.announcement_dedup_similarity = self._DEDUP_SIMILARITY
         self.announcement_dedup_window_seconds = self._DEDUP_WINDOW_SECONDS
         self._bilibili_last_known_fingerprint: tuple[str, int] | None = None
         self._bilibili_source_warned = False
-        self._last_bili_refresh_alert_at: float = 0.0
+        self._last_bili_refresh_alert_at: float = time.time()
         self._pending_broadcasts: Dict[str, Dict[str, Any]] = {}
         self._running_broadcast_cancels: Dict[str, asyncio.Event] = {}
         self._announcement_subscription_task = None
@@ -3426,24 +3426,32 @@ class RocomPlugin(Star):
             if now - last < 3600:
                 return
             self._bili_credential_checked_at = now
+
+            # 豁免保护期：若凭据保存时间在 7 天内，属于刚刚登录的新鲜凭据（有效时长长达半年），无需向服务端刷新
+            saved_cred = self._load_bili_credential()
+            if isinstance(saved_cred, dict):
+                saved_at = float(saved_cred.get("saved_at", 0.0) or 0.0)
+                if saved_at > 0 and now - saved_at < 7 * 86400:
+                    return
+
             refreshed = await self.bilibili_source.refresh_credential()
             if refreshed and self._save_bili_credential(refreshed):
                 logger.info("[Rocom] B 站登录态已自动刷新并保存")
-                self._last_bili_refresh_alert_at = 0.0
+                self._last_bili_refresh_alert_at = now
                 return
 
             refresh_err = str(getattr(self.bilibili_source, "last_refresh_error", "") or "").strip()
             if refresh_err:
-                # 刷新过程抛出异常（如 correspondPath 过期或错误），核实凭据当前在服务端的有效性
+                # 刷新过程抛出异常（如 correspondPath 接口受风控拦截），核实凭据当前在服务端的有效性
                 is_valid, uname, mid, is_net_err = await self.bilibili_source.verify_credential_detailed()
                 if not is_valid and not is_net_err:
-                    # B 站服务端明确返回未登录状态：原凭证已彻底失效
+                    # B 站服务端明确返回未登录状态：原凭证已彻底失效，必须告警并降级
                     logger.warning(
                         f"[Rocom] B 站登录态已彻底失效（原因：{refresh_err}），自动清除本地凭据并回退至匿名模式"
                     )
                     self._clear_bili_credential()
                     self.bilibili_source.clear_credential()
-                    self._last_bili_refresh_alert_at = 0.0
+                    self._last_bili_refresh_alert_at = now
 
                     alert_msg = (
                         "⚠️【洛克王国插件 · B 站登录态失效告警】\n"
@@ -3454,27 +3462,12 @@ class RocomPlugin(Star):
                     )
                     await self._notify_admin(alert_msg)
                 elif is_valid:
-                    # 凭据在服务端实际仍然有效（例如仅对应刷新路径被风控或本地时钟微小偏差）
-                    # 避免每小时重复告警骚扰，设置 12 小时静默冷却
-                    last_alert = float(getattr(self, "_last_bili_refresh_alert_at", 0.0) or 0.0)
-                    if now - last_alert >= 12 * 3600:
-                        self._last_bili_refresh_alert_at = now
-                        account_info = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
-                        logger.warning(
-                            f"[Rocom] B 站登录态自动续期受阻: {refresh_err}，当前账号 {account_info} 登录态仍有效"
-                        )
-                        alert_msg = (
-                            "⚠️【洛克王国插件 · B 站登录态续期受阻提示】\n"
-                            f"检测到 B 站登录态自动续期请求被拦截。\n"
-                            f"拦截原因：{refresh_err}\n"
-                            f"经检测，当前账号 {account_info} 登录态仍处于有效状态，日常服务不受影响。\n"
-                            "提示：该现象多由服务器系统时钟与北京时间存在微小偏差或 B 站临时安全风控引起。建议校准服务器时钟；若后续频繁出现，可私聊机器人发送【/rocom_bili_login】重新扫码更新。"
-                        )
-                        await self._notify_admin(alert_msg)
-                    else:
-                        logger.debug(
-                            f"[Rocom] B 站登录态续期受阻处于冷却期中: {refresh_err} (距离上次告警不足 12 小时)"
-                        )
+                    # 凭据在服务端实际仍然有效（仅续期接口受 B 站 WAF 风控限制，日常推送完全正常）
+                    # 此时绝不发送聊天告警打扰管理员（避免误导管理员去重复扫码），仅输出 debug 日志
+                    account_info = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
+                    logger.debug(
+                        f"[Rocom] B 站登录态自动续期受阻: {refresh_err}，当前账号 {account_info} 登录态仍处于有效状态，日常服务不受影响"
+                    )
                 else:
                     logger.debug(f"[Rocom] B 站登录态续期异常且核实验证网络受阻: {refresh_err}")
         except Exception as exc:  # noqa: BLE001
@@ -7778,7 +7771,8 @@ class RocomPlugin(Star):
                         yield event.plain_result("登录成功，但保存凭据失败，请检查插件数据目录权限。")
                         return
 
-                    self._last_bili_refresh_alert_at = 0.0
+                    self._bili_credential_checked_at = time.time()
+                    self._last_bili_refresh_alert_at = time.time()
                     account_desc = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
                     logger.info(f"[Rocom] B 站扫码登录成功并已生效: {account_desc}")
                     yield event.plain_result(
@@ -7814,6 +7808,7 @@ class RocomPlugin(Star):
                 logger.debug(f"[Rocom] B 站服务端注销异常: {exc}")
         self._clear_bili_credential()
         self._rebuild_bilibili_source(None)
+        self._bili_credential_checked_at = 0.0
         self._last_bili_refresh_alert_at = 0.0
 
         if not had_credential:
