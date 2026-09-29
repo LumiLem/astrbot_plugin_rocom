@@ -55,8 +55,8 @@
   },
   "auto_refresh_notify_group": {
     "type": "string",
-    "description": "刷新结果通知 UMO",
-    "hint": "自动刷新结果推送到此会话（填写完整的 UMO，如 default:GroupMessage:870543663）",
+    "description": "刷新结果与告警通知 UMO",
+    "hint": "凭证自动刷新结果与管理员系统异常告警推送到此会话（填写完整的 UMO，如 default:GroupMessage:870543663 或 default:FriendMessage:12345678）",
     "default": ""
   },
   "merchant_subscription_enabled": {

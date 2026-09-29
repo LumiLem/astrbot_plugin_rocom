@@ -250,6 +250,7 @@ class RocomPlugin(Star):
         self.announcement_dedup_window_seconds = self._DEDUP_WINDOW_SECONDS
         self._bilibili_last_known_fingerprint: tuple[str, int] | None = None
         self._bilibili_source_warned = False
+        self._last_bili_refresh_alert_at: float = 0.0
         self._pending_broadcasts: Dict[str, Dict[str, Any]] = {}
         self._running_broadcast_cancels: Dict[str, asyncio.Event] = {}
         self._announcement_subscription_task = None
@@ -657,6 +658,43 @@ class RocomPlugin(Star):
                 logger.info(f"[自动刷新] 通知已发送到 {session_id}")
         except Exception as e:
             logger.error(f"[自动刷新] 发送群消息失败：{e}")
+
+    async def _notify_admin(self, message: str) -> bool:
+        """向管理员发送告警/通知消息（支持配置的通知群以及全局/插件管理员私聊）。"""
+        sent_any = False
+        chain = MessageChain().message(message)
+
+        # 1. 如果配置了通知群/会话，优先推送到该会话
+        notify_group = str(getattr(self, "auto_refresh_notify_group", "") or "").strip()
+        if notify_group:
+            try:
+                await self.context.send_message(notify_group, chain)
+                sent_any = True
+                logger.info(f"[Rocom] 管理员告警通知已发送到指定会话: {notify_group}")
+            except Exception as exc:
+                logger.warning(f"[Rocom] 发送管理员告警到指定会话失败 ({notify_group}): {exc}")
+
+        # 2. 推送给 Bot 管理员私聊
+        admin_ids = self._get_bot_admin_ids()
+        if admin_ids and hasattr(self.context, "platform_manager"):
+            try:
+                platforms = getattr(self.context.platform_manager, "platform_insts", []) or []
+                for p in platforms:
+                    platform_id = getattr(p.meta(), "id", "") or ""
+                    if not platform_id or platform_id == "webchat":
+                        continue
+                    for admin_id in admin_ids:
+                        target_umo = f"{platform_id}:FriendMessage:{admin_id}"
+                        try:
+                            await self.context.send_message(target_umo, chain)
+                            sent_any = True
+                            logger.info(f"[Rocom] 管理员告警通知已私聊发送给管理员: {target_umo}")
+                        except Exception as exc:
+                            logger.debug(f"[Rocom] 私聊发送管理员告警失败 ({target_umo}): {exc}")
+            except Exception as e:
+                logger.debug(f"[Rocom] 获取平台实例发送管理员告警异常: {e}")
+
+        return sent_any
 
     async def _resolve_home_uid(self, event: AstrMessageEvent, uid: str = "") -> str:
         uid = str(uid or "").strip()
@@ -3391,6 +3429,54 @@ class RocomPlugin(Star):
             refreshed = await self.bilibili_source.refresh_credential()
             if refreshed and self._save_bili_credential(refreshed):
                 logger.info("[Rocom] B 站登录态已自动刷新并保存")
+                self._last_bili_refresh_alert_at = 0.0
+                return
+
+            refresh_err = str(getattr(self.bilibili_source, "last_refresh_error", "") or "").strip()
+            if refresh_err:
+                # 刷新过程抛出异常（如 correspondPath 过期或错误），核实凭据当前在服务端的有效性
+                is_valid, uname, mid, is_net_err = await self.bilibili_source.verify_credential_detailed()
+                if not is_valid and not is_net_err:
+                    # B 站服务端明确返回未登录状态：原凭证已彻底失效
+                    logger.warning(
+                        f"[Rocom] B 站登录态已彻底失效（原因：{refresh_err}），自动清除本地凭据并回退至匿名模式"
+                    )
+                    self._clear_bili_credential()
+                    self.bilibili_source.clear_credential()
+                    self._last_bili_refresh_alert_at = 0.0
+
+                    alert_msg = (
+                        "⚠️【洛克王国插件 · B 站登录态失效告警】\n"
+                        f"检测到 B 站账号登录态已彻底失效。\n"
+                        f"失败原因：{refresh_err}\n"
+                        "插件已自动清理本地失效凭据并转入匿名模式，常规公告与公开动态推送不受影响。\n"
+                        "如需恢复高画质视频附加推送等完整功能，请管理员私聊机器人发送【/rocom_bili_login】重新扫码登录。"
+                    )
+                    await self._notify_admin(alert_msg)
+                elif is_valid:
+                    # 凭据在服务端实际仍然有效（例如仅对应刷新路径被风控或本地时钟微小偏差）
+                    # 避免每小时重复告警骚扰，设置 12 小时静默冷却
+                    last_alert = float(getattr(self, "_last_bili_refresh_alert_at", 0.0) or 0.0)
+                    if now - last_alert >= 12 * 3600:
+                        self._last_bili_refresh_alert_at = now
+                        account_info = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
+                        logger.warning(
+                            f"[Rocom] B 站登录态自动续期受阻: {refresh_err}，当前账号 {account_info} 登录态仍有效"
+                        )
+                        alert_msg = (
+                            "⚠️【洛克王国插件 · B 站登录态续期受阻提示】\n"
+                            f"检测到 B 站登录态自动续期请求被拦截。\n"
+                            f"拦截原因：{refresh_err}\n"
+                            f"经检测，当前账号 {account_info} 登录态仍处于有效状态，日常服务不受影响。\n"
+                            "提示：该现象多由服务器系统时钟与北京时间存在微小偏差或 B 站临时安全风控引起。建议校准服务器时钟；若后续频繁出现，可私聊机器人发送【/rocom_bili_login】重新扫码更新。"
+                        )
+                        await self._notify_admin(alert_msg)
+                    else:
+                        logger.debug(
+                            f"[Rocom] B 站登录态续期受阻处于冷却期中: {refresh_err} (距离上次告警不足 12 小时)"
+                        )
+                else:
+                    logger.debug(f"[Rocom] B 站登录态续期异常且核实验证网络受阻: {refresh_err}")
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[Rocom] B 站登录态刷新检查异常: {exc}")
 
@@ -7692,6 +7778,7 @@ class RocomPlugin(Star):
                         yield event.plain_result("登录成功，但保存凭据失败，请检查插件数据目录权限。")
                         return
 
+                    self._last_bili_refresh_alert_at = 0.0
                     account_desc = f"【{uname}】(UID: {mid})" if uname else f"UID: {mid}"
                     logger.info(f"[Rocom] B 站扫码登录成功并已生效: {account_desc}")
                     yield event.plain_result(
@@ -7727,6 +7814,7 @@ class RocomPlugin(Star):
                 logger.debug(f"[Rocom] B 站服务端注销异常: {exc}")
         self._clear_bili_credential()
         self._rebuild_bilibili_source(None)
+        self._last_bili_refresh_alert_at = 0.0
 
         if not had_credential:
             yield event.plain_result("当前没有已保存的登录凭据，已恢复为默认模式。")

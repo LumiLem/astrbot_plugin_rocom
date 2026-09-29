@@ -7,6 +7,7 @@ B 站动态数据源
 
 import html
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
@@ -93,6 +94,8 @@ class BilibiliDynamicSource:
         self.proxy = str(proxy or "").strip()
         self.credential = None
         self.credential_dict: Dict[str, str] = {}
+        self.last_refresh_error: str = ""
+        self.last_refresh_error_ts: float = 0.0
         if BILIBILI_AVAILABLE:
             saved = credential_dict if isinstance(credential_dict, dict) else {}
             if str(saved.get("sessdata") or "").strip():
@@ -141,6 +144,8 @@ class BilibiliDynamicSource:
     def clear_credential(self) -> None:
         self.credential = None
         self.credential_dict = {}
+        self.last_refresh_error = ""
+        self.last_refresh_error_ts = 0.0
 
     async def refresh_credential(self) -> Optional[Dict[str, str]]:
         """按服务端指示刷新登录态，成功返回新凭据字典。"""
@@ -154,19 +159,29 @@ class BilibiliDynamicSource:
             if await self.credential.check_refresh():
                 await self.credential.refresh()
                 self.credential_dict = credential_to_dict(self.credential)
+                self.last_refresh_error = ""
                 return dict(self.credential_dict)
+            self.last_refresh_error = ""
         except Exception as exc:  # noqa: BLE001
             try:
                 self.set_credential_dict(old_dict)
             except Exception:
                 pass
-            logger.warning(f"[Rocom] B 站登录态刷新失败: {exc}")
+            self.last_refresh_error = str(exc)
+            self.last_refresh_error_ts = time.time()
+            logger.debug(f"[Rocom] B 站登录态刷新失败: {exc}")
         return None
 
-    async def verify_credential(self) -> tuple[bool, str, int]:
-        """校验当前凭据是否在服务端真正有效，成功返回 (True, uname, mid)，失败返回 (False, '', 0)。"""
+    async def verify_credential_detailed(self) -> tuple[bool, str, int, bool]:
+        """详细校验当前凭据是否在服务端真正有效。
+        返回：(is_valid, uname, mid, is_network_error)
+        - is_valid: 登录态是否有效
+        - uname: 用户名
+        - mid: 用户 UID
+        - is_network_error: 是否因网络请求异常导致的无法判定
+        """
         if not BILIBILI_AVAILABLE or self.credential is None:
-            return False, "", 0
+            return False, "", 0, False
         self._apply_proxy()
         try:
             from bilibili_api.utils.network import Api
@@ -181,10 +196,17 @@ class BilibiliDynamicSource:
             if isinstance(resp, dict) and resp.get("isLogin"):
                 uname = str(resp.get("uname") or "")
                 mid = int(resp.get("mid") or 0)
-                return True, uname, mid
+                return True, uname, mid, False
+            # 服务端明确返回未登录
+            return False, "", 0, False
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[Rocom] 校验 B 站登录态异常: {exc}")
-        return False, "", 0
+            logger.debug(f"[Rocom] 校验 B 站登录态网络异常: {exc}")
+            return False, "", 0, True
+
+    async def verify_credential(self) -> tuple[bool, str, int]:
+        """校验当前凭据是否在服务端真正有效，成功返回 (True, uname, mid)，失败返回 (False, '', 0)。"""
+        ok, uname, mid, _ = await self.verify_credential_detailed()
+        return ok, uname, mid
 
     async def logout(self) -> bool:
         """调用 B 站服务端登出接口注销凭据（参考 astrbot_plugin_bilibili）。"""
