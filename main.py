@@ -1858,6 +1858,10 @@ class RocomPlugin(Star):
                 cancel_event = asyncio.Event()
                 self._running_broadcast_cancels[str(task_id)] = cancel_event
 
+        if task.get("repush"):
+            await self._execute_repush_task(task_id, task, cancel_event)
+            return
+
         await self.broadcast_task_mgr.update_task(task_id, {"status": "running"})
         logger.info(f"[Rocom] 开始执行群发任务: {task_short_id}")
 
@@ -2067,6 +2071,143 @@ class RocomPlugin(Star):
                     except Exception:
                         pass
 
+            await self.broadcast_task_mgr.delete_task(task_id)
+
+    async def _execute_repush_task(
+        self,
+        task_id: str,
+        task: Dict[str, Any],
+        cancel_event: asyncio.Event | None = None,
+    ):
+        """执行全局补推任务：逐订阅发送最新内容，支持进度、取消与熔断回执。
+
+        复用群发的取消信号、进度落盘与回执表面；不修改任何订阅游标状态。
+        """
+        spec = task.get("repush") or {}
+        service = str(spec.get("service") or "announcement")
+        try:
+            n = int(spec.get("n", 1) or 1)
+        except (TypeError, ValueError):
+            n = 1
+        task_short_id = str(task_id)[:8]
+        if cancel_event is None:
+            cancel_event = self._running_broadcast_cancels.get(str(task_id))
+            if cancel_event is None:
+                cancel_event = asyncio.Event()
+                self._running_broadcast_cancels[str(task_id)] = cancel_event
+
+        service_label = "洛克公告" if service == "announcement" else "远行商人"
+        await self.broadcast_task_mgr.update_task(task_id, {"status": "running"})
+        logger.info(f"[Rocom] 补推任务 {task_short_id} 开始：service={service} n={n}")
+
+        issuer_umo = task.get("issuer_umo")
+        success = 0
+        failed = 0
+        total = 0
+        finish_reason = ""
+
+        async def _progress(s: int, f: int, t: int):
+            nonlocal success, failed, total
+            success, failed, total = s, f, t
+            await self.broadcast_task_mgr.update_task(
+                task_id, {"progress": {"total": t, "sent": s, "failed": f}}
+            )
+
+        try:
+            if service == "announcement":
+                all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+            else:
+                all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+
+            targets: List[tuple] = []
+            seen_umos = set()
+            for key, sub in all_subs.items():
+                umo = sub.get("umo")
+                if not umo or umo in seen_umos:
+                    continue
+                seen_umos.add(umo)
+                targets.append((key, sub))
+            total = len(targets)
+
+            if not targets:
+                finish_reason = "无订阅目标"
+            elif service == "announcement":
+                success, failed, finish_reason = await self._repush_announcement_to_subs(
+                    targets, n, advance_cursor=False,
+                    cancel_event=cancel_event, progress_cb=_progress,
+                )
+            else:
+                success, failed, finish_reason = await self._repush_merchant_to_subs(
+                    targets, advance_cursor=False,
+                    cancel_event=cancel_event, progress_cb=_progress,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[Rocom] 补推任务 {task_short_id} 执行异常: {exc}")
+            finish_reason = f"执行异常：{exc}"
+        finally:
+            self._running_broadcast_cancels.pop(str(task_id), None)
+            await self.broadcast_task_mgr.update_task(
+                task_id,
+                {"progress": {"total": total, "sent": success, "failed": failed}},
+            )
+            if finish_reason == "已取消":
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "cancelled"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"⏹️ 补推任务 [{task_short_id}] 已被管理员终止！\n"
+                                f"• 服务：{service_label}\n"
+                                f"• 执行进度：已成功发送 {success}/{total} 个目标。"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            elif finish_reason == "连续失败熔断":
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "circuit_breaker"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"⚠️【补推风控熔断】补推任务 [{task_short_id}] 连续 5 次发送失败，已自动终止！\n"
+                                f"• 服务：{service_label}\n"
+                                f"• 当前进度：成功 {success}/{total}，失败 {failed}。\n"
+                                f"建议检查 Bot 发送频率或平台临时频控。"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            elif finish_reason:
+                # 数据拉取异常、未开市、无订阅目标等
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "completed"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"ℹ️ 补推任务 [{task_short_id}] 结束：{finish_reason}。\n"
+                                f"• 服务：{service_label} | 成功 {success}/{total}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            else:
+                await self.broadcast_task_mgr.update_task(task_id, {"status": "completed"})
+                if issuer_umo:
+                    try:
+                        await self.context.send_message(
+                            issuer_umo,
+                            MessageChain().message(
+                                f"✅ 补推任务 [{task_short_id}] 已执行完成！\n"
+                                f"• 服务：{service_label}\n"
+                                f"• 发送结果：成功送达 {success}/{total} 个目标"
+                                + (f"，失败 {failed} 个。" if failed else "。")
+                            ),
+                        )
+                    except Exception:
+                        pass
             await self.broadcast_task_mgr.delete_task(task_id)
 
     async def _broadcast_poll_loop(self):
@@ -4050,6 +4191,130 @@ class RocomPlugin(Star):
                             )
                     await asyncio.sleep(2)
 
+    async def _collect_announcement_repush_items(
+        self, mode: str, n: int
+    ) -> List[Dict[str, Any]]:
+        """按数据源模式拉取用于手动补推的最新 N 条公告/动态（时间升序）。"""
+        try:
+            n = max(1, min(int(n or 1), 10))
+        except (TypeError, ValueError):
+            n = 1
+        mode = mode if mode in ("smart", "official", "bilibili") else "official"
+        items: List[Dict[str, Any]] = []
+
+        if mode in ("official", "smart"):
+            res = await self.client.get_announcement_list(
+                category_id=99, page=1, limit=max(n, 5), order="ttDesc"
+            )
+            raw = (
+                (res.get("list") or res.get("items") or [])
+                if isinstance(res, dict)
+                else []
+            )
+            if not raw:
+                latest = await self.client.get_announcement_latest()
+                raw = [latest] if latest else []
+            uniq: Dict[str, Dict[str, Any]] = {}
+            for it in raw:
+                tid = self._announcement_id(it)
+                if tid and tid not in uniq:
+                    uniq[tid] = it
+            official_sorted = sorted(
+                uniq.values(),
+                key=lambda x: (self._announcement_ts(x), int(self._announcement_id(x) or 0)),
+            )
+            items.extend(
+                self._normalize_official_item(it) for it in official_sorted[-n:]
+            )
+
+        if mode in ("bilibili", "smart") and self.bilibili_source.is_available:
+            dyn = await self.bilibili_source.get_latest_dynamics(self.bilibili_uid)
+            bili = [
+                p
+                for p in BilibiliDynamicSource.parse_items(dyn, self.bilibili_uid)
+                if not p.get("pinned")
+            ]
+            bili.sort(key=lambda x: (int(x.get("ts") or 0), int(x.get("id") or 0)))
+            items.extend(bili[-n:])
+
+        items.sort(
+            key=lambda x: (int(x.get("ts") or 0), 0 if x.get("source") == "official" else 1)
+        )
+        if mode == "smart":
+            if items:
+                history = await self.announcement_history_mgr.get_recent_history()
+                self._deduplicate_candidates_globally(items, history)
+            items = items[-n:]
+        return items
+
+    async def _repush_announcement_to_subs(
+        self,
+        targets: List[tuple],
+        n: int,
+        advance_cursor: bool,
+        cancel_event: asyncio.Event | None = None,
+        progress_cb: Callable | None = None,
+    ) -> tuple[int, int, str]:
+        """向给定订阅集合补推最新 N 条公告/动态。
+
+        返回 (成功数, 失败数, 结束原因)；结束原因为空表示正常完成。
+        """
+        total = len(targets)
+        success = 0
+        failed = 0
+        consecutive_failures = 0
+        finish_reason = ""
+        rendered_cache: Dict[str, Dict[str, Any]] = {}
+        items_cache: Dict[str, List[Dict[str, Any]]] = {}
+        modified_subs: Dict[str, Dict[str, Any]] = {}
+        new_history_entries: List[Dict[str, Any]] = []
+
+        for key, sub in targets:
+            if cancel_event is not None and cancel_event.is_set():
+                finish_reason = "已取消"
+                break
+            mode = self._subscription_source_mode(sub)
+            if mode not in items_cache:
+                items_cache[mode] = await self._collect_announcement_repush_items(mode, n)
+            items = items_cache.get(mode) or []
+            if not items:
+                if progress_cb:
+                    await progress_cb(success, failed, total)
+                continue
+            for item in items:
+                if cancel_event is not None and cancel_event.is_set():
+                    finish_reason = "已取消"
+                    break
+                rendered = await self._render_announcement_item(item, rendered_cache)
+                push_ok = await self._send_announcement_item(key, sub, item, rendered)
+                if push_ok:
+                    success += 1
+                    consecutive_failures = 0
+                    if advance_cursor:
+                        self._advance_announcement_cursor(sub, item)
+                        self._mark_sub_seen(sub, item)
+                        modified_subs[key] = sub
+                        new_history_entries.append(self._build_history_entry(item, rendered))
+                        await self._schedule_announcement_extras(item, rendered, [(key, sub)])
+                else:
+                    failed += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 5:
+                        logger.error("[Rocom] 补推：公告连续失败 5 次，触发熔断")
+                        finish_reason = "连续失败熔断"
+                        break
+                if progress_cb:
+                    await progress_cb(success, failed, total)
+                await asyncio.sleep(2)
+            if finish_reason:
+                break
+
+        if modified_subs:
+            await self.announcement_sub_mgr.upsert_subscriptions_batch(modified_subs)
+        if new_history_entries:
+            await self.announcement_history_mgr.record_entries(new_history_entries)
+        return success, failed, finish_reason
+
     def _is_image_preview_content(self, item: Dict[str, Any], rendered: Dict[str, Any]) -> bool:
         """判断公告或动态是否属于壁纸、表情包、图鉴、活动日历等需要方便图片预览保存的内容。"""
         detail = rendered.get("detail") if isinstance(rendered.get("detail"), dict) else {}
@@ -4698,6 +4963,234 @@ class RocomPlugin(Star):
             return True
         return False
 
+    def _parse_repush_args(
+        self, event: AstrMessageEvent, command_names: tuple
+    ) -> tuple[int, str, bool]:
+        """解析补推命令参数，返回 (数量 N, 目标 UMO, 是否全局 --all)。"""
+        text = str(getattr(event, "message_str", "") or "").strip()
+        for name in command_names:
+            match = re.match(rf"^[/.#]*{re.escape(name)}\s*", text)
+            if match:
+                text = text[match.end():]
+                break
+        target_umo = ""
+        all_flag = False
+        n = 1
+        for token in text.split():
+            low = token.lower()
+            if low in ("--all", "-a", "all", "全部", "全局"):
+                all_flag = True
+            elif re.fullmatch(r"\d+", token):
+                n = int(token)
+            elif ":" in token:
+                target_umo = token
+        return n, target_umo, all_flag
+
+    async def _check_repush_permission(
+        self, event: AstrMessageEvent, target_umo: str, all_flag: bool
+    ) -> tuple[bool, str]:
+        """补推权限：本地沿用订阅权限，指定目标或全局仅限 Bot 管理员。
+
+        全局补推复用 /确认洛克群发（要求机器人管理员），故此处同样要求 event.is_admin()。
+        """
+        if all_flag:
+            if not event.is_admin():
+                return False, "全局补推仅限机器人管理员使用。"
+            return True, ""
+        if target_umo:
+            if not self._is_bot_admin(event):
+                return False, "指定目标会话补推仅限 Bot 管理员使用。"
+            return True, ""
+        if not event.is_private_chat() and not await self._has_subscription_admin_permission(event):
+            return False, "仅群管理员或 Bot 管理员可以使用补推功能。"
+        return True, ""
+
+    async def _resolve_announcement_repush_target(
+        self, umo: str
+    ) -> tuple[str, Dict[str, Any], bool]:
+        """解析公告补推目标，返回 (订阅 key, 订阅 dict, 是否为已持久化订阅)。"""
+        all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+        for key, sub in all_subs.items():
+            if str(sub.get("umo")) == str(umo):
+                return key, sub, True
+        temp = {
+            "key": str(umo),
+            "umo": str(umo),
+            "source_mode": self.announcement_default_source_mode,
+        }
+        return str(umo), temp, False
+
+    async def _resolve_merchant_repush_target(
+        self, umo: str, key: str
+    ) -> tuple[str, Dict[str, Any], bool]:
+        """解析远行商人补推目标，返回 (订阅 key, 订阅 dict, 是否为已持久化订阅)。"""
+        sub = await self.merchant_sub_mgr.get_subscription(key)
+        if sub:
+            return key, sub, True
+        all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+        for existing_key, existing_sub in all_subs.items():
+            if str(existing_sub.get("umo")) == str(umo):
+                return existing_key, existing_sub, True
+        temp = {
+            "key": key,
+            "umo": umo,
+            "all_products": self.merchant_subscription_all_products,
+            "items": list(self.merchant_subscription_items),
+            "mention_items": list(self.merchant_subscription_mention_items),
+        }
+        return key, temp, False
+
+    async def _collect_repush_all_targets(
+        self, service: str
+    ) -> List[tuple]:
+        """收集全局补推目标（按 UMO 去重）。"""
+        if service == "announcement":
+            all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+        else:
+            all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
+        targets: List[tuple] = []
+        seen_umos = set()
+        for key, sub in all_subs.items():
+            umo = sub.get("umo")
+            if not umo or umo in seen_umos:
+                continue
+            seen_umos.add(umo)
+            targets.append((key, sub))
+        return targets
+
+    async def _send_repush_all_preview(
+        self, event: AstrMessageEvent, service: str, label: str, targets: List[tuple], n: int
+    ) -> None:
+        """向发起会话发送全局补推沙盒预览（实际渲染内容样例）。"""
+        content_desc = (
+            f"最新 {n} 条公告/动态" if service == "announcement" else "当前轮次商品"
+        )
+        await self.context.send_message(
+            event.unified_msg_origin,
+            MessageChain().message(
+                f"🔍【{label} · 全局补推沙盒预览】\n"
+                f"补推内容：{content_desc}\n"
+                f"以下为样例内容："
+            ),
+        )
+        if service == "merchant":
+            res = await self.client.get_merchant_info(refresh=False)
+            activity, products, history_groups = self._merchant_products_from_response(res)
+            round_info = self._current_merchant_round()
+            if not round_info["is_open"] or not products:
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    MessageChain().message("（当前未开市或暂无商品，实际补推时将跳过）"),
+                )
+                return
+            product_names = {p.get("name", "") for p in products}
+            sample_sub = targets[0][1]
+            if sample_sub.get("all_products"):
+                matched = sorted(product_names)
+            else:
+                matched = [
+                    name
+                    for name in (sample_sub.get("items") or self.merchant_subscription_items)
+                    if name in product_names
+                ]
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain().message(
+                    self._build_merchant_push_text(sample_sub, products, product_names, matched, round_info)
+                ),
+            )
+            try:
+                img = await self._render_merchant_image_from_data(
+                    activity, products, round_info, history_groups
+                )
+                if img:
+                    await self.context.send_message(
+                        event.unified_msg_origin, MessageChain().file_image(img)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Rocom] 补推：全局预览商人图渲染失败: {exc}")
+            return
+
+        modes: List[str] = []
+        for _key, sub in targets:
+            mode = self._subscription_source_mode(sub)
+            if mode not in modes:
+                modes.append(mode)
+        for mode in modes:
+            items = await self._collect_announcement_repush_items(mode, 1)
+            if not items:
+                continue
+            item = items[-1]
+            rendered = await self._render_announcement_item(item, {})
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain().message(
+                    f"【样例 · 数据源 {mode}】{item.get('title') or item.get('id') or ''}"
+                ),
+            )
+            img_urls = rendered.get("img_urls") or []
+            if img_urls:
+                chain = MessageChain()
+                for url in img_urls:
+                    chain.file_image(url)
+                await self.context.send_message(event.unified_msg_origin, chain)
+
+    async def _start_repush_all(self, event: AstrMessageEvent, service: str, n: int):
+        """生成全局补推沙盒预览，并暂存待确认草稿（复用 /确认洛克群发）。"""
+        import uuid
+
+        label = "洛克公告" if service == "announcement" else "远行商人"
+        targets = await self._collect_repush_all_targets(service)
+        if not targets:
+            yield event.plain_result(f"当前没有任何{label}订阅，无需补推。")
+            return
+
+        try:
+            await self._send_repush_all_preview(event, service, label, targets, n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Rocom] 补推：全局预览生成失败: {exc}")
+
+        token = uuid.uuid4().hex[:4].upper()
+        task_id = str(uuid.uuid4())
+        summary = f"补推：{label}（{len(targets)} 个会话）"
+        task_data = {
+            "task_id": task_id,
+            "target_ts": 0,
+            "components": [],
+            "repush": {"service": service, "n": n},
+            "issuer_umo": str(event.unified_msg_origin),
+            "created_at": int(time.time()),
+            "specific_targets": [],
+            "target_sub": False,
+            "target_active": False,
+            "active_days": 0,
+            "mention_all": False,
+            "summary": summary,
+            "status": "ready",
+            "progress": {"total": len(targets), "sent": 0, "failed": 0},
+        }
+        self._pending_broadcasts[str(event.get_sender_id())] = {
+            "token": token,
+            "expires_at": time.time() + 60,
+            "task_id": task_id,
+            "task_data": task_data,
+            "target_count": len(targets),
+            "time_hint": "即时补推",
+            "mention_all": False,
+        }
+        content_desc = (
+            f"最新 {n} 条公告/动态" if service == "announcement" else "当前轮次商品"
+        )
+        yield event.plain_result(
+            f"📋【{label} · 全局补推预览已生成】\n"
+            f"补推内容：{content_desc}\n"
+            f"目标会话：{len(targets)} 个（已按 UMO 去重）\n"
+            f"⚠️ 全局补推不会修改订阅游标/去重状态，请确认后执行：\n"
+            f"▶️ 确认补推：回复「/确认洛克群发」或「/确认洛克群发 {token}」\n"
+            f"⏹️ 取消：回复「/取消洛克群发」或等待 60 秒自动失效\n"
+            f"💡 执行中可用「/洛克群发任务列表」查看进度，「/取消洛克群发 <任务ID>」紧急终止。"
+        )
+
 
     def _merchant_payload(self, res: Dict[str, Any] | None) -> Dict[str, Any]:
         payload = res or {}
@@ -4997,90 +5490,14 @@ class RocomPlugin(Star):
         window_start = datetime.now(self._cn_tz())
         pushed = 0
         for key, sub, matched in pending_pushes:
-            text_chain = MessageChain()
-            # 珍稀商品命中计算（用于二次提醒）
-            rare_items_list = sub.get("mention_items") or self.merchant_subscription_mention_items or []
-            check_set = product_names if sub.get("all_products") else set(matched)
-            hit_rare_items = sorted(check_set & set(rare_items_list))
-            if sub.get("all_products"):
-                category_labels = {"normal": "热销商品", "round": "常规商品", "weekend": "周末限定"}
-                cat_order = ["normal", "round", "weekend"]
-                cat_map = {}
-                for p in products:
-                    pc = p.get("product_category", "round")
-                    cat_map.setdefault(pc, []).append(p)
-                active_cats = [k for k in cat_order if k in cat_map and cat_map[k]]
-                lines = [
-                    f"远行商人本轮商品已更新",
-                    f"轮次：第{round_info['current']}轮",
-                    f"剩余：{round_info['countdown']}",
-                ]
-                if len(active_cats) > 1:
-                    for cat in active_cats:
-                        prods = cat_map.get(cat, [])
-                        names = "、".join(p["name"] for p in prods if p.get("name"))
-                        if names:
-                            lines.append(f"{category_labels[cat]}：{names}")
-                else:
-                    lines.append(f"商品：{'、'.join(product_names)}")
-                msg_text = "\n".join(lines).strip()
-            else:
-                msg_text = f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
-            
-            text_chain.message(msg_text)
-            push_ok = False
-            try:
-                await self.context.send_message(sub["umo"], text_chain)
-                push_ok = True
-            except Exception as e:
-                logger.warning(f"[Rocom] 远行商人文本推送失败: {e}")
-                fallback = MessageChain().message(msg_text)
-                try:
-                    await self.context.send_message(sub["umo"], fallback)
-                    push_ok = True
-                except Exception as fallback_e:
-                    logger.warning(f"[Rocom] 远行商人降级文本推送失败: {fallback_e}")
-                    continue
-            if img_url:
-                try:
-                    image_chain = MessageChain().file_image(img_url)
-                    await self.context.send_message(sub["umo"], image_chain)
-                except Exception as image_e:
-                    logger.warning(f"[Rocom] 远行商人图片推送失败: {image_e}")
-            # 珍稀商品二次提醒
-            if hit_rare_items:
-                reminder_text = self._format_merchant_reminder(hit_rare_items)
-                reminder_chain = MessageChain()
-                has_at_all = sub.get("mention_all") and not key.startswith("private_")
-                if has_at_all:
-                    reminder_chain.at_all()
-                elif key.startswith("private_"):
-                    target_id = key.split("_", 1)[1] if "_" in key else 0
-                    umo_str = str(sub.get("umo", ""))
-                    platform_id = umo_str.split(":")[0] if ":" in umo_str else ""
-                    platform_inst = self.context.get_platform_inst(platform_id)
-                    if platform_inst and platform_inst.meta().name == "aiocqhttp":
-                        try:
-                            await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
-                        except Exception as e:
-                            logger.warning(f"[Rocom] 独立戳一戳发送失败: {e}")
-                    else:
-                        reminder_chain.chain.append(Poke(qq=target_id))
-                reminder_chain.message(reminder_text)
-                try:
-                    await self.context.send_message(sub["umo"], reminder_chain)
-                except Exception as reminder_e:
-                    logger.warning(f"[Rocom] 远行商人珍稀商品提醒(含特效)发送失败: {reminder_e}")
-                    # 降级：去掉 @全体 或 戳一戳，仅发送纯文本重试
-                    fallback_reminder = MessageChain().message(reminder_text)
-                    try:
-                        await self.context.send_message(sub["umo"], fallback_reminder)
-                    except Exception as fallback_e:
-                        logger.warning(f"[Rocom] 远行商人珍稀商品提醒降级发送失败: {fallback_e}")
-            if push_ok:
-                pushed += 1
-                logger.info(f"[Rocom] 远行商人推送 → {key} {'全部' if sub.get('all_products') else '、'.join(matched)}")
-                logger.debug(f"[Rocom] 远行商人检查：已更新订阅 {key} last_push_round={round_info['round_id']}")
+            hit_rare_items = self._merchant_hit_rare_items(sub, product_names, matched)
+            msg_text = self._build_merchant_push_text(sub, products, product_names, matched, round_info)
+            push_ok = await self._send_merchant_push(key, sub, msg_text, img_url, hit_rare_items)
+            if not push_ok:
+                continue
+            pushed += 1
+            logger.info(f"[Rocom] 远行商人推送 → {key} {'全部' if sub.get('all_products') else '、'.join(matched)}")
+            logger.debug(f"[Rocom] 远行商人检查：已更新订阅 {key} last_push_round={round_info['round_id']}")
             sub["last_push_round"] = round_info["round_id"]
             sub["last_matched_items"] = matched
             await self.merchant_sub_mgr.upsert_subscription(key, sub)
@@ -5088,6 +5505,185 @@ class RocomPlugin(Star):
         elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
         logger.info(f"[Rocom] 远行商人 本轮推送 {pushed}/{len(pending_pushes)} 个订阅，耗时 {elapsed:.0f}s")
         return "done"
+
+    def _merchant_hit_rare_items(
+        self, sub: Dict[str, Any], product_names: set, matched: List[str]
+    ) -> List[str]:
+        """计算该订阅本轮命中的珍稀商品（用于二次提醒）。"""
+        rare_items_list = sub.get("mention_items") or self.merchant_subscription_mention_items or []
+        check_set = product_names if sub.get("all_products") else set(matched)
+        return sorted(check_set & set(rare_items_list))
+
+    def _build_merchant_push_text(
+        self,
+        sub: Dict[str, Any],
+        products: List[Dict[str, Any]],
+        product_names: set,
+        matched: List[str],
+        round_info: Dict[str, Any],
+    ) -> str:
+        """构造远行商人推送文本，供调度器与手动补推共用。"""
+        if sub.get("all_products"):
+            category_labels = {"normal": "热销商品", "round": "常规商品", "weekend": "周末限定"}
+            cat_order = ["normal", "round", "weekend"]
+            cat_map: Dict[str, List[Dict[str, Any]]] = {}
+            for p in products:
+                pc = p.get("product_category", "round")
+                cat_map.setdefault(pc, []).append(p)
+            active_cats = [k for k in cat_order if k in cat_map and cat_map[k]]
+            lines = [
+                "远行商人本轮商品已更新",
+                f"轮次：第{round_info['current']}轮",
+                f"剩余：{round_info['countdown']}",
+            ]
+            if len(active_cats) > 1:
+                for cat in active_cats:
+                    prods = cat_map.get(cat, [])
+                    names = "、".join(p["name"] for p in prods if p.get("name"))
+                    if names:
+                        lines.append(f"{category_labels[cat]}：{names}")
+            else:
+                lines.append(f"商品：{'、'.join(product_names)}")
+            return "\n".join(lines).strip()
+        return (
+            f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n"
+            f"轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
+        )
+
+    async def _send_merchant_rare_reminder(
+        self, key: str, sub: Dict[str, Any], hit_rare_items: List[str]
+    ) -> None:
+        """发送珍稀商品二次提醒（群聊可 @全体，私聊走戳一戳，失败降级纯文本）。"""
+        reminder_text = self._format_merchant_reminder(hit_rare_items)
+        reminder_chain = MessageChain()
+        has_at_all = sub.get("mention_all") and not key.startswith("private_")
+        if has_at_all:
+            reminder_chain.at_all()
+        elif key.startswith("private_"):
+            target_id = key.split("_", 1)[1] if "_" in key else 0
+            umo_str = str(sub.get("umo", ""))
+            platform_id = umo_str.split(":")[0] if ":" in umo_str else ""
+            platform_inst = self.context.get_platform_inst(platform_id)
+            if platform_inst and platform_inst.meta().name == "aiocqhttp":
+                try:
+                    await platform_inst.get_client().api.call_action("friend_poke", user_id=int(target_id))
+                except Exception as e:
+                    logger.warning(f"[Rocom] 独立戳一戳发送失败: {e}")
+            else:
+                reminder_chain.chain.append(Poke(qq=target_id))
+        reminder_chain.message(reminder_text)
+        try:
+            await self.context.send_message(sub["umo"], reminder_chain)
+        except Exception as reminder_e:
+            logger.warning(f"[Rocom] 远行商人珍稀商品提醒(含特效)发送失败: {reminder_e}")
+            fallback_reminder = MessageChain().message(reminder_text)
+            try:
+                await self.context.send_message(sub["umo"], fallback_reminder)
+            except Exception as fallback_e:
+                logger.warning(f"[Rocom] 远行商人珍稀商品提醒降级发送失败: {fallback_e}")
+
+    async def _send_merchant_push(
+        self,
+        key: str,
+        sub: Dict[str, Any],
+        text: str,
+        img_url: str | None,
+        hit_rare_items: List[str],
+    ) -> bool:
+        """发送远行商人推送（文本→图片→珍稀提醒），返回文本是否发送成功。"""
+        umo = sub.get("umo")
+        if not umo:
+            return False
+        text_chain = MessageChain().message(text)
+        try:
+            await self.context.send_message(umo, text_chain)
+        except Exception as e:
+            logger.warning(f"[Rocom] 远行商人文本推送失败: {e}")
+            fallback = MessageChain().message(text)
+            try:
+                await self.context.send_message(umo, fallback)
+            except Exception as fallback_e:
+                logger.warning(f"[Rocom] 远行商人降级文本推送失败: {fallback_e}")
+                return False
+        if img_url:
+            try:
+                await self.context.send_message(umo, MessageChain().file_image(img_url))
+            except Exception as image_e:
+                logger.warning(f"[Rocom] 远行商人图片推送失败: {image_e}")
+        if hit_rare_items:
+            await self._send_merchant_rare_reminder(key, sub, hit_rare_items)
+        return True
+
+    async def _repush_merchant_to_subs(
+        self,
+        targets: List[tuple],
+        advance_cursor: bool,
+        cancel_event: asyncio.Event | None = None,
+        progress_cb: Callable | None = None,
+    ) -> tuple[int, int, str]:
+        """向给定订阅集合补推当前轮次远行商人内容。
+
+        返回 (成功数, 失败数, 结束原因)；结束原因为空表示正常完成。
+        """
+        try:
+            res = await self.client.get_merchant_info(refresh=True)
+            activity, products, history_groups = self._merchant_products_from_response(res)
+        except Exception as e:
+            logger.warning(f"[Rocom] 补推：远行商人数据拉取失败: {e}")
+            return 0, 0, "数据拉取异常"
+        round_info = self._current_merchant_round()
+        if not round_info["is_open"]:
+            return 0, 0, "当前未开市，无法补推"
+        if not products:
+            return 0, 0, "当前暂无商品，无法补推"
+        product_names = {p.get("name", "") for p in products}
+        img_url = None
+        try:
+            img_url = await self._render_merchant_image_from_data(activity, products, round_info, history_groups)
+        except Exception as e:
+            logger.warning(f"[Rocom] 补推：远行商人图片渲染失败，将仅发送文本: {e}")
+        total = len(targets)
+        success = 0
+        failed = 0
+        consecutive_failures = 0
+        finish_reason = ""
+        for key, sub in targets:
+            if cancel_event is not None and cancel_event.is_set():
+                finish_reason = "已取消"
+                break
+            if sub.get("all_products"):
+                matched = sorted(product_names)
+            else:
+                items = sub.get("items") or self.merchant_subscription_items
+                matched = [name for name in items if name in product_names]
+                if not matched:
+                    if progress_cb:
+                        await progress_cb(success, failed, total)
+                    continue
+            text = self._build_merchant_push_text(sub, products, product_names, matched, round_info)
+            hit_rare_items = self._merchant_hit_rare_items(sub, product_names, matched)
+            push_ok = await self._send_merchant_push(key, sub, text, img_url, hit_rare_items)
+            if push_ok:
+                success += 1
+                consecutive_failures = 0
+                if advance_cursor:
+                    sub["last_push_round"] = round_info["round_id"]
+                    sub["last_matched_items"] = matched
+                    await self.merchant_sub_mgr.upsert_subscription(key, sub)
+                logger.info(f"[Rocom] 补推：远行商人 → {key}")
+            else:
+                failed += 1
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    logger.error("[Rocom] 补推：远行商人连续失败 5 次，触发熔断")
+                    finish_reason = "连续失败熔断"
+                    if progress_cb:
+                        await progress_cb(success, failed, total)
+                    break
+            if progress_cb:
+                await progress_cb(success, failed, total)
+            await asyncio.sleep(3)
+        return success, failed, finish_reason
 
     async def _run_merchant_ending_reminder(self):
         """结束提醒推送：在每轮结束前向开启了结束提醒的订阅发送提醒"""
@@ -9173,6 +9769,82 @@ class RocomPlugin(Star):
         lines.append("• 关闭订阅：/取消订阅远行商人")
 
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("补推洛克公告")
+    async def repush_announcement(self, event: AstrMessageEvent):
+        """手动补推洛克公告/动态到当前会话或指定目标（--all 全局补推）"""
+        await self._record_active_user(event)
+        n, target_umo, all_flag = self._parse_repush_args(event, ("补推洛克公告",))
+        ok, msg = await self._check_repush_permission(event, target_umo, all_flag)
+        if not ok:
+            yield event.plain_result(msg)
+            return
+        if all_flag:
+            async for result in self._start_repush_all(event, "announcement", n):
+                yield result
+            return
+
+        umo = target_umo or str(event.unified_msg_origin)
+        key, sub, persisted = await self._resolve_announcement_repush_target(umo)
+        try:
+            success, failed, reason = await self._repush_announcement_to_subs(
+                [(key, sub)], n, advance_cursor=persisted
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[Rocom] 补推：公告补推异常: {exc}")
+            yield event.plain_result(f"补推失败：{exc}")
+            return
+        if reason:
+            yield event.plain_result(f"补推失败：{reason}")
+            return
+        if success <= 0:
+            yield event.plain_result("未获取到可补推的最新公告内容，或发送失败。")
+            return
+        tip = "" if persisted else "\n（当前会话未订阅公告，已按默认数据源临时补推，未建立订阅）"
+        yield event.plain_result(
+            f"✅ 已补推最新 {n} 条公告/动态，成功 {success} 条，失败 {failed} 条。{tip}"
+        )
+
+    @filter.command("补推远行商人", alias={"补推商人"})
+    async def repush_merchant(self, event: AstrMessageEvent):
+        """手动补推当前轮次远行商人内容到当前会话或指定目标（--all 全局补推）"""
+        await self._record_active_user(event)
+        _n, target_umo, all_flag = self._parse_repush_args(event, ("补推远行商人", "补推商人"))
+        ok, msg = await self._check_repush_permission(event, target_umo, all_flag)
+        if not ok:
+            yield event.plain_result(msg)
+            return
+        if all_flag:
+            async for result in self._start_repush_all(event, "merchant", 1):
+                yield result
+            return
+
+        umo = target_umo or str(event.unified_msg_origin)
+        if target_umo:
+            default_key = str(target_umo)
+        elif event.is_private_chat():
+            default_key = f"private_{event.get_sender_id()}"
+        else:
+            default_key = str(event.get_group_id())
+        key, sub, persisted = await self._resolve_merchant_repush_target(umo, default_key)
+        try:
+            success, failed, reason = await self._repush_merchant_to_subs(
+                [(key, sub)], advance_cursor=persisted
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[Rocom] 补推：商人补推异常: {exc}")
+            yield event.plain_result(f"补推失败：{exc}")
+            return
+        if reason:
+            yield event.plain_result(f"补推失败：{reason}")
+            return
+        if success <= 0:
+            yield event.plain_result("本轮未命中订阅商品或发送失败，无需补推。")
+            return
+        tip = "" if persisted else "\n（当前会话未订阅远行商人，已按默认配置临时补推，未建立订阅）"
+        yield event.plain_result(
+            f"✅ 已补推远行商人当前轮次商品，成功 {success} 条，失败 {failed} 条。{tip}"
+        )
 
     @filter.command("洛克交换大厅", alias={"洛克大厅", "交换大厅"})
     async def rocom_exchange_hall(self, event: AstrMessageEvent, page: str = "1"):
