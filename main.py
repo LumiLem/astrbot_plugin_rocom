@@ -48,7 +48,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.8", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.9", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
     # B 站数据源与智能去重的固定参数（不对外暴露为配置项）
@@ -5471,6 +5471,9 @@ class RocomPlugin(Star):
             if elapsed < 300 and not round_products:
                 logger.warning(f"[Rocom] 远行商人常规商品未加载（开盘 {elapsed:.0f}s），等待数据更新")
                 return "empty"
+        all_day_names = {p["name"] for p in products if self._is_all_day_product(p)}
+        self._current_all_day_items = all_day_names
+        current_round = round_info.get("current")
         pending_pushes = []
         skipped = 0
         seen_keys = set()
@@ -5493,6 +5496,19 @@ class RocomPlugin(Star):
                 logger.debug(f"[Rocom] 远行商人检查：订阅 {key} 关注={items} → 命中={matched}")
                 if not matched:
                     continue
+                # 全天商品优化：对于未订阅全部商品的订阅者，如果命中的商品全部为全天售卖商品，
+                # 则仅在首轮（第1轮）开盘时推送，非首轮（第2/3/4轮）跳过开盘推送，避免每轮重复推送。
+                if current_round is not None and current_round != 1:
+                    if all(name in all_day_names for name in matched):
+                        logger.debug(
+                            f"[Rocom] 远行商人检查：订阅 {key} 本轮命中均为全天商品 {matched}，非首轮跳过开盘推送"
+                        )
+                        sub["last_push_round"] = round_info["round_id"]
+                        sub["last_matched_items"] = matched
+                        sub["last_all_day_items"] = [name for name in matched if name in all_day_names]
+                        await self.merchant_sub_mgr.upsert_subscription(key, sub)
+                        skipped += 1
+                        continue
             pending_pushes.append((key, sub, matched))
         logger.debug(f"[Rocom] 远行商人检查：{len(pending_pushes)} 待推送，{skipped} 已推送跳过")
         if not pending_pushes:
@@ -5508,8 +5524,6 @@ class RocomPlugin(Star):
             logger.warning(f"[Rocom] 远行商人图片预渲染失败，将仅发送文本: {e}")
         window_start = datetime.now(self._cn_tz())
         pushed = 0
-        all_day_names = {p["name"] for p in products if self._is_all_day_product(p)}
-        self._current_all_day_items = all_day_names
         for key, sub, matched in pending_pushes:
             hit_rare_items = self._merchant_hit_rare_items(
                 sub, product_names, matched, round_info=round_info, all_day_names=all_day_names
