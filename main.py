@@ -48,7 +48,7 @@ from .core.wiki_catalog import (
     WIKI_CATALOG_ROUTES_BY_KEY,
 )
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.7", "https://github.com/LumiLem/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组 & 柠小芒", "洛克王国插件", "v4.0.0-custom.8", "https://github.com/LumiLem/astrbot_plugin_rocom")
 class RocomPlugin(Star):
     _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
     # B 站数据源与智能去重的固定参数（不对外暴露为配置项）
@@ -198,6 +198,7 @@ class RocomPlugin(Star):
         self._merchant_stop = threading.Event()
         self._merchant_wakeup = threading.Event()
         self._merchant_check_running = False
+        self._current_all_day_items: set[str] = set()
         try:
             self._main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -4788,6 +4789,19 @@ class RocomPlugin(Star):
             return "normal"
         return "round"
 
+    def _is_all_day_product(self, product: Dict[str, Any]) -> bool:
+        """判断商品是否为全天售卖商品（如热销商品、周末限定等跨多轮次商品）。"""
+        category = product.get("product_category")
+        if category in ("normal", "weekend"):
+            return True
+        if product.get("round") == 0:
+            return True
+        start_ms = product.get("start_ms")
+        end_ms = product.get("end_ms")
+        if start_ms is None or end_ms is None or start_ms == 0 or end_ms == 0:
+            return True
+        return self._classify_merchant_item(start_ms, end_ms) in ("normal", "weekend")
+
     def _current_merchant_round(self, now: datetime | None = None):
         now = self._merchant_datetime(now)
         start = now.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -5280,6 +5294,7 @@ class RocomPlugin(Star):
             "product_category": self._classify_merchant_item(start_ms, end_ms),
             "price": parsed_price,
             "buy_limit_num": parsed_limit,
+            "round": item.get("round"),
         }
 
     def _merchant_history_groups(
@@ -5351,6 +5366,9 @@ class RocomPlugin(Star):
                 all_products.append(product)
                 if product.get("is_active"):
                     products.append(product)
+        self._current_all_day_items = {
+            p["name"] for p in products if self._is_all_day_product(p)
+        }
         return activity, products, self._merchant_history_groups(all_products, now_ms)
 
 
@@ -5490,8 +5508,12 @@ class RocomPlugin(Star):
             logger.warning(f"[Rocom] 远行商人图片预渲染失败，将仅发送文本: {e}")
         window_start = datetime.now(self._cn_tz())
         pushed = 0
+        all_day_names = {p["name"] for p in products if self._is_all_day_product(p)}
+        self._current_all_day_items = all_day_names
         for key, sub, matched in pending_pushes:
-            hit_rare_items = self._merchant_hit_rare_items(sub, product_names, matched)
+            hit_rare_items = self._merchant_hit_rare_items(
+                sub, product_names, matched, round_info=round_info, all_day_names=all_day_names
+            )
             msg_text = self._build_merchant_push_text(sub, products, product_names, matched, round_info)
             push_ok = await self._send_merchant_push(key, sub, msg_text, img_url, hit_rare_items)
             if not push_ok:
@@ -5501,6 +5523,7 @@ class RocomPlugin(Star):
             logger.debug(f"[Rocom] 远行商人检查：已更新订阅 {key} last_push_round={round_info['round_id']}")
             sub["last_push_round"] = round_info["round_id"]
             sub["last_matched_items"] = matched
+            sub["last_all_day_items"] = [name for name in matched if name in all_day_names]
             await self.merchant_sub_mgr.upsert_subscription(key, sub)
             await asyncio.sleep(5)
         elapsed = (datetime.now(self._cn_tz()) - window_start).total_seconds()
@@ -5508,12 +5531,30 @@ class RocomPlugin(Star):
         return "done"
 
     def _merchant_hit_rare_items(
-        self, sub: Dict[str, Any], product_names: set, matched: List[str]
+        self,
+        sub: Dict[str, Any],
+        product_names: set,
+        matched: List[str],
+        round_info: Dict[str, Any] | None = None,
+        all_day_names: set | None = None,
     ) -> List[str]:
-        """计算该订阅本轮命中的珍稀商品（用于二次提醒）。"""
+        """计算该订阅本轮命中的珍稀商品（用于二次提醒）。
+        对于全天售卖的商品，仅在首轮（第1轮）进行二次强提醒。
+        """
         rare_items_list = sub.get("mention_items") or self.merchant_subscription_mention_items or []
         check_set = product_names if sub.get("all_products") else set(matched)
-        return sorted(check_set & set(rare_items_list))
+        hits = sorted(check_set & set(rare_items_list))
+        if not hits:
+            return []
+
+        # 全天商品仅首轮二次强提醒
+        current_round = (round_info or {}).get("current")
+        if current_round is not None and current_round != 1:
+            if all_day_names is None:
+                all_day_names = getattr(self, "_current_all_day_items", set())
+            hits = [item for item in hits if item not in all_day_names]
+
+        return hits
 
     def _build_merchant_push_text(
         self,
@@ -5638,6 +5679,8 @@ class RocomPlugin(Star):
         if not products:
             return 0, 0, "当前暂无商品，无法补推"
         product_names = {p.get("name", "") for p in products}
+        all_day_names = {p["name"] for p in products if self._is_all_day_product(p)}
+        self._current_all_day_items = all_day_names
         img_url = None
         try:
             img_url = await self._render_merchant_image_from_data(activity, products, round_info, history_groups)
@@ -5662,7 +5705,9 @@ class RocomPlugin(Star):
                         await progress_cb(success, failed, total)
                     continue
             text = self._build_merchant_push_text(sub, products, product_names, matched, round_info)
-            hit_rare_items = self._merchant_hit_rare_items(sub, product_names, matched)
+            hit_rare_items = self._merchant_hit_rare_items(
+                sub, product_names, matched, round_info=round_info, all_day_names=all_day_names
+            )
             push_ok = await self._send_merchant_push(key, sub, text, img_url, hit_rare_items)
             if push_ok:
                 success += 1
@@ -5670,6 +5715,7 @@ class RocomPlugin(Star):
                 if advance_cursor:
                     sub["last_push_round"] = round_info["round_id"]
                     sub["last_matched_items"] = matched
+                    sub["last_all_day_items"] = [name for name in matched if name in all_day_names]
                     await self.merchant_sub_mgr.upsert_subscription(key, sub)
                 logger.info(f"[Rocom] 补推：远行商人 → {key}")
             else:
@@ -5704,6 +5750,19 @@ class RocomPlugin(Star):
         remaining_seconds = (end_time - now).total_seconds()
         remaining_minutes = remaining_seconds / 60
 
+        # 获取当前全天商品列表
+        all_day_names = set(getattr(self, "_current_all_day_items", set()))
+        if not all_day_names:
+            try:
+                res = await self.client.get_merchant_info(refresh=False)
+                _, products, _ = self._merchant_products_from_response(res)
+                all_day_names = {p["name"] for p in products if self._is_all_day_product(p)}
+                self._current_all_day_items = all_day_names
+            except Exception as e:
+                logger.warning(f"[Rocom] 远行商人结束提醒获取全天商品列表失败: {e}")
+
+        is_last_round = (round_info.get("current") == round_info.get("total", 4))
+
         pending = []
         seen_keys = set()
         for key, sub in all_subs.items():
@@ -5722,6 +5781,14 @@ class RocomPlugin(Star):
                 continue  # 还没到该订阅的提醒时间
             if remaining_seconds <= 0:
                 continue  # 本轮已结束
+
+            # 若本轮未开盘推送过，仅当为最后一轮且记录包含全天商品时才允许兜底提醒
+            if sub.get("last_push_round") != round_info["round_id"]:
+                if not is_last_round:
+                    continue
+                sub_all_day = set(sub.get("last_all_day_items", [])) | all_day_names
+                if not any(item in sub_all_day for item in sub.get("last_matched_items", [])):
+                    continue
 
             # 获取本轮命中的商品
             matched = sub.get("last_matched_items", [])
@@ -5748,6 +5815,13 @@ class RocomPlugin(Star):
                 reminder_items = [item for item in matched if item in set(target_items)]
                 if not reminder_items:
                     continue  # 本轮没有关注商品命中，跳过
+
+            # 全天商品优化：对于全天售卖商品，仅在最后一轮结束时提醒
+            if not is_last_round:
+                sub_all_day = set(sub.get("last_all_day_items", [])) | all_day_names
+                reminder_items = [item for item in reminder_items if item not in sub_all_day]
+                if not reminder_items:
+                    continue  # 本轮仅全天商品命中，非最后一轮不触发结束提醒
 
             pending.append((key, sub, reminder_items))
 
